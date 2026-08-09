@@ -1,0 +1,12 @@
+build/
+out/
+.vs/
+*.user
+*.aps
+*.pdb
+*.ilk
+*.exp
+*.obj
+*.idb
+CMakeSettings.json
+.DS_Store
