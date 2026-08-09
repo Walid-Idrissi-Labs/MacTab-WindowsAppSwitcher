@@ -100,11 +100,13 @@ message(STATUS "C++/WinRT headers: ${CPPWINRT_INCLUDE_DIR}")
 add_executable(MacTab WIN32
     src/main.cpp
     src/activate.cpp
+    src/app_identity.cpp
     src/common.cpp
     src/diag.cpp
     src/foreground_history.cpp
     src/hotkey.cpp
     src/tray.cpp
+    src/window_model.cpp
     "${CMAKE_BINARY_DIR}/app.rc"
 )
 
@@ -147,6 +149,7 @@ target_link_libraries(MacTab PRIVATE
     ole32
     dwmapi
     wtsapi32       # session lock/unlock notifications
+    version        # FileDescription from executables' version resources
 )
 
 set_target_properties(MacTab PROPERTIES

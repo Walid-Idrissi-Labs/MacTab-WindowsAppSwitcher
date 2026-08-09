@@ -3,11 +3,13 @@
 
 #include "activate.h"
 #include "app.h"
+#include "app_identity.h"
 #include "common.h"
 #include "diag.h"
 #include "foreground_history.h"
 #include "hotkey.h"
 #include "tray.h"
+#include "window_model.h"
 #include "resource.h"
 
 namespace mactab {
@@ -24,7 +26,7 @@ UINT g_msgTaskbarCreated = 0;   // RegisterWindowMessage(L"TaskbarCreated")
 // Owned entirely by the UI thread. The hook thread never reads it — it posts
 // intent (begin / select / commit) and this side decides what that means.
 struct Gesture {
-    std::vector<HWND> candidates;
+    std::vector<SwitcherApp> apps;
     int  index      = 0;
     bool active     = false;
     bool panelShown = false;
@@ -51,35 +53,35 @@ bool HasFlag(const wchar_t* cmdLine, const wchar_t* flag) {
 void BeginGesture(bool reverse) {
     Gesture& g = g_app.gesture;
 
-    g.candidates = foreground::Snapshot();
+    g.apps       = BuildSwitcherList();
     g.active     = true;
     g.panelShown = false;
 
-    if (g.candidates.size() < 2) {
+    if (g.apps.size() < 2) {
         // Nothing to switch to. Stay armed so the keys are still swallowed —
         // falling back to the built-in switcher mid-gesture would be worse.
         g.index = 0;
-        MACTAB_DIAG("gesture: begin with %zu candidate(s), nothing to switch to",
-                    g.candidates.size());
+        MACTAB_DIAG("gesture: begin with %zu app(s), nothing to switch to", g.apps.size());
         return;
     }
 
     // macOS lands on the previously-used app, not the current one. Shift starts
     // from the far end of the list instead.
-    g.index = reverse ? static_cast<int>(g.candidates.size()) - 1 : 1;
+    g.index = reverse ? static_cast<int>(g.apps.size()) - 1 : 1;
 
-    MACTAB_DIAG("gesture: begin, %zu candidates, start index %d (reverse %d)",
-                g.candidates.size(), g.index, reverse ? 1 : 0);
+    MACTAB_DIAG("gesture: begin, %zu apps, start index %d (reverse %d)",
+                g.apps.size(), g.index, reverse ? 1 : 0);
 }
 
 void AdvanceSelection(int direction) {
     Gesture& g = g_app.gesture;
-    if (!g.active || g.candidates.empty()) return;
+    if (!g.active || g.apps.empty()) return;
 
-    const int n = static_cast<int>(g.candidates.size());
+    const int n = static_cast<int>(g.apps.size());
     g.index = ((g.index + direction) % n + n) % n;   // wrap in both directions
 
-    MACTAB_DIAG("gesture: select -> index %d", g.index);
+    MACTAB_DIAG("gesture: select -> index %d (%s)", g.index,
+                ToUtf8(g.apps[static_cast<size_t>(g.index)].displayName).c_str());
 }
 
 void CommitGesture(WORD altVirtualKey) {
@@ -93,8 +95,12 @@ void CommitGesture(WORD altVirtualKey) {
     }
 
     HWND target = nullptr;
-    if (g.index >= 0 && g.index < static_cast<int>(g.candidates.size()))
-        target = g.candidates[static_cast<size_t>(g.index)];
+    std::wstring targetName;
+    if (g.index >= 0 && g.index < static_cast<int>(g.apps.size())) {
+        const SwitcherApp& app = g.apps[static_cast<size_t>(g.index)];
+        target     = app.PrimaryWindow();
+        targetName = app.displayName;
+    }
 
     g.active     = false;
     g.panelShown = false;
@@ -105,10 +111,8 @@ void CommitGesture(WORD altVirtualKey) {
         return;
     }
 
-    wchar_t title[128] = L"";
-    ::GetWindowTextW(target, title, ARRAYSIZE(title));
-    MACTAB_DIAG("gesture: commit -> %p \"%s\"",
-                static_cast<void*>(target), ToUtf8(title).c_str());
+    MACTAB_DIAG("gesture: commit -> %s (%p)",
+                ToUtf8(targetName).c_str(), static_cast<void*>(target));
 
     // ActivateWindow performs the Alt neutralisation itself, in the specific
     // order that avoids menu bleed-through.
@@ -119,7 +123,7 @@ void CancelGesture(WORD altVirtualKey) {
     Gesture& g = g_app.gesture;
     g.active     = false;
     g.panelShown = false;
-    g.candidates.clear();
+    g.apps.clear();
 
     hotkey::NeutralizeAlt(altVirtualKey);
     MACTAB_DIAG("gesture: cancelled");
@@ -132,7 +136,7 @@ void RevealPanel() {
     // the hold-versus-tap split is working: a quick Alt+Tab must never reach
     // this point, and holding Alt must always reach it exactly once.
     MACTAB_DIAG("gesture: reveal (panel would appear now, index %d of %zu)",
-                g_app.gesture.index, g_app.gesture.candidates.size());
+                g_app.gesture.index, g_app.gesture.apps.size());
 }
 
 // --- Tray ------------------------------------------------------------------
@@ -145,6 +149,7 @@ void ShowTrayMenu(HWND hwnd, POINT screenPt) {
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(menu, MF_STRING | (hotkey::IsRunning() ? 0u : MF_DISABLED),
                   IDM_TRAY_RELOAD_HOOK, L"Reload keyboard hook");
+    ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_LIST, L"Log current switcher list");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_LOG, L"Open diagnostics log");
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_QUIT, L"Quit MacTab");
@@ -253,6 +258,20 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 g_app.tray.ShowBalloon(L"MacTab", L"Could not reinstall the keyboard hook.");
             return 0;
 
+        case IDM_TRAY_DUMP_LIST:
+            // M2 verification: what this prints should match what Windows'
+            // own Alt+Tab shows, app-grouped.
+            if (diag::Enabled()) {
+                LogSwitcherList();
+                g_app.tray.ShowBalloon(L"MacTab", L"Switcher list written to the diagnostics log.");
+            } else {
+                ::MessageBoxW(hwnd,
+                              L"Diagnostics logging is off for this session.\n\n"
+                              L"Relaunch MacTab with --diag to capture the list.",
+                              L"MacTab", MB_OK | MB_ICONINFORMATION);
+            }
+            return 0;
+
         case IDM_TRAY_OPEN_LOG:
             OpenDiagnosticsLog(hwnd);
             return 0;
@@ -277,6 +296,10 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             MACTAB_DIAG("session: change %llu, aborting any in-flight gesture",
                         static_cast<unsigned long long>(wParam));
             hotkey::AbortGesture();
+
+            // Processes very likely came and went while the session was locked,
+            // and PIDs get reused. Cheaper to drop the cache than to validate it.
+            ClearIdentityCache();
         }
         return 0;
 
