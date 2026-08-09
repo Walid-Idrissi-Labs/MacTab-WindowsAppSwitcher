@@ -1,0 +1,105 @@
+# Build MacTab + Inno Setup installer on a tagged push (v1.2.3) and attach
+# both, plus SHA-256 sums, to a draft GitHub Release.
+#
+# Notes:
+#  * windows-latest is Windows Server 2025 (VS2026 image since June 2026).
+#    Inno Setup is NOT guaranteed preinstalled there, so we install it via
+#    Chocolatey when ISCC.exe is missing (~15 s, pin the version if you want
+#    reproducibility).
+#  * ilammy/msvc-dev-cmd sets up the VS developer environment (vcvars), which
+#    also exports WindowsSdkDir/WindowsSDKVersion for CMake's C++/WinRT lookup.
+#  * The release is created as a DRAFT so you can write notes (and the
+#    SmartScreen paragraph) before publishing.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'          # e.g. v1.2.3 or v1.2.3-beta1
+          $version = $tag.TrimStart('v')
+          # numeric-only for VERSIONINFO (strip -beta etc.)
+          $numeric = ($version -split '-')[0]
+          if ($numeric -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            throw "Tag '$tag' does not contain a usable x.y.z version"
+          }
+          "version=$version"  >> $env:GITHUB_OUTPUT
+          "numeric=$numeric" >> $env:GITHUB_OUTPUT
+
+      - name: MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure & build (Release, static CRT)
+        shell: pwsh
+        run: |
+          # Version comes from the tag so the exe's VERSIONINFO and the version
+          # the installer registers in Add/Remove Programs cannot disagree.
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DMACTAB_VERSION_STRING=${{ steps.ver.outputs.numeric }}
+          cmake --build build
+          if (-not (Test-Path build/bin/MacTab.exe)) { throw "MacTab.exe missing" }
+
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          # Test-Path rather than running ISCC /? — it exits non-zero after
+          # printing help, which this step would read as a failure.
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe still missing after install" }
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc `
+            /DMyAppVersion=${{ steps.ver.outputs.version }} `
+            /DMyAppVersionNumeric=${{ steps.ver.outputs.numeric }} `
+            /DSourceDir=$PWD\build\bin `
+            /O$PWD\dist `
+            installer\MacTab.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - name: Stage artifacts + checksums
+        shell: pwsh
+        run: |
+          Copy-Item build\bin\MacTab.exe dist\MacTab-${{ steps.ver.outputs.version }}.exe
+          # Enumerate into an array FIRST. Streaming Get-ChildItem straight into
+          # Out-File races with the file being created inside the same directory,
+          # which can list a zero-byte SHA256SUMS.txt in its own manifest.
+          $files = @(Get-ChildItem dist -File)
+          $lines = $files | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          }
+          $lines | Out-File -Encoding ascii dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: Create draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ github.ref_name }}' `
+            --draft --verify-tag `
+            --title 'MacTab ${{ steps.ver.outputs.version }}' `
+            --generate-notes `
+            (Get-ChildItem dist | ForEach-Object { $_.FullName })

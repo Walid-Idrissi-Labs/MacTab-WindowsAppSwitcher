@@ -7,6 +7,30 @@ if(NOT MSVC)
         "MinGW/clang-mingw cannot consume the C++/WinRT projection headers.")
 endif()
 
+# ---------------------------------------------------------------------------
+# Version.
+#
+# Single-sourced so the binary's VERSIONINFO, the version string the app shows,
+# and the version the installer registers in Add/Remove Programs cannot drift.
+# CI passes -DMACTAB_VERSION_STRING=<from git tag>; a local build falls back to
+# the project() version.
+# ---------------------------------------------------------------------------
+set(MACTAB_VERSION_STRING "${PROJECT_VERSION}" CACHE STRING
+    "Version stamped into the binary and its resources")
+
+if(MACTAB_VERSION_STRING MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)")
+    set(MACTAB_VER_MAJOR "${CMAKE_MATCH_1}")
+    set(MACTAB_VER_MINOR "${CMAKE_MATCH_2}")
+    set(MACTAB_VER_PATCH "${CMAKE_MATCH_3}")
+else()
+    message(FATAL_ERROR
+        "MACTAB_VERSION_STRING ('${MACTAB_VERSION_STRING}') must start with x.y.z")
+endif()
+
+set(MACTAB_RES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/res")
+configure_file(res/app.rc.in "${CMAKE_BINARY_DIR}/app.rc" @ONLY)
+message(STATUS "MacTab version: ${MACTAB_VERSION_STRING}")
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -81,7 +105,7 @@ add_executable(MacTab WIN32
     src/foreground_history.cpp
     src/hotkey.cpp
     src/tray.cpp
-    res/app.rc
+    "${CMAKE_BINARY_DIR}/app.rc"
 )
 
 target_precompile_headers(MacTab PRIVATE src/pch.h)
@@ -96,7 +120,7 @@ target_compile_definitions(MacTab PRIVATE
     UNICODE _UNICODE
     NOMINMAX
     WIN32_LEAN_AND_MEAN
-    MACTAB_VERSION="${PROJECT_VERSION}"
+    MACTAB_VERSION="${MACTAB_VERSION_STRING}"
 )
 
 target_compile_options(MacTab PRIVATE
