@@ -57,18 +57,21 @@ const wchar_t* kDefaultIni =
     L"\r\n"
     L"; --- Mission Control -------------------------------------------------\r\n"
     L";\r\n"
-    L"; Win+Tab spreads every window out instead of opening Task View.\r\n"
-    L"MissionEnabled=1\r\n"
+    L"; Win+Tab spreads every window out instead of opening Task View. Off by\r\n"
+    L"; default; also in the tray menu under Settings.\r\n"
+    L"MissionEnabled=0\r\n"
     L"\r\n"
-    L"; 1 = pull each app's windows into a cluster. macOS ships this off, and\r\n"
-    L"; it costs room: gathering a scattered app's windows means moving them a\r\n"
-    L"; long way, so everything ends up smaller.\r\n"
-    L"MissionGroupByApp=0\r\n"
+    L"; 1 = pull each app's windows into a cluster with its icon and name under\r\n"
+    L"; it. Costs room, because gathering a scattered app's windows means moving\r\n"
+    L"; them a long way and everything ends up smaller.\r\n"
+    L"MissionGroupByApp=1\r\n"
     L"\r\n"
-    L"; Space kept between windows, and between one app's cluster and the next,\r\n"
-    L"; in logical pixels.\r\n"
+    L"; Space between windows, between windows of the SAME app, and between one\r\n"
+    L"; app's cluster and the next. The ratio is what makes the grouping\r\n"
+    L"; readable without drawing a box around anything.\r\n"
     L"MissionGap=26\r\n"
-    L"MissionClusterGap=72\r\n"
+    L"MissionMemberGap=12\r\n"
+    L"MissionClusterGap=88\r\n"
     L"\r\n"
     L"; The wallpaper behind the windows: how soft it goes, and how far back it\r\n"
     L"; is pushed. Dim is 0 for none and 1 for opaque.\r\n"
@@ -357,13 +360,14 @@ void Load() {
     g_settings.glassRefraction = ReadInt(L"GlassRefraction", 1) != 0;
     g_settings.glassRimTap     = ReadInt(L"GlassRimTap", 1) != 0;
 
-    g_settings.missionEnabled    = ReadInt(L"MissionEnabled", 1) != 0;
-    g_settings.missionGroupByApp = ReadInt(L"MissionGroupByApp", 0) != 0;
+    g_settings.missionEnabled    = ReadInt(L"MissionEnabled", 0) != 0;
+    g_settings.missionGroupByApp = ReadInt(L"MissionGroupByApp", 1) != 0;
     g_settings.missionRevealMs   = static_cast<UINT>(
         (std::max)(0, (std::min)(2000, ReadInt(L"MissionRevealMs", 260))));
     g_settings.missionThumbnails = ReadString(L"MissionThumbnails", L"auto");
 
     ReadFloat(L"MissionGap",        g_settings.missionGap);
+    ReadFloat(L"MissionMemberGap",  g_settings.missionMemberGap);
     ReadFloat(L"MissionClusterGap", g_settings.missionClusterGap);
     ReadFloat(L"MissionBlurSigma",  g_settings.missionBlurSigma);
     ReadFloat(L"MissionDim",        g_settings.missionDim);
@@ -372,6 +376,7 @@ void Load() {
     // the material's keys are. A gap of 4000 typed by hand would put every
     // window off screen and look like a crash rather than a mistake.
     g_settings.missionGap        = (std::max)(0.0f,  (std::min)(400.0f, g_settings.missionGap));
+    g_settings.missionMemberGap  = (std::max)(0.0f,  (std::min)(400.0f, g_settings.missionMemberGap));
     g_settings.missionClusterGap = (std::max)(0.0f,  (std::min)(600.0f, g_settings.missionClusterGap));
     g_settings.missionBlurSigma  = (std::max)(0.0f,  (std::min)(120.0f, g_settings.missionBlurSigma));
     g_settings.missionDim        = (std::max)(0.0f,  (std::min)(1.0f,   g_settings.missionDim));
@@ -432,6 +437,18 @@ bool SetTheme(const wchar_t* value) {
     MACTAB_DIAG("config: theme -> %s (%s)", ToUtf8(value).c_str(),
                 ok ? "saved" : "not saved");
     return ok != FALSE;
+}
+
+bool SetMissionEnabled(bool enabled) {
+    if (g_settingsPath.empty()) return false;
+
+    const bool ok = ::WritePrivateProfileStringW(kSection, L"MissionEnabled",
+                                                 enabled ? L"1" : L"0",
+                                                 g_settingsPath.c_str()) != FALSE;
+    g_settings.missionEnabled = enabled;
+    MACTAB_DIAG("config: MissionEnabled -> %d (persisted %d)",
+                enabled ? 1 : 0, ok ? 1 : 0);
+    return ok;
 }
 
 // Must match AppId in installer/MacTab.iss. Inno appends _is1.

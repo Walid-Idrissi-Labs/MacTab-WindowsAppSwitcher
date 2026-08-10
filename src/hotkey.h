@@ -120,6 +120,14 @@ bool Reload();
 
 bool IsRunning();
 
+// Start or stop intercepting Win+Tab without restarting the hook.
+//
+// Written from the UI thread and read inside the hook callback on its own
+// thread. A plain bool, because it is a feature switch rather than state: a torn
+// read is not possible and the worst a stale one can do is let one keystroke
+// through to Task View, which is exactly what turning it off asks for anyway.
+void SetMissionOnWinTab(bool enabled);
+
 // Abort any in-flight gesture and clear the stuck-Alt state. Called on session
 // lock/unlock: the secure desktop means we may never see the Alt release.
 void AbortGesture();

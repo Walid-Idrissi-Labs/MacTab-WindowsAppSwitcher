@@ -416,6 +416,32 @@ HMONITOR MissionMonitor() {
     return ::MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
 }
 
+// Bring the overlay up to readiness, building it if this is the first time.
+//
+// Deliberately lazy. Mission Control is off by default, and initialising it
+// means a compositor, a D3D device, a D2D device and a window, which is real
+// memory to spend on a feature nobody has asked for. Turning it on from the
+// tray pays that cost once, at a moment when a few milliseconds cannot be felt.
+bool EnsureMission() {
+    if (g_app.mission.Ready()) return true;
+
+    if (!g_app.mission.Initialize(g_app.instance, g_app.host, WM_MACTAB_MC_ACTIVATE,
+                                  WM_MACTAB_MC_DISMISS, WM_MACTAB_MC_SPACE)) {
+        MACTAB_WARN("mission: initialisation failed; Win+Tab left alone");
+        return false;
+    }
+
+    const std::wstring& forced = config::Current().missionThumbnails;
+    if (forced == L"shared")        thumbnail::Force(thumbnail::Tier::SharedVisual);
+    else if (forced == L"snapshot") thumbnail::Force(thumbnail::Tier::Snapshot);
+    else if (forced == L"icon")     thumbnail::Force(thumbnail::Tier::IconOnly);
+
+    // Everything that can be done before the first invocation is done now, so
+    // the first Win+Tab costs what the hundredth costs.
+    g_app.mission.Prewarm();
+    return true;
+}
+
 void CloseMission() {
     if (g_app.mission.Visible()) {
         g_app.mission.Hide();
@@ -424,7 +450,8 @@ void CloseMission() {
 }
 
 void OpenMission() {
-    if (!g_app.mission.Ready() || !config::Current().missionEnabled) return;
+    if (!config::Current().missionEnabled) return;
+    if (!EnsureMission()) return;
 
     // A toggle, like the key it replaces and like the gesture it copies.
     if (g_app.mission.Visible()) {
@@ -568,6 +595,8 @@ HMENU CreateSettingsMenu() {
                          checkedTheme, MF_BYCOMMAND);
 
     ::AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
+    ::AppendMenuW(settings, MF_STRING | (config::Current().missionEnabled ? MF_CHECKED : 0u),
+                  IDM_TRAY_MISSION, L"Mission Control on Win+Tab");
     ::AppendMenuW(settings, MF_STRING | (config::AutostartEnabled() ? MF_CHECKED : 0u),
                   IDM_TRAY_AUTOSTART, L"Start when I sign in");
 
@@ -767,6 +796,25 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             else
                 g_app.tray.ShowBalloon(L"MacTab", L"Could not reinstall the keyboard hook.");
             return 0;
+
+        case IDM_TRAY_MISSION: {
+            const bool enabled = !config::Current().missionEnabled;
+            config::SetMissionEnabled(enabled);
+
+            // Built on the first switch-on rather than at boot, so the cost
+            // lands here instead of on the first keystroke.
+            const bool ready = enabled ? EnsureMission() : true;
+            if (enabled && !ready) config::SetMissionEnabled(false);
+
+            hotkey::SetMissionOnWinTab(enabled && ready);
+            if (!enabled) CloseMission();
+
+            g_app.tray.ShowBalloon(L"MacTab",
+                                   (enabled && ready)
+                                       ? L"Win+Tab now opens Mission Control."
+                                       : L"Win+Tab left to Windows.");
+            return 0;
+        }
 
         case IDM_TRAY_AUTOSTART:
             // Read-modify-write the Run key itself. There is deliberately no
@@ -1047,21 +1095,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
         return 1;
     }
 
-    // Mission Control attaches to the same thread and the same compositing
-    // stack the panel just set up, so it has to come after it. A failure here
-    // is not fatal: the switcher is the product, and Win+Tab falling back to
-    // Windows' own Task View is a far better outcome than refusing to start.
-    if (config::Current().missionEnabled) {
-        if (g_app.mission.Initialize(instance, g_app.host, WM_MACTAB_MC_ACTIVATE,
-                                     WM_MACTAB_MC_DISMISS, WM_MACTAB_MC_SPACE)) {
-            const std::wstring& forced = config::Current().missionThumbnails;
-            if (forced == L"shared")        thumbnail::Force(thumbnail::Tier::SharedVisual);
-            else if (forced == L"snapshot") thumbnail::Force(thumbnail::Tier::Snapshot);
-            else if (forced == L"icon")     thumbnail::Force(thumbnail::Tier::IconOnly);
-        } else {
-            MACTAB_WARN("boot: Mission Control unavailable; Win+Tab left alone");
-        }
-    }
+    // Mission Control needs the compositing stack the panel just set up, so it
+    // can only come after it. Built at boot only when it is switched on, so the
+    // first Win+Tab is not the one that pays for it.
+    if (config::Current().missionEnabled) EnsureMission();
 
     icons::Start(g_app.host, WM_MACTAB_ICON_READY);
 
@@ -1078,8 +1115,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
     hotkey::Options hotkeyOptions{};
     hotkeyOptions.revealDelayMs = config::Current().revealDelayMs;
     hotkeyOptions.leftAltOnly   = config::Current().leftAltOnly;
-    hotkeyOptions.missionOnWinTab =
-        config::Current().missionEnabled && g_app.mission.Ready();
+    hotkeyOptions.missionOnWinTab = config::Current().missionEnabled;
     if (!hotkey::Start(g_app.host, hotkeyOptions)) {
         ::MessageBoxW(nullptr,
                       L"MacTab could not install its keyboard hook, so Alt+Tab cannot "

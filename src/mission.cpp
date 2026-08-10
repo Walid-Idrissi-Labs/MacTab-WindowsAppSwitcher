@@ -8,6 +8,9 @@
 #include <dxgi1_2.h>
 #include <shellscalingapi.h>
 
+#include <thread>
+#include <vector>
+
 #include <DispatcherQueue.h>
 #include <windows.ui.composition.interop.h>
 
@@ -553,6 +556,43 @@ bool Mission::Initialize(HINSTANCE instance, HWND notifyWindow,
     MACTAB_DIAG("mission: initialised, thumbnails via %s",
                 thumbnail::TierName(thumbnail::Current()));
     return true;
+}
+
+void Mission::Prewarm() {
+    Impl& impl = *m_impl;
+    if (!impl.ready) return;
+
+    // Decoding only, on a thread of its own, and the results land in the
+    // wallpaper cache. Nothing here touches the compositor or D2D, both of
+    // which have thread affinity.
+    struct Job { HMONITOR monitor; int width, height; };
+    std::vector<Job> jobs;
+
+    ::EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM param) -> BOOL {
+            MONITORINFO info{};
+            info.cbSize = sizeof(info);
+            if (!::GetMonitorInfoW(monitor, &info)) return TRUE;
+
+            const int width  = info.rcMonitor.right - info.rcMonitor.left;
+            const int height = info.rcMonitor.bottom - info.rcMonitor.top;
+            if (width <= 0 || height <= 0) return TRUE;
+
+            reinterpret_cast<std::vector<Job>*>(param)->push_back(
+                Job{ monitor,
+                     (std::max)(1, static_cast<int>(width  * kBackdropDownscale)),
+                     (std::max)(1, static_cast<int>(height * kBackdropDownscale)) });
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&jobs));
+
+    if (jobs.empty()) return;
+
+    std::thread([jobs] {
+        for (const Job& job : jobs)
+            wallpaper::ForMonitor(job.monitor, job.width, job.height);
+    }).detach();
 }
 
 void Mission::Shutdown() {

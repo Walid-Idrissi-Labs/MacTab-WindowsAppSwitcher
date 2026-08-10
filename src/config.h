@@ -74,20 +74,27 @@ struct Settings {
     // --- Mission Control ----------------------------------------------------
 
     // Win+Tab opens the arrangement instead of Windows' Task View.
-    bool missionEnabled = true;
+    //
+    // Off by default. Alt+Tab is the product and it replaces a key most people
+    // press a hundred times a day; Win+Tab takes over a second one, and taking
+    // over two keys uninvited is a different proposition from taking over one.
+    // The tray menu turns it on without a restart.
+    bool missionEnabled = false;
 
     // Gap kept between windows in the arrangement, and between one app's
     // cluster and the next when grouping is on. Logical pixels at 96 DPI.
     float missionGap        = 26.0f;
-    float missionClusterGap = 72.0f;
+    float missionMemberGap  = 12.0f;
+    float missionClusterGap = 88.0f;
 
-    // Relax each app's windows into a cluster before arranging.
+    // Relax each app's windows into a cluster before arranging, and put the
+    // app's icon and name under the cluster.
     //
-    // Off by default, because that is macOS' default and has been since El
-    // Capitan. It also costs real estate: pulling a scattered app's windows
-    // together is a promise to move them a long way, which shows up as a
-    // smaller scale and a lower spatial agreement in tools/preview/mission.
-    bool missionGroupByApp = false;
+    // It costs real estate: pulling a scattered app's windows together is a
+    // promise to move them a long way, which shows up as a smaller scale in
+    // tools/preview/mission. Worth it, because an arrangement you cannot read
+    // by application is just a pile of rectangles.
+    bool missionGroupByApp = true;
 
     // The wallpaper behind the arrangement: how far it is blurred and how far
     // it is pushed back. Dim is the alpha of the tint over it, 0 to 1.
@@ -143,6 +150,10 @@ bool SetPanelDisplay(PanelDisplay display);
 // it back. Nothing else touches it, so the wstring assignment has no reader on
 // another thread the way the themes directory does.
 bool SetTheme(const wchar_t* value);
+
+// Turn Mission Control on or off and persist it. Same in-place single-key
+// write as the two above, and for the same reasons.
+bool SetMissionEnabled(bool enabled);
 
 // --- Uninstall --------------------------------------------------------------
 //

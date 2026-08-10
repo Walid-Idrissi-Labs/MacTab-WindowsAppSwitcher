@@ -450,6 +450,11 @@ WORD GestureAltKey() {
     return static_cast<WORD>(::InterlockedCompareExchange(&g_sharedAltVk, 0, 0));
 }
 
+void SetMissionOnWinTab(bool enabled) {
+    g_options.missionOnWinTab = enabled;
+    MACTAB_DIAG("hotkey: Win+Tab interception %s", enabled ? "on" : "off");
+}
+
 bool IsRunning() {
     return ::InterlockedCompareExchange(&g_running, 0, 0) != 0;
 }

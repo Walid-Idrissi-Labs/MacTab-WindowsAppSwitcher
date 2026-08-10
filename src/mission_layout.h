@@ -61,10 +61,14 @@ namespace mactab::mission {
 // of macOS 26.
 inline constexpr float kWindowGap = 26.0f;
 
-// Between one app's cluster and the next, when grouping is on. Wider than the
-// gap inside a cluster, which is what makes the grouping legible without
-// drawing anything around it.
-inline constexpr float kClusterGap = 72.0f;
+// Inside one app's cluster, and between one cluster and the next.
+//
+// The ratio is what makes grouping legible without drawing a box around
+// anything: an app's windows sit closer to each other than to anything else, so
+// the eye reads the cluster before it reads the windows. Equal gaps and the
+// grouping is invisible however correct it is.
+inline constexpr float kMemberGap  = 12.0f;
+inline constexpr float kClusterGap = 88.0f;
 
 // Never enlarge. A 400x300 window is a small tile in Mission Control, and
 // blowing it up to fill the screen would break the "this is your desktop"
@@ -82,6 +86,7 @@ inline constexpr int kMaxIterations = 400;
 
 struct Params {
     float gap        = kWindowGap;
+    float memberGap  = kMemberGap;
     float clusterGap = kClusterGap;
     float maxScale   = kMaxScale;
     float minScale   = kMinScale;
@@ -89,9 +94,8 @@ struct Params {
 
     // Windows of the same application are relaxed into a cluster first, and the
     // clusters are then relaxed against each other. Off, every window competes
-    // with every other and only position matters, which is what macOS does by
-    // default.
-    bool  groupByApp = false;
+    // with every other and only position matters.
+    bool  groupByApp = true;
 };
 
 // One window, as it actually sits on the desktop.
@@ -120,8 +124,16 @@ struct Placement {
     int   source = 0;              // index into the input vector
 };
 
+// The area one application's windows ended up occupying, which is what the app
+// icon and name are anchored under when grouping is on.
+struct Cluster {
+    int   group = 0;
+    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
+};
+
 struct Result {
     std::vector<Placement> tiles;  // in input order
+    std::vector<Cluster>   clusters;   // empty when grouping is off
     float scale      = 1.0f;
     int   iterations = 0;          // how much shoving it took
     bool  relaxed    = true;       // false means the grid fallback was used
@@ -316,6 +328,7 @@ inline Result Layout(const std::vector<Window>& windows,
     // open, which is the opposite of what it should do.
     auto arrange = [&](float gapScale, std::vector<detail::Rect>& out) {
         const float gap        = p.gap        / gapScale;
+        const float memberGap  = p.memberGap  / gapScale;
         const float clusterGap = p.clusterGap / gapScale;
 
         out.resize(windows.size());
@@ -375,9 +388,10 @@ inline Result Layout(const std::vector<Window>& windows,
             }
 
             bool localSettled = true;
-            passes += detail::Shove(local, gap, regionAspect, p.iterations, localSettled);
+            passes += detail::Shove(local, memberGap, regionAspect, p.iterations,
+                                    localSettled);
             if (!localSettled) {
-                detail::GridFallback(local, gap);
+                detail::GridFallback(local, memberGap);
                 settled = false;
             }
 
@@ -445,6 +459,33 @@ inline Result Layout(const std::vector<Window>& windows,
         place.h      = rects[i].h * scale;
         place.source = static_cast<int>(i);
         result.tiles[i] = place;
+    }
+
+    // The box each app ended up in, in the same coordinates as the tiles, so
+    // the caller can put an icon and a name under it without repeating the
+    // grouping logic and getting a different answer.
+    if (p.groupByApp) {
+        for (size_t i = 0; i < windows.size(); ++i) {
+            Cluster* found = nullptr;
+            for (Cluster& c : result.clusters)
+                if (c.group == windows[i].group) { found = &c; break; }
+
+            const Placement& t = result.tiles[i];
+            if (!found) {
+                Cluster c;
+                c.group = windows[i].group;
+                c.x = t.x; c.y = t.y; c.w = t.w; c.h = t.h;
+                result.clusters.push_back(c);
+                continue;
+            }
+
+            const float right  = (std::max)(found->x + found->w, t.x + t.w);
+            const float bottom = (std::max)(found->y + found->h, t.y + t.h);
+            found->x = (std::min)(found->x, t.x);
+            found->y = (std::min)(found->y, t.y);
+            found->w = right  - found->x;
+            found->h = bottom - found->y;
+        }
     }
 
     return result;

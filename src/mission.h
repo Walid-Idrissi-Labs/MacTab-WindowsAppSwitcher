@@ -52,6 +52,14 @@ public:
     void Shutdown();
     bool Ready() const;
 
+    // Do now everything that can be done before the first invocation.
+    //
+    // The gesture is judged on how fast it comes up, and the expensive part is
+    // reading and scaling a wallpaper that may be a 4K photograph on a slow
+    // disk. Doing it here means the first Win+Tab costs what the hundredth
+    // costs. Safe to call more than once.
+    void Prewarm();
+
     // wParam values for spaceMessage that are not a space index.
     static constexpr WPARAM kSpaceAdd   = 0xFFFF;
     static constexpr WPARAM kSpaceClose = 0xFFFE;
