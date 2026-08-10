@@ -371,7 +371,8 @@ void Check(bool condition, const char* what) {
 // chosen without being able to see them. This runs the actual shared layout and
 // glass code, not a copy of it, so the proportions and the material can be
 // judged rather than assumed.
-Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCount) {
+Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCount,
+                   int selected) {
     const int count = 6;
     const layout::Metrics m = layout::Compute(count, 2400.0f, 1.0f);
 
@@ -451,8 +452,7 @@ Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCou
 
     CompositeOver(canvas, body, margin, margin);
 
-    // Selection highlight behind tile 1, then the tiles themselves.
-    const int selected = 1;
+    // Selection highlight, then the tiles themselves.
     const int inset  = static_cast<int>(m.tileSize * layout::kSelectionInset);
     const int hlSize = static_cast<int>(m.tileSize) + inset * 2;
 
@@ -704,16 +704,22 @@ int main(int argc, char** argv) {
                     m.tileSize, m.panelWidth, m.panelHeight, m.radius,
                     static_cast<double>(layout::kPanelCornerExponent));
 
-        struct { const char* file; const glass::Params& material; } themes[] = {
-            { "/panel-dark.png",  glass::kDark  },
-            { "/panel-light.png", glass::kLight },
+        // The last one puts the selection on the final tile, which is the case
+        // that exercises BakeLabel's clamp: the name is anchored on the tile's
+        // centre, so at the end of the row it has to slide inward instead of
+        // overhanging the panel.
+        struct { const char* file; const glass::Params& material; int selected; } shots[] = {
+            { "/panel-dark.png",       glass::kDark,  1 },
+            { "/panel-light.png",      glass::kLight, 1 },
+            { "/panel-label-end.png",  glass::kDark,  5 },
         };
 
-        for (const auto& theme : themes) {
-            const Bitmap panel = RenderPanel(theme.material, cases,
-                                             static_cast<int>(std::size(cases)));
-            if (!WritePng(outDir + theme.file, panel)) {
-                std::fprintf(stderr, "failed to write %s\n", theme.file);
+        for (const auto& shot : shots) {
+            const Bitmap panel = RenderPanel(shot.material, cases,
+                                             static_cast<int>(std::size(cases)),
+                                             shot.selected);
+            if (!WritePng(outDir + shot.file, panel)) {
+                std::fprintf(stderr, "failed to write %s\n", shot.file);
                 ++failures;
             }
         }
