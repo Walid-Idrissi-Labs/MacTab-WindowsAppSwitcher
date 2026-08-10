@@ -66,11 +66,11 @@ const wchar_t* kDefaultIni =
     L"; them a long way and everything ends up smaller.\r\n"
     L"MissionGroupByApp=1\r\n"
     L"\r\n"
-    L"; Space between windows, between windows of the SAME app, and between one\r\n"
-    L"; app's cluster and the next. The ratio is what makes the grouping\r\n"
-    L"; readable without drawing a box around anything.\r\n"
+    L"; Space between two windows, how far each window of an app is offset from\r\n"
+    L"; the one in front of it in its pile, and the room left between one pile\r\n"
+    L"; and the next.\r\n"
     L"MissionGap=26\r\n"
-    L"MissionMemberGap=12\r\n"
+    L"MissionFan=30\r\n"
     L"MissionClusterGap=88\r\n"
     L"\r\n"
     L"; The wallpaper behind the windows: how soft it goes, and how far back it\r\n"
@@ -367,7 +367,7 @@ void Load() {
     g_settings.missionThumbnails = ReadString(L"MissionThumbnails", L"auto");
 
     ReadFloat(L"MissionGap",        g_settings.missionGap);
-    ReadFloat(L"MissionMemberGap",  g_settings.missionMemberGap);
+    ReadFloat(L"MissionFan",        g_settings.missionFan);
     ReadFloat(L"MissionClusterGap", g_settings.missionClusterGap);
     ReadFloat(L"MissionBlurSigma",  g_settings.missionBlurSigma);
     ReadFloat(L"MissionDim",        g_settings.missionDim);
@@ -376,7 +376,7 @@ void Load() {
     // the material's keys are. A gap of 4000 typed by hand would put every
     // window off screen and look like a crash rather than a mistake.
     g_settings.missionGap        = (std::max)(0.0f,  (std::min)(400.0f, g_settings.missionGap));
-    g_settings.missionMemberGap  = (std::max)(0.0f,  (std::min)(400.0f, g_settings.missionMemberGap));
+    g_settings.missionFan        = (std::max)(0.0f,  (std::min)(400.0f, g_settings.missionFan));
     g_settings.missionClusterGap = (std::max)(0.0f,  (std::min)(600.0f, g_settings.missionClusterGap));
     g_settings.missionBlurSigma  = (std::max)(0.0f,  (std::min)(120.0f, g_settings.missionBlurSigma));
     g_settings.missionDim        = (std::max)(0.0f,  (std::min)(1.0f,   g_settings.missionDim));

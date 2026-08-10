@@ -383,8 +383,8 @@ defaults and comments on first run:
 | `MissionEnabled` | 0 | 1 makes Win+Tab open Mission Control instead of Task View. Also in the tray menu |
 | `MissionGroupByApp` | 1 | 0 arranges purely by position and ignores which app owns what |
 | `MissionGap` | 26 | Space kept between windows, logical pixels |
-| `MissionMemberGap` | 12 | Space between two windows of the same app |
-| `MissionClusterGap` | 88 | Space between one app's cluster and the next |
+| `MissionFan` | 30 | How far each window of an app is offset from the one in front of it in its pile |
+| `MissionClusterGap` | 88 | Space between one app's pile and the next |
 | `MissionBlurSigma` | 18 | How soft the wallpaper behind the arrangement goes |
 | `MissionDim` | 0.55 | How far back the wallpaper is pushed, 0 to 1 |
 | `MissionRevealMs` | 260 | How long the windows take to fly to their places |

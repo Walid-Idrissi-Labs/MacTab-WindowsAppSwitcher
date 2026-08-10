@@ -81,10 +81,11 @@ struct Settings {
     // The tray menu turns it on without a restart.
     bool missionEnabled = false;
 
-    // Gap kept between windows in the arrangement, and between one app's
-    // cluster and the next when grouping is on. Logical pixels at 96 DPI.
+    // Space between two windows, how far each window of an app is offset
+    // from the one in front of it in its pile, and how much room is left
+    // between one pile and the next. Logical pixels at 96 DPI.
     float missionGap        = 26.0f;
-    float missionMemberGap  = 12.0f;
+    float missionFan        = 30.0f;
     float missionClusterGap = 88.0f;
 
     // Relax each app's windows into a cluster before arranging, and put the

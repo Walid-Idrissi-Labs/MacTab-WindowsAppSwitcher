@@ -8,6 +8,7 @@
 #include <dxgi1_2.h>
 #include <shellscalingapi.h>
 
+#include <map>
 #include <thread>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Composition.Desktop.h>
 #include <winrt/Windows.UI.Composition.h>
+#include <winrt/Windows.UI.ViewManagement.h>
 #include <winrt/Windows.UI.h>
 
 #include "mission.h"
@@ -42,19 +44,33 @@ namespace {
 constexpr wchar_t kMissionClass[] = L"MacTabMissionWindow";
 
 // Logical pixels at 96 DPI.
-constexpr float kSpacesStripHeight = 132.0f;   // the whole band
-constexpr float kSpaceChipHeight   = 92.0f;    // one desktop miniature
-constexpr float kSpaceChipGap      = 18.0f;
-constexpr float kSpaceChipRadius   = 10.0f;
-constexpr float kSpaceLabelHeight  = 22.0f;   // the name under each miniature
-constexpr float kOuterMargin       = 56.0f;
-constexpr float kTitleHeight       = 30.0f;
-constexpr float kTitleGap          = 10.0f;
+constexpr float kBarHeight    = 168.0f;   // the full-width glass bar
+constexpr float kChipHeight   = 90.0f;    // one desktop miniature inside it
+constexpr float kChipGap      = 18.0f;
+constexpr float kChipRadius   = 10.0f;
+constexpr float kChipLabel    = 24.0f;    // the name under a miniature
+constexpr float kBarInset     = 40.0f;    // how far the add button sits from the edge
+constexpr float kOuterMargin  = 56.0f;
+constexpr float kBadgeSize    = 46.0f;    // the app icon under a pile
+constexpr float kTitleHeight  = 26.0f;
+constexpr float kTitleGap     = 8.0f;
+constexpr float kTileRadius   = 8.0f;
+constexpr float kOutlineWidth = 3.0f;
+
+// The shadow under each window, as a nine-grid texture baked once.
+//
+// One texture stretched to every size rather than a Composition drop shadow per
+// tile: a drop shadow needs a mask, and the thumbnail is a visual DWM owns which
+// cannot be masked at all. The nine-grid also lives inside the tile, so it flies
+// and scales with it, and a shadow travelling with its window is a large part of
+// what makes the windows read as lifting off the desktop.
+constexpr float kShadowSpread = 24.0f;
+constexpr float kShadowSigma  = 9.0f;
+constexpr float kShadowAlpha  = 0.45f;
 
 // The wallpaper is blurred at a quarter of the screen's resolution and the
-// visual stretches it back. At this radius the difference is not visible and it
-// is a sixteenth of the pixels, which matters when the surface is the size of a
-// 4K display.
+// visual stretches it back. At this radius the difference is invisible and it is
+// a sixteenth of the pixels, which matters on a 4K display.
 constexpr float kBackdropDownscale = 0.25f;
 
 // How long the snapshot tier may spend before the rest of the windows become
@@ -63,29 +79,32 @@ constexpr double kSnapshotBudgetMs = 400.0;
 
 struct Theme {
     D2D1_COLOR_F backdropTint;
+    D2D1_COLOR_F bar;
+    D2D1_COLOR_F barLine;
     D2D1_COLOR_F chip;
-    D2D1_COLOR_F chipCurrent;
     D2D1_COLOR_F chipBorder;
     D2D1_COLOR_F text;
-    D2D1_COLOR_F selection;
+    D2D1_COLOR_F plate;
 };
 
 Theme MakeTheme(bool light) {
     Theme theme{};
     if (light) {
         theme.backdropTint = { 0.86f, 0.87f, 0.90f, 0.55f };
-        theme.chip         = { 1.00f, 1.00f, 1.00f, 0.35f };
-        theme.chipCurrent  = { 1.00f, 1.00f, 1.00f, 0.70f };
-        theme.chipBorder   = { 0.10f, 0.10f, 0.12f, 0.35f };
+        theme.bar          = { 0.97f, 0.97f, 0.99f, 0.55f };
+        theme.barLine      = { 0.10f, 0.10f, 0.12f, 0.14f };
+        theme.chip         = { 1.00f, 1.00f, 1.00f, 0.42f };
+        theme.chipBorder   = { 0.10f, 0.10f, 0.12f, 0.45f };
         theme.text         = { 0.08f, 0.08f, 0.10f, 1.00f };
-        theme.selection    = { 0.10f, 0.10f, 0.12f, 0.80f };
+        theme.plate        = { 1.00f, 1.00f, 1.00f, 0.78f };
     } else {
         theme.backdropTint = { 0.03f, 0.03f, 0.05f, 0.55f };
-        theme.chip         = { 1.00f, 1.00f, 1.00f, 0.14f };
-        theme.chipCurrent  = { 1.00f, 1.00f, 1.00f, 0.34f };
-        theme.chipBorder   = { 1.00f, 1.00f, 1.00f, 0.55f };
+        theme.bar          = { 0.06f, 0.06f, 0.08f, 0.52f };
+        theme.barLine      = { 1.00f, 1.00f, 1.00f, 0.12f };
+        theme.chip         = { 1.00f, 1.00f, 1.00f, 0.16f };
+        theme.chipBorder   = { 1.00f, 1.00f, 1.00f, 0.62f };
         theme.text         = { 0.96f, 0.96f, 0.98f, 1.00f };
-        theme.selection    = { 1.00f, 1.00f, 1.00f, 0.90f };
+        theme.plate        = { 0.00f, 0.00f, 0.00f, 0.52f };
     }
     return theme;
 }
@@ -118,6 +137,9 @@ struct SurfaceDraw {
         if (!interop) return;
         ok = SUCCEEDED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext),
                                           dc.PutVoid(), &offset));
+        if (ok)
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(
+                static_cast<float>(offset.x), static_cast<float>(offset.y)));
     }
     ~SurfaceDraw() {
         if (ok && interop) interop->EndDraw();
@@ -129,10 +151,9 @@ struct SurfaceDraw {
 // ---------------------------------------------------------------------------
 
 struct Mission::Impl {
-    HINSTANCE instance       = nullptr;
-    HWND      hwnd           = nullptr;
-    HWND      notifyWindow   = nullptr;
-    HWND      restoreWindow  = nullptr;   // what had focus before we took it
+    HINSTANCE instance        = nullptr;
+    HWND      notifyWindow    = nullptr;
+    HWND      restoreWindow   = nullptr;
     UINT      activateMessage = 0;
     UINT      dismissMessage  = 0;
     UINT      spaceMessage    = 0;
@@ -140,73 +161,100 @@ struct Mission::Impl {
     bool ready   = false;
     bool visible = false;
 
-    WUC::Compositor                   compositor{ nullptr };
-    WUC::Desktop::DesktopWindowTarget target{ nullptr };
-    WUC::CompositionGraphicsDevice    graphics{ nullptr };
+    WUC::Compositor                compositor{ nullptr };
+    WUC::CompositionGraphicsDevice graphics{ nullptr };
 
-    ComPtr<ID2D1Device>    d2dDevice;
-    ComPtr<ID2D1Factory1>  d2dFactory;
-    ComPtr<IDWriteFactory> dwriteFactory;
-
-    // Whichever DirectComposition device interface the compositor will admit
-    // to. Only used as an opaque pointer to hand to DWM.
-    //
-    // winrt::com_ptr rather than the project's own ComPtr, which is deliberately
-    // minimal and has no way to adopt a pointer that is already referenced.
-    // This file is MSVC-only anyway, so the WinRT one costs nothing here.
+    ComPtr<ID2D1Device>      d2dDevice;
+    ComPtr<ID2D1Factory1>    d2dFactory;
+    ComPtr<IDWriteFactory>   dwriteFactory;
     winrt::com_ptr<IUnknown> dcompDevice;
 
-    WUC::ContainerVisual root{ nullptr };
-    WUC::SpriteVisual    backdropVisual{ nullptr };
-    WUC::SpriteVisual    spacesVisual{ nullptr };
-    WUC::ContainerVisual tileLayer{ nullptr };
-    WUC::SpriteVisual    selectionVisual{ nullptr };
-    WUC::SpriteVisual    titleVisual{ nullptr };
+    // Constructed once and kept. Activation is a WinRT call and the accent
+    // colour can change while the process runs, so the object is cached and the
+    // value read at initialisation, which is cheaper than subscribing to a
+    // change event that fires on somebody else's thread.
+    winrt::Windows::UI::ViewManagement::UISettings uiSettings{ nullptr };
 
-    WUC::CompositionDrawingSurface backdropSurface{ nullptr };
-    WUC::CompositionDrawingSurface spacesSurface{ nullptr };
-    WUC::CompositionDrawingSurface titleSurface{ nullptr };
+    Theme        theme        = MakeTheme(false);
+    bool         themeIsLight = false;
+    D2D1_COLOR_F accent       = D2D1::ColorF(0.0f, 0.47f, 0.83f, 1.0f);
 
-    // One per window in the arrangement.
+    // Baked once and reused for the life of the process. Both are stretched by
+    // a nine-grid brush, so one small texture serves every window at every size.
+    WUC::CompositionDrawingSurface shadowSurface{ nullptr };
+    WUC::CompositionDrawingSurface outlineSurface{ nullptr };
+    WUC::CompositionNineGridBrush  shadowBrush{ nullptr };
+    WUC::CompositionNineGridBrush  outlineBrush{ nullptr };
+    float                          textureSpread = 0.0f;
+
     struct Tile {
         WUC::ContainerVisual holder{ nullptr };
-        WUC::SpriteVisual    sprite{ nullptr };   // snapshot or icon card
-        WUC::CompositionDrawingSurface surface{ nullptr };
-        HTHUMBNAIL           thumbnail = nullptr;
-        RECT                 screenRect{};        // where it is on the overlay
-        RECT                 sourceRect{};        // where the window really is
+        WUC::SpriteVisual    shadow{ nullptr };
+        WUC::SpriteVisual    content{ nullptr };   // snapshot or icon card
+        WUC::SpriteVisual    chrome{ nullptr };    // badge and name, pile front only
+        WUC::CompositionDrawingSurface contentSurface{ nullptr };
+        WUC::CompositionDrawingSurface chromeSurface{ nullptr };
+        HTHUMBNAIL thumbnail = nullptr;
+        RECT       screenRect{};   // where it lands, in overlay coordinates
+        RECT       sourceRect{};   // where the window really is
+        int        item  = -1;     // index into Impl::items
+        int        depth = 0;      // 0 is the front of its pile
+        float      pileX = 0.0f;   // the pile's box, for anchoring the chrome
+        float      pileW = 0.0f;
+        float      pileBottom = 0.0f;
     };
 
-    std::vector<Tile>         tiles;
+    struct Screen {
+        HMONITOR monitor = nullptr;
+        RECT     rect{};
+        float    dpiScale = 1.0f;
+        HWND     hwnd = nullptr;
+
+        WUC::Desktop::DesktopWindowTarget target{ nullptr };
+        WUC::ContainerVisual root{ nullptr };
+        WUC::SpriteVisual    backdrop{ nullptr };
+        WUC::ContainerVisual tileLayer{ nullptr };
+        WUC::ContainerVisual chromeLayer{ nullptr };
+        WUC::SpriteVisual    outline{ nullptr };
+        WUC::SpriteVisual    bar{ nullptr };
+
+        WUC::CompositionDrawingSurface backdropSurface{ nullptr };
+        WUC::CompositionDrawingSurface barSurface{ nullptr };
+
+        std::vector<Tile>               tiles;
+        std::vector<mission::SpaceChip> chips;
+        int hovered = -1;
+
+        float Scaled(float logical) const { return logical * dpiScale; }
+        float Width()  const { return static_cast<float>(rect.right - rect.left); }
+        float Height() const { return static_cast<float>(rect.bottom - rect.top); }
+    };
+
+    std::vector<Screen>       screens;
     std::vector<MissionItem>  items;
     std::vector<MissionSpace> spaces;
-    std::vector<mission::SpaceChip> chips;
 
-    HMONITOR monitor  = nullptr;
-    RECT     monitorRect{};
-    float    dpiScale = 1.0f;
-    Theme    theme    = MakeTheme(false);
-    bool     themeIsLight = false;
-    int      hovered  = -1;
-    int      hoveredChip = -1;
+    // The app icons, uploaded once each rather than once per window.
+    std::map<std::wstring, ComPtr<ID2D1Bitmap1>> iconBitmaps;
 
-    bool CreateMissionWindow();
     bool CreateDevices();
-    bool CreateVisualTree();
+    bool BakeTextures();
+    bool BuildScreens();
+    Screen* ScreenFor(HWND hwnd);
+    bool    IsOwnWindow(HWND hwnd) const;
 
-    void Build();
-    void BakeBackdrop();
-    void BakeSpaces();
-    void BakeTitle();
-    void PositionSelection();
-    void ReleaseTiles();
+    void BakeBackdrop(Screen& screen);
+    void BakeBar(Screen& screen);
+    void BakeChrome(Screen& screen, Tile& tile);
+    void BuildTiles(Screen& screen, const std::vector<int>& members);
+    void ReleaseTiles(Screen& screen);
+    void PositionOutline(Screen& screen);
+    void SetHovered(Screen& screen, int index);
+    int  HitTestTile(const Screen& screen, POINT client) const;
+    int  HitTestChip(const Screen& screen, POINT client) const;
+    int  Neighbour(const Screen& screen, int from, int dx, int dy) const;
 
-    int  HitTestTile(POINT client) const;
-    int  HitTestChip(POINT client) const;
-    void SetHovered(int index);
-    int  Neighbour(int from, int dx, int dy) const;
-
-    float Scaled(float logical) const { return logical * dpiScale; }
+    ComPtr<ID2D1Bitmap1> IconFor(ID2D1DeviceContext* dc, const MissionItem& item);
 };
 
 namespace {
@@ -246,20 +294,16 @@ ComPtr<ID2D1Bitmap1> UploadBitmap(ID2D1DeviceContext* dc, Bitmap image) {
     return bitmap;
 }
 
-// A rounded rectangle in the icons' shape language, which is what every piece
-// of chrome in MacTab uses.
 void FillSquircle(ID2D1DeviceContext* dc, ID2D1Factory* factory,
                   float x, float y, float w, float h, float radius,
                   const D2D1_COLOR_F& colour) {
     ComPtr<ID2D1PathGeometry> geometry =
         CreateSquircleGeometry(factory, w, h, radius, 5.0f);
-    if (!geometry) return;
-
     ComPtr<ID2D1SolidColorBrush> brush;
-    if (FAILED(dc->CreateSolidColorBrush(colour, brush.Put()))) return;
+    if (!geometry || FAILED(dc->CreateSolidColorBrush(colour, brush.Put()))) return;
 
-    const D2D1_MATRIX_3X2_F saved = D2D1::Matrix3x2F::Identity();
-    dc->GetTransform(const_cast<D2D1_MATRIX_3X2_F*>(&saved));
+    D2D1_MATRIX_3X2_F saved{};
+    dc->GetTransform(&saved);
     dc->SetTransform(D2D1::Matrix3x2F::Translation(x, y) * saved);
     dc->FillGeometry(geometry.Get(), brush.Get());
     dc->SetTransform(saved);
@@ -284,16 +328,37 @@ void StrokeSquircle(ID2D1DeviceContext* dc, ID2D1Factory* factory,
                     float thickness, const D2D1_COLOR_F& colour) {
     ComPtr<ID2D1PathGeometry> geometry =
         CreateSquircleGeometry(factory, w, h, radius, 5.0f);
-    if (!geometry) return;
-
     ComPtr<ID2D1SolidColorBrush> brush;
-    if (FAILED(dc->CreateSolidColorBrush(colour, brush.Put()))) return;
+    if (!geometry || FAILED(dc->CreateSolidColorBrush(colour, brush.Put()))) return;
 
     D2D1_MATRIX_3X2_F saved{};
     dc->GetTransform(&saved);
     dc->SetTransform(D2D1::Matrix3x2F::Translation(x, y) * saved);
     dc->DrawGeometry(geometry.Get(), brush.Get(), thickness);
     dc->SetTransform(saved);
+}
+
+ComPtr<IDWriteTextFormat> MakeFormat(IDWriteFactory* dwrite, float size,
+                                     DWRITE_FONT_WEIGHT weight) {
+    ComPtr<IDWriteTextFormat> format;
+
+    // Segoe UI Variable is the Windows 11 UI face and does not exist on 10, so
+    // the older name is a fallback rather than an error.
+    if (FAILED(dwrite->CreateTextFormat(L"Segoe UI Variable Display", nullptr, weight,
+                                        DWRITE_FONT_STYLE_NORMAL,
+                                        DWRITE_FONT_STRETCH_NORMAL, size, L"",
+                                        format.Put())))
+        dwrite->CreateTextFormat(L"Segoe UI", nullptr, weight,
+                                 DWRITE_FONT_STYLE_NORMAL,
+                                 DWRITE_FONT_STRETCH_NORMAL, size, L"",
+                                 format.Put());
+
+    if (format) {
+        format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    return format;
 }
 
 } // namespace
@@ -309,70 +374,85 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     auto* impl = reinterpret_cast<Mission::Impl*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (!impl) return ::DefWindowProcW(hwnd, msg, wParam, lParam);
 
+    Mission::Impl::Screen* screen = impl->ScreenFor(hwnd);
+    if (!screen) return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+
     switch (msg) {
-    case WM_MOUSEMOVE: {
-        const POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        impl->hoveredChip = impl->HitTestChip(point);
-        impl->SetHovered(impl->HitTestTile(point));
+    case WM_MOUSEMOVE:
+        impl->SetHovered(*screen, impl->HitTestTile(*screen,
+            POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) }));
         return 0;
-    }
 
     case WM_LBUTTONUP: {
         const POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (!impl->notifyWindow) return 0;
 
-        const int chip = impl->HitTestChip(point);
-        if (chip >= 0 && impl->notifyWindow) {
-            const mission::SpaceChip& c = impl->chips[static_cast<size_t>(chip)];
+        const int chip = impl->HitTestChip(*screen, point);
+        if (chip >= 0) {
+            const mission::SpaceChip& c = screen->chips[static_cast<size_t>(chip)];
             ::PostMessageW(impl->notifyWindow, impl->spaceMessage,
-                           c.add ? Mission::kSpaceAdd
-                                 : static_cast<WPARAM>(c.index), 0);
+                           c.add ? Mission::kSpaceAdd : static_cast<WPARAM>(c.index), 0);
             return 0;
         }
 
-        const int tile = impl->HitTestTile(point);
-        if (impl->notifyWindow) {
-            // A click on empty space dismisses, which is what macOS does and
-            // what makes the gesture feel like a place rather than a dialog.
-            if (tile >= 0)
-                ::PostMessageW(impl->notifyWindow, impl->activateMessage,
-                               static_cast<WPARAM>(tile), 0);
-            else
-                ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
+        // A click on empty space dismisses, which is what macOS does and what
+        // makes the gesture feel like a place rather than a dialog.
+        const int tile = impl->HitTestTile(*screen, point);
+        if (tile >= 0) {
+            ::PostMessageW(impl->notifyWindow, impl->activateMessage,
+                           static_cast<WPARAM>(screen->tiles[static_cast<size_t>(tile)].item), 0);
+        } else {
+            ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
         }
         return 0;
     }
 
     case WM_KEYDOWN: {
         if (!impl->notifyWindow) return 0;
+        const int hovered = screen->hovered;
         switch (wParam) {
         case VK_ESCAPE:
             ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
             return 0;
         case VK_RETURN:
         case VK_SPACE:
-            if (impl->hovered >= 0)
+            if (hovered >= 0)
                 ::PostMessageW(impl->notifyWindow, impl->activateMessage,
-                               static_cast<WPARAM>(impl->hovered), 0);
+                               static_cast<WPARAM>(screen->tiles[static_cast<size_t>(hovered)].item), 0);
             return 0;
-        case VK_LEFT:  impl->SetHovered(impl->Neighbour(impl->hovered, -1,  0)); return 0;
-        case VK_RIGHT: impl->SetHovered(impl->Neighbour(impl->hovered,  1,  0)); return 0;
-        case VK_UP:    impl->SetHovered(impl->Neighbour(impl->hovered,  0, -1)); return 0;
-        case VK_DOWN:  impl->SetHovered(impl->Neighbour(impl->hovered,  0,  1)); return 0;
+        case VK_LEFT:  impl->SetHovered(*screen, impl->Neighbour(*screen, hovered, -1,  0)); return 0;
+        case VK_RIGHT: impl->SetHovered(*screen, impl->Neighbour(*screen, hovered,  1,  0)); return 0;
+        case VK_UP:    impl->SetHovered(*screen, impl->Neighbour(*screen, hovered,  0, -1)); return 0;
+        case VK_DOWN:  impl->SetHovered(*screen, impl->Neighbour(*screen, hovered,  0,  1)); return 0;
         case VK_TAB:
-            impl->SetHovered(impl->tiles.empty()
-                                 ? -1
-                                 : (impl->hovered + 1) %
-                                       static_cast<int>(impl->tiles.size()));
+            if (!screen->tiles.empty())
+                impl->SetHovered(*screen,
+                                 (hovered + 1) % static_cast<int>(screen->tiles.size()));
             return 0;
         default:
             return 0;
         }
     }
 
-    // Clicking away, or anything else taking foreground, closes it. Mission
-    // Control is a place you are in, and you cannot be in it and somewhere else.
+    // Losing focus to something that is not one of our own overlays.
+    //
+    // The sibling check is what makes more than one display work at all. With
+    // an overlay per screen, clicking the second one IS a focus change, and
+    // dismissing on any focus change would close everything the moment the
+    // pointer moved to another monitor. WM_KILLFOCUS carries the window gaining
+    // focus, and for a same-thread transfer that handle is reliable.
     case WM_KILLFOCUS:
-        if (impl->visible && impl->notifyWindow)
+        if (impl->visible && impl->notifyWindow &&
+            !impl->IsOwnWindow(reinterpret_cast<HWND>(wParam)))
+            ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
+        return 0;
+
+    // Belt and braces for the same thing from the other direction: this fires
+    // only when activation crosses out of the process, which is exactly the
+    // condition, and it catches the paths where the focus handle comes back
+    // null. Dismissal is idempotent, so both firing is harmless.
+    case WM_ACTIVATEAPP:
+        if (wParam == FALSE && impl->visible && impl->notifyWindow)
             ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
         return 0;
 
@@ -385,34 +465,17 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 } // namespace
 
-bool Mission::Impl::CreateMissionWindow() {
-    WNDCLASSEXW wc{};
-    wc.cbSize        = sizeof(wc);
-    wc.lpfnWndProc   = MissionWndProc;
-    wc.hInstance     = instance;
-    wc.lpszClassName = kMissionClass;
-    wc.hCursor       = ::LoadCursorW(nullptr, IDC_ARROW);
-    ::RegisterClassExW(&wc);
+Mission::Impl::Screen* Mission::Impl::ScreenFor(HWND hwnd) {
+    for (Screen& screen : screens)
+        if (screen.hwnd == hwnd) return &screen;
+    return nullptr;
+}
 
-    // Activatable, unlike the switcher's panel.
-    //
-    // The panel must never take foreground, because it exists to hand
-    // foreground to something else and the activation path depends on the old
-    // window still being in front. Mission Control is the opposite: it is a
-    // place the user is in, it owns the keyboard while it is up, and losing
-    // focus is exactly the signal to close.
-    hwnd = ::CreateWindowExW(
-        WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        kMissionClass, L"MacTab Mission Control", WS_POPUP,
-        0, 0, 1, 1, nullptr, nullptr, instance, nullptr);
-
-    if (!hwnd) {
-        MACTAB_FAIL("mission: CreateWindowEx failed (err %lu)", ::GetLastError());
-        return false;
-    }
-
-    ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-    return true;
+bool Mission::Impl::IsOwnWindow(HWND hwnd) const {
+    if (!hwnd) return false;
+    for (const Screen& screen : screens)
+        if (screen.hwnd == hwnd) return true;
+    return false;
 }
 
 bool Mission::Impl::CreateDevices() {
@@ -426,11 +489,9 @@ bool Mission::Impl::CreateDevices() {
     graphics = abiGraphics.as<WUC::CompositionGraphicsDevice>();
 
     // The DirectComposition device behind the compositor, which is what DWM
-    // wants in order to hand back a thumbnail visual that belongs to our tree.
-    //
-    // Tried newest first. Which of these a given build's compositor admits to
-    // is not documented anywhere, and the only thing that matters is getting a
-    // pointer DWM accepts, so any of them will do.
+    // wants in order to hand back a thumbnail visual belonging to our tree.
+    // Which of these a given build admits to is not documented and any of them
+    // will do, so this tries newest first and takes what it gets.
     if (auto device3 = compositor.try_as<IDCompositionDevice3>())
         dcompDevice = device3.as<IUnknown>();
     else if (auto desktop = compositor.try_as<IDCompositionDesktopDevice>())
@@ -441,39 +502,196 @@ bool Mission::Impl::CreateDevices() {
     if (!dcompDevice)
         MACTAB_WARN("mission: no DirectComposition device behind the compositor; "
                     "falling back to snapshots");
-
     return true;
 }
 
-bool Mission::Impl::CreateVisualTree() {
-    auto interop =
-        compositor.as<ABI::Windows::UI::Composition::Desktop::ICompositorDesktopInterop>();
-    if (FAILED(interop->CreateDesktopWindowTarget(
-            hwnd, false,
-            reinterpret_cast<ABI::Windows::UI::Composition::Desktop::IDesktopWindowTarget**>(
-                winrt::put_abi(target))))) {
-        MACTAB_FAIL("mission: CreateDesktopWindowTarget failed");
+// The shadow and the selection outline, baked once at the largest scale in use.
+//
+// Nine-grid textures: the middle stretches and the corners do not, so one small
+// bitmap serves a 400 pixel window and a 1400 pixel one at the same cost.
+// Drawing these per tile, per invocation, is the shape of the code this replaced
+// and a large part of why the gesture felt heavy.
+bool Mission::Impl::BakeTextures() {
+    float dpi = 1.0f;
+    for (const Screen& screen : screens) dpi = (std::max)(dpi, screen.dpiScale);
+
+    const float spread = kShadowSpread * dpi;
+    const float radius = kTileRadius   * dpi;
+    const float side   = spread * 2 + radius * 2 + 4.0f;
+
+    textureSpread = spread;
+
+    shadowSurface = graphics.CreateDrawingSurface(
+        { side, side },
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+
+    {
+        SurfaceDraw draw(shadowSurface);
+        if (!draw.ok) return false;
+
+        ID2D1DeviceContext* dc = draw.dc.Get();
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+        // The shape goes into a bitmap first, because a blur is an effect and
+        // effects take an image rather than a geometry.
+        ComPtr<ID2D1BitmapRenderTarget> scratch;
+        if (FAILED(dc->CreateCompatibleRenderTarget(D2D1::SizeF(side, side), scratch.Put())))
+            return false;
+
+        scratch->BeginDraw();
+        scratch->Clear(D2D1::ColorF(0, 0, 0, 0));
+        {
+            ComPtr<ID2D1SolidColorBrush> black;
+            if (SUCCEEDED(scratch->CreateSolidColorBrush(
+                    D2D1::ColorF(0.0f, 0.0f, 0.0f, kShadowAlpha), black.Put()))) {
+                const D2D1_ROUNDED_RECT shape{
+                    D2D1::RectF(spread, spread, side - spread, side - spread),
+                    radius, radius };
+                scratch->FillRoundedRectangle(shape, black.Get());
+            }
+        }
+        scratch->EndDraw();
+
+        ComPtr<ID2D1Bitmap> shape;
+        if (FAILED(scratch->GetBitmap(shape.Put()))) return false;
+
+        ComPtr<ID2D1Effect> blur;
+        if (SUCCEEDED(dc->CreateEffect(CLSID_D2D1GaussianBlur, blur.Put()))) {
+            blur->SetInput(0, shape.Get());
+            blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, kShadowSigma * dpi);
+            dc->DrawImage(blur.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
+        } else {
+            dc->DrawBitmap(shape.Get());
+        }
+    }
+
+    outlineSurface = graphics.CreateDrawingSurface(
+        { side, side },
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+
+    {
+        SurfaceDraw draw(outlineSurface);
+        if (!draw.ok) return false;
+
+        ID2D1DeviceContext* dc = draw.dc.Get();
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+        ComPtr<ID2D1SolidColorBrush> brush;
+        if (SUCCEEDED(dc->CreateSolidColorBrush(accent, brush.Put()))) {
+            const float width = kOutlineWidth * dpi;
+            const D2D1_ROUNDED_RECT shape{
+                D2D1::RectF(spread - width, spread - width,
+                            side - spread + width, side - spread + width),
+                radius + width, radius + width };
+            dc->DrawRoundedRectangle(shape, brush.Get(), width);
+        }
+    }
+
+    auto ninegrid = [&](const WUC::CompositionDrawingSurface& surface) {
+        auto brush = compositor.CreateNineGridBrush();
+        brush.Source(compositor.CreateSurfaceBrush(surface));
+        brush.SetInsets(spread + radius);
+        return brush;
+    };
+
+    shadowBrush  = ninegrid(shadowSurface);
+    outlineBrush = ninegrid(outlineSurface);
+    return true;
+}
+
+bool Mission::Impl::BuildScreens() {
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = MissionWndProc;
+    wc.hInstance     = instance;
+    wc.lpszClassName = kMissionClass;
+    wc.hCursor       = ::LoadCursorW(nullptr, IDC_ARROW);
+    ::RegisterClassExW(&wc);
+
+    std::vector<Screen> built;
+
+    ::EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM param) -> BOOL {
+            MONITORINFO info{};
+            info.cbSize = sizeof(info);
+            if (!::GetMonitorInfoW(monitor, &info)) return TRUE;
+
+            Screen screen;
+            screen.monitor = monitor;
+            screen.rect    = info.rcMonitor;
+
+            // Per display, not per process. Everything on this overlay scales
+            // by this, and one shared value is the bug that makes a second
+            // monitor at a different scale look wrong.
+            UINT dpiX = 96, dpiY = 96;
+            if (SUCCEEDED(::GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
+                screen.dpiScale = static_cast<float>(dpiX) / 96.0f;
+
+            reinterpret_cast<std::vector<Screen>*>(param)->push_back(std::move(screen));
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&built));
+
+    if (built.empty()) {
+        MACTAB_FAIL("mission: no displays enumerated");
         return false;
     }
 
-    root = compositor.CreateContainerVisual();
-    root.RelativeSizeAdjustment({ 1.0f, 1.0f });
-    target.Root(root);
+    for (Screen& screen : built) {
+        // Activatable, unlike the switcher's panel. The panel must never take
+        // foreground because it exists to hand foreground to something else.
+        // This is a place the user is in: it owns the keyboard while it is up,
+        // and the process losing activation is the signal to close.
+        screen.hwnd = ::CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            kMissionClass, L"MacTab Mission Control", WS_POPUP,
+            screen.rect.left, screen.rect.top,
+            screen.rect.right - screen.rect.left,
+            screen.rect.bottom - screen.rect.top,
+            nullptr, nullptr, instance, nullptr);
 
-    backdropVisual  = compositor.CreateSpriteVisual();
-    tileLayer       = compositor.CreateContainerVisual();
-    selectionVisual = compositor.CreateSpriteVisual();
-    titleVisual     = compositor.CreateSpriteVisual();
-    spacesVisual    = compositor.CreateSpriteVisual();
+        if (!screen.hwnd) {
+            MACTAB_FAIL("mission: CreateWindowEx failed (err %lu)", ::GetLastError());
+            return false;
+        }
+        ::SetWindowLongPtrW(screen.hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
 
-    auto children = root.Children();
-    children.InsertAtTop(backdropVisual);
-    children.InsertAtTop(selectionVisual);
-    children.InsertAtTop(tileLayer);
-    children.InsertAtTop(titleVisual);
-    children.InsertAtTop(spacesVisual);
+        auto interop =
+            compositor.as<ABI::Windows::UI::Composition::Desktop::ICompositorDesktopInterop>();
+        if (FAILED(interop->CreateDesktopWindowTarget(
+                screen.hwnd, false,
+                reinterpret_cast<ABI::Windows::UI::Composition::Desktop::IDesktopWindowTarget**>(
+                    winrt::put_abi(screen.target))))) {
+            MACTAB_FAIL("mission: CreateDesktopWindowTarget failed");
+            return false;
+        }
 
-    root.Opacity(0.0f);
+        screen.root = compositor.CreateContainerVisual();
+        screen.root.RelativeSizeAdjustment({ 1.0f, 1.0f });
+        screen.target.Root(screen.root);
+
+        screen.backdrop    = compositor.CreateSpriteVisual();
+        screen.outline     = compositor.CreateSpriteVisual();
+        screen.tileLayer   = compositor.CreateContainerVisual();
+        screen.chromeLayer = compositor.CreateContainerVisual();
+        screen.bar         = compositor.CreateSpriteVisual();
+
+        auto children = screen.root.Children();
+        children.InsertAtTop(screen.backdrop);
+        children.InsertAtTop(screen.outline);
+        children.InsertAtTop(screen.tileLayer);
+        children.InsertAtTop(screen.chromeLayer);
+        children.InsertAtTop(screen.bar);
+
+        screen.outline.Opacity(0.0f);
+        screen.root.Opacity(0.0f);
+    }
+
+    screens = std::move(built);
+    MACTAB_DIAG("mission: %zu display(s)", screens.size());
     return true;
 }
 
@@ -493,10 +711,9 @@ bool Mission::Initialize(HINSTANCE instance, HWND notifyWindow,
         //
         // Not shared with the panel, which would be the obvious economy, and
         // the reason is the thumbnails: DWM is handed the DirectComposition
-        // device sitting behind a compositor and returns a visual that belongs
-        // to that compositor's tree. Device and tree have to be the same one,
-        // and the panel does not expose either. Two compositors on one thread
-        // is supported and costs a few hundred kilobytes.
+        // device sitting behind a compositor and returns a visual belonging to
+        // that compositor's tree. Device and tree have to be the same one, and
+        // the panel exposes neither.
         impl.compositor = WUC::Compositor();
     } catch (const winrt::hresult_error& e) {
         MACTAB_FAIL("mission: Compositor construction failed (0x%08lX)",
@@ -512,15 +729,18 @@ bool Mission::Initialize(HINSTANCE instance, HWND notifyWindow,
         return false;
     }
 
-    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     ComPtr<ID3D11Device> d3dDevice;
     HRESULT hr = ::D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
                                      nullptr, 0, D3D11_SDK_VERSION,
                                      d3dDevice.Put(), nullptr, nullptr);
-    if (FAILED(hr))
+    if (FAILED(hr)) {
+        MACTAB_WARN("mission: hardware D3D device failed (0x%08lX), trying WARP",
+                    static_cast<unsigned long>(hr));
         hr = ::D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
                                  nullptr, 0, D3D11_SDK_VERSION,
                                  d3dDevice.Put(), nullptr, nullptr);
+    }
     if (FAILED(hr)) {
         MACTAB_FAIL("mission: no D3D11 device (0x%08lX)", static_cast<unsigned long>(hr));
         return false;
@@ -539,22 +759,45 @@ bool Mission::Initialize(HINSTANCE instance, HWND notifyWindow,
         return false;
     }
 
-    if (!impl.CreateMissionWindow()) return false;
-    if (!impl.CreateDevices())       return false;
-    if (!impl.CreateVisualTree())    return false;
+    impl.themeIsLight = ResolveLightTheme();
+    impl.theme        = MakeTheme(impl.themeIsLight);
 
-    // Probe the thumbnail path now rather than on the reveal path, and log
-    // which tier won so a screenshot arrives with the answer attached.
+    // The accent colour, from the API the shell itself uses.
     //
-    // The source is the host window rather than the overlay itself. Whether DWM
-    // will compose a window's thumbnail into that same window is not documented
-    // and is exactly the kind of thing that would answer "no" for a reason that
-    // has nothing to do with whether the export works.
-    thumbnail::Probe(impl.hwnd, notifyWindow);
+    // Deliberately NOT DwmGetColorizationColor, which answers with the blended
+    // glass colour rather than the accent, and deliberately not the registry,
+    // whose format nobody promises. This one also ignores the "show accent
+    // colour on title bars" setting, which is correct: that setting controls
+    // where DWM paints the accent, not what the accent is, and Windows uses the
+    // accent for selection either way.
+    try {
+        impl.uiSettings = winrt::Windows::UI::ViewManagement::UISettings();
+        const WUI::Color colour = impl.uiSettings.GetColorValue(
+            winrt::Windows::UI::ViewManagement::UIColorType::Accent);
+        if (colour.A != 0)
+            impl.accent = D2D1::ColorF(colour.R / 255.0f, colour.G / 255.0f,
+                                       colour.B / 255.0f, 1.0f);
+    } catch (const winrt::hresult_error&) {
+        MACTAB_WARN("mission: UISettings unavailable; using the default accent");
+    }
+
+    if (!impl.CreateDevices()) return false;
+    if (!impl.BuildScreens())  return false;
+
+    // Probed here rather than on the reveal path, using the host window as the
+    // source: whether DWM will compose a window's thumbnail into that same
+    // window is undocumented, and a refusal for that reason would say nothing
+    // about whether the export works.
+    thumbnail::Probe(impl.screens.front().hwnd, notifyWindow);
 
     impl.ready = true;
-    MACTAB_DIAG("mission: initialised, thumbnails via %s",
-                thumbnail::TierName(thumbnail::Current()));
+
+    if (!impl.BakeTextures())
+        MACTAB_WARN("mission: shadow and outline textures unavailable");
+
+    MACTAB_DIAG("mission: initialised, thumbnails via %s, accent %.2f %.2f %.2f",
+                thumbnail::TierName(thumbnail::Current()),
+                impl.accent.r, impl.accent.g, impl.accent.b);
     return true;
 }
 
@@ -562,32 +805,15 @@ void Mission::Prewarm() {
     Impl& impl = *m_impl;
     if (!impl.ready) return;
 
-    // Decoding only, on a thread of its own, and the results land in the
-    // wallpaper cache. Nothing here touches the compositor or D2D, both of
-    // which have thread affinity.
+    // The wallpapers, on a thread of their own, because they are the one part
+    // that touches the disk. Nothing here goes near the compositor or D2D, both
+    // of which have thread affinity.
     struct Job { HMONITOR monitor; int width, height; };
     std::vector<Job> jobs;
-
-    ::EnumDisplayMonitors(
-        nullptr, nullptr,
-        [](HMONITOR monitor, HDC, LPRECT, LPARAM param) -> BOOL {
-            MONITORINFO info{};
-            info.cbSize = sizeof(info);
-            if (!::GetMonitorInfoW(monitor, &info)) return TRUE;
-
-            const int width  = info.rcMonitor.right - info.rcMonitor.left;
-            const int height = info.rcMonitor.bottom - info.rcMonitor.top;
-            if (width <= 0 || height <= 0) return TRUE;
-
-            reinterpret_cast<std::vector<Job>*>(param)->push_back(
-                Job{ monitor,
-                     (std::max)(1, static_cast<int>(width  * kBackdropDownscale)),
-                     (std::max)(1, static_cast<int>(height * kBackdropDownscale)) });
-            return TRUE;
-        },
-        reinterpret_cast<LPARAM>(&jobs));
-
-    if (jobs.empty()) return;
+    for (const Impl::Screen& screen : impl.screens)
+        jobs.push_back(Job{ screen.monitor,
+                            (std::max)(1, static_cast<int>(screen.Width()  * kBackdropDownscale)),
+                            (std::max)(1, static_cast<int>(screen.Height() * kBackdropDownscale)) });
 
     std::thread([jobs] {
         for (const Job& job : jobs)
@@ -595,82 +821,95 @@ void Mission::Prewarm() {
     }).detach();
 }
 
+void Mission::InvalidateBackdrop() {
+    Impl& impl = *m_impl;
+    wallpaper::Invalidate();
+    for (Impl::Screen& screen : impl.screens)
+        screen.backdropSurface = nullptr;
+    MACTAB_DIAG("mission: backdrops invalidated");
+}
+
 void Mission::Shutdown() {
     Impl& impl = *m_impl;
-    if (!impl.ready && !impl.hwnd) return;
+    if (!impl.ready && impl.screens.empty()) return;
 
     impl.ready = false;
-    impl.ReleaseTiles();
 
-    impl.root            = nullptr;
-    impl.backdropVisual  = nullptr;
-    impl.spacesVisual    = nullptr;
-    impl.tileLayer       = nullptr;
-    impl.selectionVisual = nullptr;
-    impl.titleVisual     = nullptr;
-    impl.backdropSurface = nullptr;
-    impl.spacesSurface   = nullptr;
-    impl.titleSurface    = nullptr;
-    impl.target          = nullptr;
-    impl.graphics        = nullptr;
-    impl.compositor      = nullptr;
-    impl.dcompDevice = nullptr;
-
-    if (impl.hwnd) {
-        ::DestroyWindow(impl.hwnd);
-        impl.hwnd = nullptr;
+    for (Impl::Screen& screen : impl.screens) {
+        impl.ReleaseTiles(screen);
+        screen.root            = nullptr;
+        screen.backdrop        = nullptr;
+        screen.tileLayer       = nullptr;
+        screen.chromeLayer     = nullptr;
+        screen.outline         = nullptr;
+        screen.bar             = nullptr;
+        screen.backdropSurface = nullptr;
+        screen.barSurface      = nullptr;
+        screen.target          = nullptr;
+        if (screen.hwnd) ::DestroyWindow(screen.hwnd);
     }
+    impl.screens.clear();
+
+    impl.iconBitmaps.clear();
+    impl.shadowBrush    = nullptr;
+    impl.outlineBrush   = nullptr;
+    impl.shadowSurface  = nullptr;
+    impl.outlineSurface = nullptr;
+    impl.graphics       = nullptr;
+    impl.compositor     = nullptr;
+    impl.dcompDevice    = nullptr;
+    impl.uiSettings     = nullptr;
+
     MACTAB_DIAG("mission: shut down");
 }
 
 bool Mission::Ready() const   { return m_impl->ready; }
+bool Mission::Visible() const { return m_impl->visible; }
 
 HWND Mission::ItemWindow(int index) const {
     if (index < 0 || index >= static_cast<int>(m_impl->items.size())) return nullptr;
     return m_impl->items[static_cast<size_t>(index)].hwnd;
 }
 
-bool Mission::Visible() const { return m_impl->visible; }
-HWND Mission::Hwnd() const    { return m_impl->hwnd; }
+void Mission::Impl::ReleaseTiles(Screen& screen) {
+    if (screen.tileLayer)   screen.tileLayer.Children().RemoveAll();
+    if (screen.chromeLayer) screen.chromeLayer.Children().RemoveAll();
 
-void Mission::Impl::ReleaseTiles() {
-    if (tileLayer)
-        tileLayer.Children().RemoveAll();
-
-    for (Tile& tile : tiles)
+    for (Tile& tile : screen.tiles)
         thumbnail::ReleaseSharedVisual(tile.thumbnail);
 
-    tiles.clear();
+    screen.tiles.clear();
+    screen.hovered = -1;
 }
 
 // ---------------------------------------------------------------------------
 
-void Mission::Impl::BakeBackdrop() {
-    const int width  = monitorRect.right - monitorRect.left;
-    const int height = monitorRect.bottom - monitorRect.top;
-    if (width <= 0 || height <= 0) return;
+void Mission::Impl::BakeBackdrop(Screen& screen) {
+    // Kept for the life of the process. It depends on the wallpaper and the
+    // monitor, neither of which changes while the machine is idle, and baking
+    // it per invocation was the single largest thing on the reveal path.
+    if (screen.backdropSurface) {
+        screen.backdrop.Size({ screen.Width(), screen.Height() });
+        return;
+    }
 
-    const int smallW = (std::max)(1, static_cast<int>(width  * kBackdropDownscale));
-    const int smallH = (std::max)(1, static_cast<int>(height * kBackdropDownscale));
+    const int smallW = (std::max)(1, static_cast<int>(screen.Width()  * kBackdropDownscale));
+    const int smallH = (std::max)(1, static_cast<int>(screen.Height() * kBackdropDownscale));
 
-    backdropSurface = graphics.CreateDrawingSurface(
+    screen.backdropSurface = graphics.CreateDrawingSurface(
         { static_cast<float>(smallW), static_cast<float>(smallH) },
         winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
         winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
 
-    Bitmap paper = wallpaper::ForMonitor(monitor, smallW, smallH);
+    Bitmap paper = wallpaper::ForMonitor(screen.monitor, smallW, smallH);
 
-    SurfaceDraw draw(backdropSurface);
+    SurfaceDraw draw(screen.backdropSurface);
     if (!draw.ok) return;
 
     ID2D1DeviceContext* dc = draw.dc.Get();
-    dc->SetTransform(D2D1::Matrix3x2F::Translation(static_cast<float>(draw.offset.x),
-                                                   static_cast<float>(draw.offset.y)));
     dc->Clear(D2D1::ColorF(0, 0, 0, 0));
 
     if (paper.Empty()) {
-        // No picture, or it could not be read. The desktop colour is what the
-        // user would be looking at anyway.
         const uint32_t solid = wallpaper::SolidColour();
         dc->Clear(D2D1::ColorF(RedOf(solid)   / 255.0f,
                                GreenOf(solid) / 255.0f,
@@ -680,9 +919,9 @@ void Mission::Impl::BakeBackdrop() {
         if (SUCCEEDED(dc->CreateEffect(CLSID_D2D1GaussianBlur, blur.Put()))) {
             blur->SetInput(0, source.Get());
             blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
-                           Scaled(config::Current().missionBlurSigma) * kBackdropDownscale);
-            blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
-                           D2D1_BORDER_MODE_HARD);
+                           screen.Scaled(config::Current().missionBlurSigma) *
+                               kBackdropDownscale);
+            blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
             dc->DrawImage(blur.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
         } else {
             dc->DrawBitmap(source.Get());
@@ -690,196 +929,242 @@ void Mission::Impl::BakeBackdrop() {
     }
 
     // The dim. Mission Control pushes the desktop back so the windows read as
-    // floating above it; without this the arrangement competes with the
-    // wallpaper for attention and a busy picture wins.
+    // floating above it; without it a busy wallpaper competes with the
+    // arrangement and wins.
     D2D1_COLOR_F dim = theme.backdropTint;
     dim.a = config::Current().missionDim;
 
     ComPtr<ID2D1SolidColorBrush> brush;
     if (SUCCEEDED(dc->CreateSolidColorBrush(dim, brush.Put())))
         dc->FillRectangle(D2D1::RectF(0, 0, static_cast<float>(smallW),
-                                      static_cast<float>(smallH)),
-                          brush.Get());
+                                      static_cast<float>(smallH)), brush.Get());
 
-    auto surfaceBrush = compositor.CreateSurfaceBrush(backdropSurface);
+    auto surfaceBrush = compositor.CreateSurfaceBrush(screen.backdropSurface);
     surfaceBrush.Stretch(WUC::CompositionStretch::Fill);
-    backdropVisual.Brush(surfaceBrush);
-    backdropVisual.Size({ static_cast<float>(width), static_cast<float>(height) });
-    backdropVisual.Offset({ 0.0f, 0.0f, 0.0f });
+    screen.backdrop.Brush(surfaceBrush);
+    screen.backdrop.Size({ screen.Width(), screen.Height() });
+    screen.backdrop.Offset({ 0.0f, 0.0f, 0.0f });
 }
 
-void Mission::Impl::BakeSpaces() {
-    const float width  = static_cast<float>(monitorRect.right - monitorRect.left);
-    const float strip  = Scaled(kSpacesStripHeight);
+void Mission::Impl::BakeBar(Screen& screen) {
+    screen.chips.clear();
 
-    chips.clear();
     if (spaces.empty()) {
-        spacesVisual.Size({ 0.0f, 0.0f });
+        screen.bar.Size({ 0.0f, 0.0f });
         return;
     }
 
-    const float height = static_cast<float>(monitorRect.bottom - monitorRect.top);
-    // Centre the miniatures in the band ABOVE the labels, not in the whole
-    // band, so the names have somewhere to sit.
-    chips = mission::LayoutSpaces(static_cast<int>(spaces.size()), width,
-                                  strip - Scaled(kSpaceLabelHeight),
-                                  Scaled(kSpaceChipHeight),
-                                  (height > 0.0f) ? width / height : 1.6f,
-                                  Scaled(kSpaceChipGap));
+    const float width  = screen.Width();
+    const float height = screen.Scaled(kBarHeight);
 
-    spacesSurface = graphics.CreateDrawingSurface(
-        { width, strip },
-        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+    // The miniatures are centred in the band above the labels, so the names
+    // have somewhere to sit.
+    screen.chips = mission::LayoutSpaces(
+        static_cast<int>(spaces.size()), width, height - screen.Scaled(kChipLabel),
+        screen.Scaled(kChipHeight),
+        (screen.Height() > 0.0f) ? screen.Width() / screen.Height() : 1.6f,
+        screen.Scaled(kChipGap));
 
-    SurfaceDraw draw(spacesSurface);
-    if (!draw.ok) return;
-
-    ID2D1DeviceContext* dc = draw.dc.Get();
-    dc->SetTransform(D2D1::Matrix3x2F::Translation(static_cast<float>(draw.offset.x),
-                                                   static_cast<float>(draw.offset.y)));
-    dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-
-    ComPtr<IDWriteTextFormat> format;
-    dwriteFactory->CreateTextFormat(L"Segoe UI Variable Display", nullptr,
-                                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                    DWRITE_FONT_STYLE_NORMAL,
-                                    DWRITE_FONT_STRETCH_NORMAL,
-                                    Scaled(13.0f), L"", format.Put());
-    if (!format)
-        dwriteFactory->CreateTextFormat(L"Segoe UI", nullptr,
-                                        DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                        DWRITE_FONT_STYLE_NORMAL,
-                                        DWRITE_FONT_STRETCH_NORMAL,
-                                        Scaled(13.0f), L"", format.Put());
-    if (format) {
-        format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    // The add button is round, smaller than a desktop, and all the way to the
+    // right rather than trailing the centred run.
+    if (!screen.chips.empty()) {
+        mission::SpaceChip& add = screen.chips.back();
+        const float side = screen.Scaled(kChipHeight) * 0.42f;
+        add.w = side;
+        add.h = side;
+        add.x = width - screen.Scaled(kBarInset) - side;
+        add.y = (height - screen.Scaled(kChipLabel) - side) * 0.5f;
     }
 
-    ComPtr<ID2D1SolidColorBrush> textBrush;
-    dc->CreateSolidColorBrush(theme.text, textBrush.Put());
-
-    const float radius = Scaled(kSpaceChipRadius);
-
-    // Every desktop shows the wallpaper, which is what an empty one looks like
-    // and is a great deal closer to the real thing than a grey rectangle.
-    //
-    // Not a picture of what is actually on each desktop. Windows on another
-    // desktop are shell-cloaked, and DWM does not compose a cloaked window
-    // through any path available here, so there is nothing to show but the
-    // desktop itself. Saying so in the release notes beats pretending.
-    // ID2D1BitmapBrush1 and the ...PROPERTIES1 struct, not the plain ones.
-    // ID2D1DeviceContext declares its own overloads of CreateBitmapBrush, which
-    // hide every one the render target had, so the older form does not resolve.
-    ComPtr<ID2D1BitmapBrush1> paperBrush;
-    if (!chips.empty()) {
-        const int chipW = (std::max)(1, static_cast<int>(chips[0].w));
-        const int chipH = (std::max)(1, static_cast<int>(chips[0].h));
-        Bitmap paper = wallpaper::ForMonitor(monitor, chipW, chipH);
-        if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(paper))) {
-            D2D1_BITMAP_BRUSH_PROPERTIES1 props{};
-            props.extendModeX = D2D1_EXTEND_MODE_CLAMP;
-            props.extendModeY = D2D1_EXTEND_MODE_CLAMP;
-            props.interpolationMode = D2D1_INTERPOLATION_MODE_LINEAR;
-            // Four arguments, with no brush properties. The three-argument
-            // convenience form is an inline helper that only some SDK
-            // versions carry, and the explicit one resolves on all of them.
-            dc->CreateBitmapBrush(bitmap.Get(), &props, nullptr, paperBrush.Put());
-        }
-    }
-
-    for (const mission::SpaceChip& chip : chips) {
-        const bool current = !chip.add &&
-                             chip.index >= 0 &&
-                             chip.index < static_cast<int>(spaces.size()) &&
-                             spaces[static_cast<size_t>(chip.index)].current;
-
-        if (!chip.add && paperBrush) {
-            paperBrush->SetTransform(D2D1::Matrix3x2F::Translation(chip.x, chip.y));
-            FillSquircleWith(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h,
-                             radius, paperBrush.Get());
-
-            // The desktop you are not on is pushed back, the same way the
-            // wallpaper behind the arrangement is.
-            if (!current)
-                FillSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h,
-                             radius,
-                             themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.45f)
-                                          : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.45f));
-        } else {
-            FillSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h, radius,
-                         current ? theme.chipCurrent : theme.chip);
-        }
-
-        StrokeSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h,
-                       radius, Scaled(current ? 2.5f : 1.0f),
-                       current ? theme.chipBorder
-                               : D2D1::ColorF(theme.chipBorder.r, theme.chipBorder.g,
-                                              theme.chipBorder.b,
-                                              theme.chipBorder.a * 0.35f));
-
-        if (!format || !textBrush) continue;
-
-        if (chip.add) {
-            dc->DrawTextW(L"+", 1, format.Get(),
-                          D2D1::RectF(chip.x, chip.y, chip.x + chip.w, chip.y + chip.h),
-                          textBrush.Get());
-        } else if (chip.index >= 0 && chip.index < static_cast<int>(spaces.size())) {
-            // Under the miniature, not on it. A name printed over a photograph
-            // is unreadable on some fraction of all wallpapers, and there is no
-            // colour that fixes that.
-            const std::wstring& name = spaces[static_cast<size_t>(chip.index)].name;
-            dc->DrawTextW(name.c_str(), static_cast<UINT32>(name.size()),
-                          format.Get(),
-                          D2D1::RectF(chip.x, chip.y + chip.h,
-                                      chip.x + chip.w, strip),
-                          textBrush.Get());
-        }
-    }
-
-    spacesVisual.Brush(compositor.CreateSurfaceBrush(spacesSurface));
-    spacesVisual.Size({ width, strip });
-    spacesVisual.Offset({ 0.0f, 0.0f, 0.0f });
-}
-
-void Mission::Impl::BakeTitle() {
-    if (hovered < 0 || hovered >= static_cast<int>(items.size()) ||
-        hovered >= static_cast<int>(tiles.size())) {
-        titleVisual.Size({ 0.0f, 0.0f });
-        return;
-    }
-
-    const MissionItem& item = items[static_cast<size_t>(hovered)];
-    const std::wstring text = item.title.empty() ? item.appName : item.title;
-
-    const float height = Scaled(kTitleHeight);
-    const float width  = (std::min)(Scaled(560.0f),
-                                    static_cast<float>(monitorRect.right - monitorRect.left));
-
-    titleSurface = graphics.CreateDrawingSurface(
+    screen.barSurface = graphics.CreateDrawingSurface(
         { width, height },
         winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
         winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
 
-    SurfaceDraw draw(titleSurface);
+    SurfaceDraw draw(screen.barSurface);
     if (!draw.ok) return;
 
     ID2D1DeviceContext* dc = draw.dc.Get();
-    dc->SetTransform(D2D1::Matrix3x2F::Translation(static_cast<float>(draw.offset.x),
-                                                   static_cast<float>(draw.offset.y)));
     dc->Clear(D2D1::ColorF(0, 0, 0, 0));
 
-    ComPtr<IDWriteTextFormat> format;
-    dwriteFactory->CreateTextFormat(L"Segoe UI Variable Display", nullptr,
-                                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                    DWRITE_FONT_STYLE_NORMAL,
-                                    DWRITE_FONT_STRETCH_NORMAL,
-                                    Scaled(14.0f), L"", format.Put());
+    // The bar itself: full width, edge to edge, with a hairline along the
+    // bottom. The wallpaper behind it is already blurred, so a translucent fill
+    // over that reads as glass without a second blur pass.
+    ComPtr<ID2D1SolidColorBrush> fill;
+    if (SUCCEEDED(dc->CreateSolidColorBrush(theme.bar, fill.Put())))
+        dc->FillRectangle(D2D1::RectF(0.0f, 0.0f, width, height), fill.Get());
+
+    ComPtr<ID2D1SolidColorBrush> line;
+    if (SUCCEEDED(dc->CreateSolidColorBrush(theme.barLine, line.Put())))
+        dc->FillRectangle(D2D1::RectF(0.0f, height - screen.Scaled(1.0f), width, height),
+                          line.Get());
+
+    // The miniatures come from the wallpaper already decoded for the backdrop,
+    // resized here rather than read again. Asking the cache for a second size
+    // means a second decode of what can be a 4K photograph, and it happened on
+    // every single invocation.
+    ComPtr<ID2D1BitmapBrush1> paperBrush;
+    if (!screen.chips.empty()) {
+        const int backdropW = (std::max)(1, static_cast<int>(screen.Width()  * kBackdropDownscale));
+        const int backdropH = (std::max)(1, static_cast<int>(screen.Height() * kBackdropDownscale));
+        const int chipW = (std::max)(1, static_cast<int>(screen.chips[0].w));
+        const int chipH = (std::max)(1, static_cast<int>(screen.chips[0].h));
+
+        Bitmap paper = wallpaper::ForMonitor(screen.monitor, backdropW, backdropH);
+        if (!paper.Empty()) {
+            Bitmap chip = Resize(paper, chipW, chipH);
+            if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(chip))) {
+                D2D1_BITMAP_BRUSH_PROPERTIES1 props{};
+                props.extendModeX       = D2D1_EXTEND_MODE_CLAMP;
+                props.extendModeY       = D2D1_EXTEND_MODE_CLAMP;
+                props.interpolationMode = D2D1_INTERPOLATION_MODE_LINEAR;
+                dc->CreateBitmapBrush(bitmap.Get(), &props, nullptr, paperBrush.Put());
+            }
+        }
+    }
+
+    ComPtr<IDWriteTextFormat> format =
+        MakeFormat(dwriteFactory.Get(), screen.Scaled(12.0f), DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    ComPtr<ID2D1SolidColorBrush> textBrush;
+    dc->CreateSolidColorBrush(theme.text, textBrush.Put());
+
+    const float radius = screen.Scaled(kChipRadius);
+
+    for (const mission::SpaceChip& chip : screen.chips) {
+        if (chip.add) {
+            const float cx = chip.x + chip.w * 0.5f;
+            const float cy = chip.y + chip.h * 0.5f;
+            const float r  = chip.w * 0.5f;
+
+            ComPtr<ID2D1SolidColorBrush> disc;
+            if (SUCCEEDED(dc->CreateSolidColorBrush(theme.chip, disc.Put())))
+                dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r), disc.Get());
+
+            if (textBrush) {
+                const float arm    = r * 0.42f;
+                const float stroke = screen.Scaled(2.0f);
+                dc->DrawLine(D2D1::Point2F(cx - arm, cy), D2D1::Point2F(cx + arm, cy),
+                             textBrush.Get(), stroke);
+                dc->DrawLine(D2D1::Point2F(cx, cy - arm), D2D1::Point2F(cx, cy + arm),
+                             textBrush.Get(), stroke);
+                dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r),
+                                textBrush.Get(), screen.Scaled(1.0f));
+            }
+            continue;
+        }
+
+        const bool current = chip.index >= 0 &&
+                             chip.index < static_cast<int>(spaces.size()) &&
+                             spaces[static_cast<size_t>(chip.index)].current;
+
+        // Every desktop shows the wallpaper, which is what an empty one looks
+        // like. Not a picture of what is on it: windows on another desktop are
+        // shell-cloaked and DWM will not compose a cloaked window through any
+        // path a normal process has.
+        if (paperBrush) {
+            paperBrush->SetTransform(D2D1::Matrix3x2F::Translation(chip.x, chip.y));
+            FillSquircleWith(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h,
+                             radius, paperBrush.Get());
+            if (!current)
+                FillSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h, radius,
+                             themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.45f)
+                                          : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.45f));
+        } else {
+            FillSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h, radius,
+                         theme.chip);
+        }
+
+        StrokeSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h, radius,
+                       screen.Scaled(current ? 2.5f : 1.0f),
+                       current ? theme.chipBorder
+                               : D2D1::ColorF(theme.chipBorder.r, theme.chipBorder.g,
+                                              theme.chipBorder.b, theme.chipBorder.a * 0.3f));
+
+        // The name goes under the miniature, not on it: a name printed over a
+        // photograph is unreadable on some fraction of all wallpapers, and no
+        // colour fixes that.
+        if (format && textBrush && chip.index >= 0 &&
+            chip.index < static_cast<int>(spaces.size())) {
+            const std::wstring& name = spaces[static_cast<size_t>(chip.index)].name;
+            dc->DrawTextW(name.c_str(), static_cast<UINT32>(name.size()), format.Get(),
+                          D2D1::RectF(chip.x, chip.y + chip.h, chip.x + chip.w,
+                                      chip.y + chip.h + screen.Scaled(kChipLabel)),
+                          textBrush.Get());
+        }
+    }
+
+    screen.bar.Brush(compositor.CreateSurfaceBrush(screen.barSurface));
+    screen.bar.Size({ width, height });
+    screen.bar.Offset({ 0.0f, 0.0f, 0.0f });
+}
+
+ComPtr<ID2D1Bitmap1> Mission::Impl::IconFor(ID2D1DeviceContext* dc,
+                                            const MissionItem& item) {
+    const auto existing = iconBitmaps.find(item.appKey);
+    if (existing != iconBitmaps.end()) return existing->second;
+    if (item.icon.Empty()) return {};
+
+    // Uploaded once per application rather than once per window. A D2D bitmap
+    // belongs to the device, not to the context it was made on, so the same one
+    // draws into every surface.
+    ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, item.icon);
+    if (bitmap) iconBitmaps.emplace(item.appKey, bitmap);
+    return bitmap;
+}
+
+// The app icon and the name, in one small surface under each pile.
+//
+// One surface per pile, not per window and not one the size of the screen. A
+// screen-sized premultiplied surface on a 4K display is thirty-three megabytes
+// for what amounts to a few hundred kilobytes of ink, and a surface per window
+// is a separate BeginDraw and flush for each one.
+void Mission::Impl::BakeChrome(Screen& screen, Tile& tile) {
+    if (tile.item < 0 || tile.item >= static_cast<int>(items.size())) return;
+    if (!tile.chrome) return;
+
+    const MissionItem& item = items[static_cast<size_t>(tile.item)];
+
+    // Grouped, the label names the application, because the pile is the
+    // application. Ungrouped, every window is its own pile of one and the label
+    // names the window.
+    const bool grouped = config::Current().missionGroupByApp;
+    const std::wstring text =
+        (grouped && !item.appName.empty()) ? item.appName
+                                           : (item.title.empty() ? item.appName : item.title);
+
+    const float badge  = screen.Scaled(kBadgeSize);
+    const float titleH = screen.Scaled(kTitleHeight);
+
+    // Wide enough for a readable name under a narrow window, and never so wide
+    // that two neighbours' names run into each other.
+    const float width  = (std::max)(tile.pileW, screen.Scaled(190.0f));
+    const float height = badge * 0.5f + screen.Scaled(kTitleGap) + titleH;
+
+    tile.chromeSurface = graphics.CreateDrawingSurface(
+        { width, height },
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+
+    SurfaceDraw draw(tile.chromeSurface);
+    if (!draw.ok) return;
+
+    ID2D1DeviceContext* dc = draw.dc.Get();
+    dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+    const float centre = width * 0.5f;
+
+    // The badge sits half in and half out of the pile's bottom edge, which is
+    // what makes it read as belonging to those windows rather than floating
+    // under them. This surface holds the lower half.
+    if (ComPtr<ID2D1Bitmap1> icon = IconFor(dc, item)) {
+        dc->DrawBitmap(icon.Get(),
+                       D2D1::RectF(centre - badge * 0.5f, -badge * 0.5f,
+                                   centre + badge * 0.5f,  badge * 0.5f));
+    }
+
+    ComPtr<IDWriteTextFormat> format =
+        MakeFormat(dwriteFactory.Get(), screen.Scaled(12.5f), DWRITE_FONT_WEIGHT_NORMAL);
     if (!format) return;
-    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
     ComPtr<IDWriteInlineObject> ellipsis;
     if (SUCCEEDED(dwriteFactory->CreateEllipsisTrimmingSign(format.Get(), ellipsis.Put()))) {
@@ -887,55 +1172,264 @@ void Mission::Impl::BakeTitle() {
         format->SetTrimming(&trimming, ellipsis.Get());
     }
 
-    // A dark capsule behind the text. The title sits over the wallpaper, which
-    // can be any colour at all, so a bare string is unreadable on roughly half
-    // of all desktops.
+    const float top = badge * 0.5f + screen.Scaled(kTitleGap);
+
+    // A capsule behind the name. It sits over the wallpaper, which can be any
+    // colour at all, so bare text is unreadable on roughly half of all desktops.
     ComPtr<ID2D1SolidColorBrush> plate;
-    if (SUCCEEDED(dc->CreateSolidColorBrush(
-            themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.82f)
-                         : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.55f), plate.Put()))) {
+    if (SUCCEEDED(dc->CreateSolidColorBrush(theme.plate, plate.Put()))) {
         const D2D1_ROUNDED_RECT capsule{
-            D2D1::RectF(0.0f, 0.0f, width, height), height * 0.5f, height * 0.5f };
+            D2D1::RectF(screen.Scaled(8.0f), top, width - screen.Scaled(8.0f), top + titleH),
+            titleH * 0.5f, titleH * 0.5f };
         dc->FillRoundedRectangle(capsule, plate.Get());
     }
 
     ComPtr<ID2D1SolidColorBrush> brush;
     if (SUCCEEDED(dc->CreateSolidColorBrush(theme.text, brush.Put())))
         dc->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format.Get(),
-                      D2D1::RectF(Scaled(14.0f), 0.0f, width - Scaled(14.0f), height),
+                      D2D1::RectF(screen.Scaled(18.0f), top,
+                                  width - screen.Scaled(18.0f), top + titleH),
                       brush.Get());
 
-    titleVisual.Brush(compositor.CreateSurfaceBrush(titleSurface));
-    titleVisual.Size({ width, height });
-
-    const RECT& rect = tiles[static_cast<size_t>(hovered)].screenRect;
-    const float centre = static_cast<float>(rect.left + rect.right) * 0.5f;
-    titleVisual.Offset({ centre - width * 0.5f,
-                         static_cast<float>(rect.bottom) + Scaled(kTitleGap), 0.0f });
+    tile.chrome.Brush(compositor.CreateSurfaceBrush(tile.chromeSurface));
+    tile.chrome.Size({ width, height });
+    tile.chrome.Offset({ tile.pileX + (tile.pileW - width) * 0.5f, tile.pileBottom, 0.0f });
 }
 
-void Mission::Impl::PositionSelection() {
-    if (hovered < 0 || hovered >= static_cast<int>(tiles.size())) {
-        selectionVisual.Opacity(0.0f);
+void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members) {
+    ReleaseTiles(screen);
+    if (members.empty()) return;
+
+    const float margin  = screen.Scaled(kOuterMargin);
+    const float barH    = spaces.empty() ? 0.0f : screen.Scaled(kBarHeight);
+    const float chromeH = screen.Scaled(kBadgeSize) * 0.5f + screen.Scaled(kTitleGap) +
+                          screen.Scaled(kTitleHeight);
+
+    const float regionX = margin;
+    const float regionY = barH + margin;
+
+    // Floored, not just computed. On a short display the bar, the margins and
+    // the chrome band can add up to more than the screen, and Layout answers a
+    // non-positive region with an empty result.
+    const float regionW = (std::max)(screen.Scaled(160.0f), screen.Width() - margin * 2);
+    const float regionH = (std::max)(screen.Scaled(120.0f),
+                                     screen.Height() - barH - margin * 2 - chromeH);
+
+    std::vector<mission::Window> windows;
+    windows.reserve(members.size());
+    for (int index : members) {
+        const MissionItem& item = items[static_cast<size_t>(index)];
+        mission::Window w;
+        w.x     = static_cast<float>(item.bounds.left - screen.rect.left);
+        w.y     = static_cast<float>(item.bounds.top  - screen.rect.top);
+        w.w     = static_cast<float>((std::max)(1l, item.bounds.right - item.bounds.left));
+        w.h     = static_cast<float>((std::max)(1l, item.bounds.bottom - item.bounds.top));
+        w.group = item.group;
+        w.order = item.order;
+        windows.push_back(w);
+    }
+
+    mission::Params params;
+    params.gap        = screen.Scaled(config::Current().missionGap);
+    params.fan        = screen.Scaled(config::Current().missionFan);
+    params.clusterGap = screen.Scaled(config::Current().missionClusterGap);
+    params.groupByApp = config::Current().missionGroupByApp;
+
+    const double started = NowMs();
+    const mission::Result result = mission::Layout(windows, regionW, regionH, params);
+
+    MACTAB_DIAG("mission: %zu window(s) arranged in %.2f ms, scale %.3f, %d pass(es)%s",
+                members.size(), NowMs() - started, result.scale, result.iterations,
+                result.relaxed ? "" : " (grid fallback)");
+
+    if (result.tiles.size() != members.size()) {
+        MACTAB_FAIL("mission: arrangement returned %zu placement(s) for %zu window(s)",
+                    result.tiles.size(), members.size());
         return;
     }
 
-    const RECT& rect = tiles[static_cast<size_t>(hovered)].screenRect;
-    const float inset = Scaled(6.0f);
+    // Back to front, so the most recent window of a pile is not buried under
+    // the ones behind it.
+    std::vector<size_t> order(members.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        if (result.tiles[a].depth != result.tiles[b].depth)
+            return result.tiles[a].depth > result.tiles[b].depth;
+        return a < b;
+    });
 
-    // Springing from wherever it was left is right between two tiles and wrong
-    // for the first one, where "wherever it was left" is the top left corner of
-    // the screen and the highlight would fly in from nothing.
-    const bool wasHidden = selectionVisual.Opacity() < 0.5f;
-    selectionVisual.Opacity(1.0f);
-    selectionVisual.Size({ static_cast<float>(rect.right - rect.left) + inset * 2,
-                           static_cast<float>(rect.bottom - rect.top) + inset * 2 });
+    screen.tiles.resize(members.size());
 
-    const WFN::float3 destination{ static_cast<float>(rect.left) - inset,
-                                   static_cast<float>(rect.top) - inset, 0.0f };
+    const double snapshotsStarted = NowMs();
+    int snapshots = 0, skipped = 0;
 
+    for (size_t slot : order) {
+        const mission::Placement& place = result.tiles[slot];
+        Tile& tile = screen.tiles[slot];
+        tile.item  = members[slot];
+        tile.depth = place.depth;
+
+        const MissionItem& item = items[static_cast<size_t>(tile.item)];
+
+        tile.screenRect = RECT{
+            static_cast<LONG>(regionX + place.x),
+            static_cast<LONG>(regionY + place.y),
+            static_cast<LONG>(regionX + place.x + place.w),
+            static_cast<LONG>(regionY + place.y + place.h),
+        };
+        tile.sourceRect = RECT{
+            item.bounds.left   - screen.rect.left,
+            item.bounds.top    - screen.rect.top,
+            item.bounds.right  - screen.rect.left,
+            item.bounds.bottom - screen.rect.top,
+        };
+
+        // The pile's box, so the badge and the name sit under all of it rather
+        // than under the front window alone.
+        tile.pileX      = regionX + place.x;
+        tile.pileW      = place.w;
+        tile.pileBottom = regionY + place.y + place.h;
+        for (const mission::Cluster& cluster : result.clusters) {
+            if (cluster.group != item.group) continue;
+            tile.pileX      = regionX + cluster.x;
+            tile.pileW      = cluster.w;
+            tile.pileBottom = regionY + cluster.y + cluster.h;
+            break;
+        }
+
+        tile.holder = compositor.CreateContainerVisual();
+        tile.holder.Size({ place.w, place.h });
+        tile.holder.Offset({ regionX + place.x, regionY + place.y, 0.0f });
+        screen.tileLayer.Children().InsertAtTop(tile.holder);
+
+        // The shadow rides with the window, so it flies and scales with it.
+        if (shadowBrush) {
+            tile.shadow = compositor.CreateSpriteVisual();
+            tile.shadow.Brush(shadowBrush);
+            tile.shadow.Size({ place.w + textureSpread * 2, place.h + textureSpread * 2 });
+            tile.shadow.Offset({ -textureSpread, -textureSpread, 0.0f });
+            tile.holder.Children().InsertAtTop(tile.shadow);
+        }
+
+        bool haveThumbnail = false;
+
+        if (dcompDevice) {
+            void* raw = nullptr;
+            if (thumbnail::CreateSharedVisual(dcompDevice.get(), screen.hwnd, item.hwnd,
+                                              &raw, &tile.thumbnail) && raw) {
+                winrt::com_ptr<IUnknown> unknown;
+                unknown.attach(reinterpret_cast<IUnknown*>(raw));
+
+                if (auto visual = unknown.try_as<WUC::Visual>()) {
+                    SIZE source{};
+                    if (!thumbnail::SourceSize(item.hwnd, source) ||
+                        source.cx <= 0 || source.cy <= 0) {
+                        source.cx = tile.sourceRect.right - tile.sourceRect.left;
+                        source.cy = tile.sourceRect.bottom - tile.sourceRect.top;
+                    }
+
+                    // The visual draws at the source window's own size, so it is
+                    // scaled into the slot rather than resized.
+                    visual.Scale({ place.w / (std::max)(1.0f, static_cast<float>(source.cx)),
+                                   place.h / (std::max)(1.0f, static_cast<float>(source.cy)),
+                                   1.0f });
+                    tile.holder.Children().InsertAtTop(visual);
+                    haveThumbnail = true;
+                }
+            }
+        }
+
+        if (!haveThumbnail) {
+            // Snapshots run on the thread that owes a frame: a fifty
+            // millisecond ping plus a full-size readback each. So the tier gets
+            // a budget and everything past it becomes a card, because a late
+            // window is worse than a plain one.
+            Bitmap content;
+            if (thumbnail::Current() != thumbnail::Tier::IconOnly &&
+                NowMs() - snapshotsStarted < kSnapshotBudgetMs) {
+                content = thumbnail::Snapshot(item.hwnd, static_cast<int>(place.w),
+                                              static_cast<int>(place.h));
+                ++snapshots;
+            } else if (thumbnail::Current() != thumbnail::Tier::IconOnly) {
+                ++skipped;
+            }
+
+            tile.contentSurface = graphics.CreateDrawingSurface(
+                { place.w, place.h },
+                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+
+            SurfaceDraw draw(tile.contentSurface);
+            if (draw.ok) {
+                ID2D1DeviceContext* dc = draw.dc.Get();
+                dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+                if (!content.Empty()) {
+                    if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(content)))
+                        dc->DrawBitmap(bitmap.Get(), D2D1::RectF(0.0f, 0.0f, place.w, place.h));
+                } else {
+                    // A window-shaped plate with the app's icon on it, which is
+                    // a design rather than a hole.
+                    FillSquircle(dc, d2dFactory.Get(), 0.0f, 0.0f, place.w, place.h,
+                                 screen.Scaled(kTileRadius),
+                                 themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.80f)
+                                              : D2D1::ColorF(0.10f, 0.10f, 0.13f, 0.85f));
+
+                    if (ComPtr<ID2D1Bitmap1> icon = IconFor(dc, item)) {
+                        const float side = (std::min)(place.w, place.h) * 0.40f;
+                        dc->DrawBitmap(icon.Get(),
+                                       D2D1::RectF((place.w - side) * 0.5f,
+                                                   (place.h - side) * 0.5f,
+                                                   (place.w + side) * 0.5f,
+                                                   (place.h + side) * 0.5f));
+                    }
+                }
+            }
+
+            tile.content = compositor.CreateSpriteVisual();
+            tile.content.Size({ place.w, place.h });
+            tile.content.Brush(compositor.CreateSurfaceBrush(tile.contentSurface));
+            tile.holder.Children().InsertAtTop(tile.content);
+        }
+
+        // One badge and one name per pile, under the front window. The chrome
+        // does NOT ride with the tiles: a name and an icon hurtling across the
+        // screen and shrinking as they go is unreadable, and it is not what the
+        // reference does. It fades in as the flight settles instead.
+        if (tile.depth == 0) {
+            tile.chrome = compositor.CreateSpriteVisual();
+            screen.chromeLayer.Children().InsertAtTop(tile.chrome);
+            BakeChrome(screen, tile);
+        }
+    }
+
+    if (skipped > 0)
+        MACTAB_WARN("mission: %d snapshot(s) in %.0f ms, %d window(s) fell back to cards",
+                    snapshots, NowMs() - snapshotsStarted, skipped);
+}
+
+void Mission::Impl::PositionOutline(Screen& screen) {
+    if (screen.hovered < 0 || screen.hovered >= static_cast<int>(screen.tiles.size()) ||
+        !outlineBrush) {
+        screen.outline.Opacity(0.0f);
+        return;
+    }
+
+    const RECT& rect = screen.tiles[static_cast<size_t>(screen.hovered)].screenRect;
+    const bool wasHidden = screen.outline.Opacity() < 0.5f;
+
+    screen.outline.Brush(outlineBrush);
+    screen.outline.Opacity(1.0f);
+    screen.outline.Size({ static_cast<float>(rect.right - rect.left) + textureSpread * 2,
+                          static_cast<float>(rect.bottom - rect.top) + textureSpread * 2 });
+
+    const WFN::float3 destination{ static_cast<float>(rect.left) - textureSpread,
+                                   static_cast<float>(rect.top)  - textureSpread, 0.0f };
+
+    // Springing from wherever it was left is right between two windows and
+    // wrong for the first one, where "wherever it was left" is the corner.
     if (wasHidden) {
-        selectionVisual.Offset(destination);
+        screen.outline.Offset(destination);
         return;
     }
 
@@ -943,32 +1437,32 @@ void Mission::Impl::PositionSelection() {
     spring.DampingRatio(0.85f);
     spring.Period(std::chrono::milliseconds(45));
     spring.FinalValue(destination);
-    selectionVisual.StartAnimation(L"Offset", spring);
+    screen.outline.StartAnimation(L"Offset", spring);
 }
 
-void Mission::Impl::SetHovered(int index) {
-    if (index == hovered) return;
-    hovered = index;
-
-    GuardMission(*this, "SetHovered", [&] {
-        PositionSelection();
-        BakeTitle();
-    });
+void Mission::Impl::SetHovered(Screen& screen, int index) {
+    if (index == screen.hovered) return;
+    screen.hovered = index;
+    GuardMission(*this, "SetHovered", [&] { PositionOutline(screen); });
 }
 
-int Mission::Impl::HitTestTile(POINT client) const {
-    for (size_t i = 0; i < tiles.size(); ++i) {
-        const RECT& r = tiles[i].screenRect;
-        if (client.x >= r.left && client.x < r.right &&
-            client.y >= r.top  && client.y < r.bottom)
-            return static_cast<int>(i);
+int Mission::Impl::HitTestTile(const Screen& screen, POINT client) const {
+    // Front to back, so the window on top of a pile takes the click.
+    int best = -1;
+    for (size_t i = 0; i < screen.tiles.size(); ++i) {
+        const RECT& r = screen.tiles[i].screenRect;
+        if (client.x < r.left || client.x >= r.right ||
+            client.y < r.top  || client.y >= r.bottom)
+            continue;
+        if (best < 0 || screen.tiles[i].depth < screen.tiles[static_cast<size_t>(best)].depth)
+            best = static_cast<int>(i);
     }
-    return -1;
+    return best;
 }
 
-int Mission::Impl::HitTestChip(POINT client) const {
-    for (size_t i = 0; i < chips.size(); ++i) {
-        const mission::SpaceChip& c = chips[i];
+int Mission::Impl::HitTestChip(const Screen& screen, POINT client) const {
+    for (size_t i = 0; i < screen.chips.size(); ++i) {
+        const mission::SpaceChip& c = screen.chips[i];
         if (client.x >= c.x && client.x < c.x + c.w &&
             client.y >= c.y && client.y < c.y + c.h)
             return static_cast<int>(i);
@@ -976,35 +1470,35 @@ int Mission::Impl::HitTestChip(POINT client) const {
     return -1;
 }
 
-// The nearest tile in a direction, by centre distance.
+// The nearest window in a direction, by centre distance.
 //
 // Not an index step. The arrangement has no rows, so "the next one to the
-// right" is a geometric question, and stepping through the list would jump
-// across the screen in a way that looks random.
-int Mission::Impl::Neighbour(int from, int dx, int dy) const {
-    if (tiles.empty()) return -1;
-    if (from < 0 || from >= static_cast<int>(tiles.size())) return 0;
+// right" is a geometric question, and walking the list would jump across the
+// screen in a way that looks random.
+int Mission::Impl::Neighbour(const Screen& screen, int from, int dx, int dy) const {
+    if (screen.tiles.empty()) return -1;
+    if (from < 0 || from >= static_cast<int>(screen.tiles.size())) return 0;
 
-    const RECT& origin = tiles[static_cast<size_t>(from)].screenRect;
+    const RECT& origin = screen.tiles[static_cast<size_t>(from)].screenRect;
     const float ox = static_cast<float>(origin.left + origin.right) * 0.5f;
     const float oy = static_cast<float>(origin.top + origin.bottom) * 0.5f;
 
     int   best     = -1;
     float bestCost = 0.0f;
 
-    for (size_t i = 0; i < tiles.size(); ++i) {
+    for (size_t i = 0; i < screen.tiles.size(); ++i) {
         if (static_cast<int>(i) == from) continue;
 
-        const RECT& r = tiles[i].screenRect;
+        const RECT& r = screen.tiles[i].screenRect;
         const float cx = static_cast<float>(r.left + r.right) * 0.5f;
         const float cy = static_cast<float>(r.top + r.bottom) * 0.5f;
 
         const float along  = (cx - ox) * dx + (cy - oy) * dy;
         const float across = (cx - ox) * dy + (cy - oy) * dx;
-        if (along <= 1.0f) continue;   // not in the requested direction
+        if (along <= 1.0f) continue;
 
-        // Distance along the direction, plus a penalty for drifting off it, so
-        // a tile straight ahead beats a nearer one far to the side.
+        // Distance along the direction plus a penalty for drifting off it, so a
+        // window straight ahead beats a nearer one far to the side.
         const float cost = along + std::fabs(across) * 2.0f;
         if (best < 0 || cost < bestCost) {
             best     = static_cast<int>(i);
@@ -1017,280 +1511,117 @@ int Mission::Impl::Neighbour(int from, int dx, int dy) const {
 
 // ---------------------------------------------------------------------------
 
-void Mission::Impl::Build() {
-    ReleaseTiles();
-
-    const float width  = static_cast<float>(monitorRect.right - monitorRect.left);
-    const float height = static_cast<float>(monitorRect.bottom - monitorRect.top);
-
-    const float margin  = Scaled(kOuterMargin);
-    const float stripH  = spaces.empty() ? 0.0f : Scaled(kSpacesStripHeight);
-    const float regionX = margin;
-    const float regionY = stripH + margin;
-    // Floored, not just computed. On a short display the strip, the margins and
-    // the title band can add up to more than the screen, and Layout answers a
-    // non-positive region with an empty result, which the loop below would then
-    // index straight past the end of.
-    const float regionW = (std::max)(Scaled(160.0f), width - margin * 2);
-    const float regionH = (std::max)(Scaled(120.0f),
-                                     height - stripH - margin * 2 -
-                                     Scaled(kTitleHeight + kTitleGap));
-
-    std::vector<mission::Window> windows;
-    windows.reserve(items.size());
-    for (const MissionItem& item : items) {
-        mission::Window w;
-        w.x     = static_cast<float>(item.bounds.left - monitorRect.left);
-        w.y     = static_cast<float>(item.bounds.top  - monitorRect.top);
-        w.w     = static_cast<float>((std::max)(1l, item.bounds.right - item.bounds.left));
-        w.h     = static_cast<float>((std::max)(1l, item.bounds.bottom - item.bounds.top));
-        w.group = item.group;
-        w.order = item.order;
-        windows.push_back(w);
-    }
-
-    mission::Params params;
-    params.gap        = Scaled(config::Current().missionGap);
-    params.clusterGap = Scaled(config::Current().missionClusterGap);
-    params.groupByApp = config::Current().missionGroupByApp;
-
-    const double started = NowMs();
-    const mission::Result result = mission::Layout(windows, regionW, regionH, params);
-
-    MACTAB_DIAG("mission: %zu window(s) arranged in %.2f ms, scale %.3f, "
-                "%d pass(es)%s, agreement %.2f",
-                items.size(), NowMs() - started, result.scale, result.iterations,
-                result.relaxed ? "" : " (grid fallback)",
-                mission::SpatialAgreement(windows, result));
-
-    // Belt and braces against the case above: if the arrangement ever comes
-    // back short, draw what it did produce rather than reading past it.
-    if (result.tiles.size() != items.size()) {
-        MACTAB_FAIL("mission: arrangement returned %zu placement(s) for %zu window(s)",
-                    result.tiles.size(), items.size());
-        return;
-    }
-
-    tiles.resize(items.size());
-
-    const double snapshotsStarted = NowMs();
-    int snapshots = 0, skipped = 0;
-
-    for (size_t i = 0; i < items.size(); ++i) {
-        const mission::Placement& place = result.tiles[i];
-        Tile& tile = tiles[i];
-
-        tile.screenRect = RECT{
-            static_cast<LONG>(regionX + place.x),
-            static_cast<LONG>(regionY + place.y),
-            static_cast<LONG>(regionX + place.x + place.w),
-            static_cast<LONG>(regionY + place.y + place.h),
-        };
-        tile.sourceRect = RECT{
-            items[i].bounds.left   - monitorRect.left,
-            items[i].bounds.top    - monitorRect.top,
-            items[i].bounds.right  - monitorRect.left,
-            items[i].bounds.bottom - monitorRect.top,
-        };
-
-        tile.holder = compositor.CreateContainerVisual();
-        tile.holder.Size({ place.w, place.h });
-        tile.holder.Offset({ regionX + place.x, regionY + place.y, 0.0f });
-        tileLayer.Children().InsertAtTop(tile.holder);
-
-        bool haveThumbnail = false;
-
-        // Tier 1: a visual DWM owns, living in our tree. Live, and animatable
-        // by the compositor at no CPU cost, which is what the reveal needs.
-        if (dcompDevice) {
-            void* raw = nullptr;
-            if (thumbnail::CreateSharedVisual(dcompDevice.get(), hwnd, items[i].hwnd,
-                                              &raw, &tile.thumbnail) && raw) {
-                winrt::com_ptr<IUnknown> unknown;
-                unknown.attach(reinterpret_cast<IUnknown*>(raw));
-
-                if (auto visual = unknown.try_as<WUC::Visual>()) {
-                    SIZE source{};
-                    if (!thumbnail::SourceSize(items[i].hwnd, source) ||
-                        source.cx <= 0 || source.cy <= 0) {
-                        source.cx = tile.sourceRect.right - tile.sourceRect.left;
-                        source.cy = tile.sourceRect.bottom - tile.sourceRect.top;
-                    }
-
-                    // The visual draws at the source window's own size, so it
-                    // is scaled to the slot rather than resized.
-                    visual.Scale({ place.w / (std::max)(1.0f, static_cast<float>(source.cx)),
-                                   place.h / (std::max)(1.0f, static_cast<float>(source.cy)),
-                                   1.0f });
-                    tile.holder.Children().InsertAtTop(visual);
-                    haveThumbnail = true;
-                }
-            }
-        }
-
-        // Tier 2 and 3 share a sprite: either the snapshot or the icon card
-        // goes into the same surface, so the rest of the code does not care
-        // which it got.
-        if (!haveThumbnail) {
-            // Snapshots are taken on this thread, which is the thread that
-            // owes a frame, and each one is a fifty millisecond ping plus a
-            // full-size readback of somebody else's window. Thirty of those is
-            // seconds, so the tier gets a budget and everything past it gets a
-            // card. A late window is worse than a plain one.
-            Bitmap content;
-            if (thumbnail::Current() != thumbnail::Tier::IconOnly &&
-                NowMs() - snapshotsStarted < kSnapshotBudgetMs) {
-                content = thumbnail::Snapshot(items[i].hwnd,
-                                              static_cast<int>(place.w),
-                                              static_cast<int>(place.h));
-                ++snapshots;
-            } else if (thumbnail::Current() != thumbnail::Tier::IconOnly) {
-                ++skipped;
-            }
-
-            tile.surface = graphics.CreateDrawingSurface(
-                { place.w, place.h },
-                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
-
-            SurfaceDraw draw(tile.surface);
-            if (draw.ok) {
-                ID2D1DeviceContext* dc = draw.dc.Get();
-                dc->SetTransform(D2D1::Matrix3x2F::Translation(
-                    static_cast<float>(draw.offset.x), static_cast<float>(draw.offset.y)));
-                dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-
-                if (!content.Empty()) {
-                    if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(content)))
-                        dc->DrawBitmap(bitmap.Get(),
-                                       D2D1::RectF(0.0f, 0.0f, place.w, place.h));
-                } else {
-                    // The card. A window-shaped plate with the app's icon in
-                    // the middle of it, which is a design rather than a hole.
-                    FillSquircle(dc, d2dFactory.Get(), 0.0f, 0.0f, place.w, place.h,
-                                 Scaled(10.0f),
-                                 themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.80f)
-                                              : D2D1::ColorF(0.10f, 0.10f, 0.13f, 0.85f));
-
-                    if (!items[i].icon.Empty()) {
-                        const float side = (std::min)(place.w, place.h) * 0.42f;
-                        if (ComPtr<ID2D1Bitmap1> icon =
-                                UploadBitmap(dc, items[i].icon)) {
-                            dc->DrawBitmap(icon.Get(),
-                                           D2D1::RectF((place.w - side) * 0.5f,
-                                                       (place.h - side) * 0.5f,
-                                                       (place.w + side) * 0.5f,
-                                                       (place.h + side) * 0.5f));
-                        }
-                    }
-                }
-            }
-
-            tile.sprite = compositor.CreateSpriteVisual();
-            tile.sprite.Size({ place.w, place.h });
-            tile.sprite.Brush(compositor.CreateSurfaceBrush(tile.surface));
-            tile.holder.Children().InsertAtTop(tile.sprite);
-        }
-    }
-
-    if (skipped > 0)
-        MACTAB_WARN("mission: %d snapshot(s) taken in %.0f ms, %d window(s) fell "
-                    "back to cards", snapshots, NowMs() - snapshotsStarted, skipped);
-
-    // The selection outline, sized per hover.
-    selectionVisual.Brush(compositor.CreateColorBrush(
-        WUI::ColorHelper::FromArgb(
-            static_cast<uint8_t>(theme.selection.a * 255.0f),
-            static_cast<uint8_t>(theme.selection.r * 255.0f),
-            static_cast<uint8_t>(theme.selection.g * 255.0f),
-            static_cast<uint8_t>(theme.selection.b * 255.0f))));
-    selectionVisual.Opacity(0.0f);
-}
-
-void Mission::Show(HMONITOR monitor, std::vector<MissionItem> items,
-                   std::vector<MissionSpace> spaces) {
+void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spaces) {
     Impl& impl = *m_impl;
-    if (impl.visible) return;
+    if (impl.visible || impl.screens.empty()) return;
 
     const bool ok = GuardMission(impl, "Show", [&] {
         MACTAB_DIAG_TIMER("mission: Show");
 
-        impl.monitor = monitor;
-        impl.items   = std::move(items);
-        impl.spaces  = std::move(spaces);
-        impl.hovered = -1;
+        impl.items  = std::move(items);
+        impl.spaces = std::move(spaces);
 
-        MONITORINFO info{};
-        info.cbSize = sizeof(info);
-        if (::GetMonitorInfoW(monitor, &info))
-            impl.monitorRect = info.rcMonitor;
+        const bool light = ResolveLightTheme();
+        if (light != impl.themeIsLight) {
+            impl.themeIsLight = light;
+            impl.theme        = MakeTheme(light);
+            for (Impl::Screen& screen : impl.screens) screen.backdropSurface = nullptr;
+        }
 
-        UINT dpiX = 96, dpiY = 96;
-        if (SUCCEEDED(::GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
-            impl.dpiScale = static_cast<float>(dpiX) / 96.0f;
+        // Which windows belong to which display. A window straddling two
+        // monitors belongs to whichever holds its centre.
+        std::vector<std::vector<int>> members(impl.screens.size());
+        for (size_t i = 0; i < impl.items.size(); ++i) {
+            const RECT& b = impl.items[i].bounds;
+            const POINT centre{ (b.left + b.right) / 2, (b.top + b.bottom) / 2 };
+            const HMONITOR monitor = ::MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST);
 
-        impl.themeIsLight = ResolveLightTheme();
-        impl.theme        = MakeTheme(impl.themeIsLight);
+            for (size_t s = 0; s < impl.screens.size(); ++s)
+                if (impl.screens[s].monitor == monitor) {
+                    members[s].push_back(static_cast<int>(i));
+                    break;
+                }
+        }
 
-        ::SetWindowPos(impl.hwnd, HWND_TOPMOST,
-                       impl.monitorRect.left, impl.monitorRect.top,
-                       impl.monitorRect.right - impl.monitorRect.left,
-                       impl.monitorRect.bottom - impl.monitorRect.top,
-                       SWP_NOACTIVATE);
-
-        impl.BakeBackdrop();
-        impl.BakeSpaces();
-        impl.Build();
+        for (size_t s = 0; s < impl.screens.size(); ++s) {
+            Impl::Screen& screen = impl.screens[s];
+            impl.BakeBackdrop(screen);
+            impl.BakeBar(screen);
+            impl.BuildTiles(screen, members[s]);
+        }
 
         impl.restoreWindow = ::GetForegroundWindow();
 
-        ::ShowWindow(impl.hwnd, SW_SHOW);
-        ::SetForegroundWindow(impl.hwnd);
-        ::SetFocus(impl.hwnd);
+        for (Impl::Screen& screen : impl.screens)
+            ::SetWindowPos(screen.hwnd, HWND_TOPMOST,
+                           screen.rect.left, screen.rect.top,
+                           screen.rect.right - screen.rect.left,
+                           screen.rect.bottom - screen.rect.top,
+                           SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
-        // The reveal. Every window starts at the position and size it really
-        // has on screen and travels to its slot, which is the whole illusion:
-        // the desktop pulls itself apart rather than a dialog appearing.
-        //
-        // Offset and Scale only, both on the compositor thread, so this costs
-        // this process nothing while it runs.
-        const auto duration = std::chrono::milliseconds(
-            config::Current().missionRevealMs);
+        // Focus goes to the display the user was already on. The others stay
+        // clickable, and clicking one moves activation between two windows of
+        // this process, which is exactly why dismissal checks whether the window
+        // taking focus is one of ours.
+        const HMONITOR active = impl.restoreWindow
+            ? ::MonitorFromWindow(impl.restoreWindow, MONITOR_DEFAULTTOPRIMARY)
+            : ::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
 
-        auto easing = impl.compositor.CreateCubicBezierEasingFunction(
-            { 0.22f, 1.0f }, { 0.36f, 1.0f });
+        HWND focus = impl.screens.front().hwnd;
+        for (const Impl::Screen& screen : impl.screens)
+            if (screen.monitor == active) focus = screen.hwnd;
 
-        for (Mission::Impl::Tile& tile : impl.tiles) {
-            const float finalW = static_cast<float>(tile.screenRect.right - tile.screenRect.left);
-            const float finalH = static_cast<float>(tile.screenRect.bottom - tile.screenRect.top);
-            if (finalW <= 0.0f || finalH <= 0.0f) continue;
+        ::SetForegroundWindow(focus);
+        ::SetFocus(focus);
 
-            const float startScaleX =
-                static_cast<float>(tile.sourceRect.right - tile.sourceRect.left) / finalW;
-            const float startScaleY =
-                static_cast<float>(tile.sourceRect.bottom - tile.sourceRect.top) / finalH;
+        const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
+        auto easing = impl.compositor.CreateCubicBezierEasingFunction({ 0.22f, 1.0f },
+                                                                     { 0.36f, 1.0f });
 
-            auto offset = impl.compositor.CreateVector3KeyFrameAnimation();
-            offset.InsertKeyFrame(0.0f, { static_cast<float>(tile.sourceRect.left),
-                                          static_cast<float>(tile.sourceRect.top), 0.0f });
-            offset.InsertKeyFrame(1.0f, { static_cast<float>(tile.screenRect.left),
-                                          static_cast<float>(tile.screenRect.top), 0.0f },
-                                  easing);
-            offset.Duration(duration);
-            tile.holder.StartAnimation(L"Offset", offset);
+        for (Impl::Screen& screen : impl.screens) {
+            // Every window starts at the position and size it really has and
+            // travels to its slot. That is the whole illusion: the desktop
+            // pulls itself apart rather than a dialog appearing. Offset and
+            // Scale only, both on the compositor thread, so it costs this
+            // process nothing while it runs.
+            for (Impl::Tile& tile : screen.tiles) {
+                const float finalW = static_cast<float>(tile.screenRect.right - tile.screenRect.left);
+                const float finalH = static_cast<float>(tile.screenRect.bottom - tile.screenRect.top);
+                if (finalW <= 0.0f || finalH <= 0.0f) continue;
 
-            auto scale = impl.compositor.CreateVector3KeyFrameAnimation();
-            scale.InsertKeyFrame(0.0f, { startScaleX, startScaleY, 1.0f });
-            scale.InsertKeyFrame(1.0f, { 1.0f, 1.0f, 1.0f }, easing);
-            scale.Duration(duration);
-            tile.holder.StartAnimation(L"Scale", scale);
+                auto offset = impl.compositor.CreateVector3KeyFrameAnimation();
+                offset.InsertKeyFrame(0.0f, { static_cast<float>(tile.sourceRect.left),
+                                              static_cast<float>(tile.sourceRect.top), 0.0f });
+                offset.InsertKeyFrame(1.0f, { static_cast<float>(tile.screenRect.left),
+                                              static_cast<float>(tile.screenRect.top), 0.0f },
+                                      easing);
+                offset.Duration(duration);
+                tile.holder.StartAnimation(L"Offset", offset);
+
+                auto scale = impl.compositor.CreateVector3KeyFrameAnimation();
+                scale.InsertKeyFrame(0.0f,
+                    { static_cast<float>(tile.sourceRect.right - tile.sourceRect.left) / finalW,
+                      static_cast<float>(tile.sourceRect.bottom - tile.sourceRect.top) / finalH,
+                      1.0f });
+                scale.InsertKeyFrame(1.0f, { 1.0f, 1.0f, 1.0f }, easing);
+                scale.Duration(duration);
+                tile.holder.StartAnimation(L"Scale", scale);
+            }
+
+            // The names and icons arrive once the windows have landed.
+            auto chromeFade = impl.compositor.CreateScalarKeyFrameAnimation();
+            chromeFade.InsertKeyFrame(0.0f, 0.0f);
+            chromeFade.InsertKeyFrame(0.62f, 0.0f);
+            chromeFade.InsertKeyFrame(1.0f, 1.0f, easing);
+            chromeFade.Duration(duration);
+            screen.chromeLayer.StartAnimation(L"Opacity", chromeFade);
+
+            auto fade = impl.compositor.CreateScalarKeyFrameAnimation();
+            fade.InsertKeyFrame(0.0f, 0.0f);
+            fade.InsertKeyFrame(1.0f, 1.0f, easing);
+            fade.Duration(duration);
+            screen.root.StartAnimation(L"Opacity", fade);
         }
-
-        auto fade = impl.compositor.CreateScalarKeyFrameAnimation();
-        fade.InsertKeyFrame(0.0f, 0.0f);
-        fade.InsertKeyFrame(1.0f, 1.0f, easing);
-        fade.Duration(duration);
-        impl.root.StartAnimation(L"Opacity", fade);
 
         impl.visible = true;
     });
@@ -1303,30 +1634,58 @@ void Mission::Show(HMONITOR monitor, std::vector<MissionItem> items,
 
 void Mission::Hide(bool restoreFocus) {
     Impl& impl = *m_impl;
-    if (!impl.visible && !impl.hwnd) return;
+    if (!impl.visible && impl.screens.empty()) return;
 
     impl.visible = false;
 
-    GuardMission(impl, "Hide", [&] {
-        impl.root.Opacity(0.0f);
-    });
+    for (Impl::Screen& screen : impl.screens) {
+        GuardMission(impl, "Hide", [&] {
+            screen.root.Opacity(0.0f);
+            screen.outline.Opacity(0.0f);
+        });
+        ::ShowWindow(screen.hwnd, SW_HIDE);
 
-    ::ShowWindow(impl.hwnd, SW_HIDE);
-
-    // Release the thumbnails immediately rather than at the next invocation.
-    // Each one is a registration DWM holds on our behalf, and the budget for
-    // this process while nothing is happening is zero.
-    GuardMission(impl, "ReleaseTiles", [&] { impl.ReleaseTiles(); });
+        // Released immediately rather than at the next invocation. Each
+        // thumbnail is a registration DWM holds on our behalf, and the budget
+        // for this process while nothing is happening is zero.
+        GuardMission(impl, "ReleaseTiles", [&] { impl.ReleaseTiles(screen); });
+    }
 
     impl.items.clear();
     impl.spaces.clear();
-    impl.chips.clear();
-    impl.hovered = -1;
 
     if (restoreFocus && impl.restoreWindow && ::IsWindow(impl.restoreWindow))
         ::SetForegroundWindow(impl.restoreWindow);
 
     impl.restoreWindow = nullptr;
+}
+
+void Mission::UpdateIcon(const std::wstring& appKey, const Bitmap& icon) {
+    Impl& impl = *m_impl;
+    if (!impl.visible || icon.Empty()) return;
+
+    GuardMission(impl, "UpdateIcon", [&] {
+        bool touched = false;
+        for (MissionItem& item : impl.items) {
+            if (item.appKey != appKey) continue;
+            item.icon = icon;
+            touched = true;
+        }
+        if (!touched) return;
+
+        // The upload is keyed by app, so dropping the stale one is what makes
+        // the next draw pick up the new artwork.
+        impl.iconBitmaps.erase(appKey);
+
+        for (Impl::Screen& screen : impl.screens)
+            for (Impl::Tile& tile : screen.tiles) {
+                if (tile.depth != 0 || tile.item < 0 ||
+                    tile.item >= static_cast<int>(impl.items.size()))
+                    continue;
+                if (impl.items[static_cast<size_t>(tile.item)].appKey != appKey) continue;
+                impl.BakeChrome(screen, tile);
+            }
+    });
 }
 
 } // namespace mactab

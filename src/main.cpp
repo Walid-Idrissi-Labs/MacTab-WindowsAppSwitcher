@@ -398,23 +398,13 @@ void HandleActionKey(WORD virtualKey) {
 
 // --- Mission Control --------------------------------------------------------
 
-// Which display the arrangement opens on.
+// The size icons are asked for in the arrangement.
 //
-// One monitor, deliberately. macOS puts a separate Mission Control on every
-// display, each holding that display's windows, and doing the same here is a
-// second overlay window, a second wallpaper bake and a second set of thumbnails
-// for a case that cannot be tested from the machine this is written on. One
-// display first, and the windows on the others are simply not in it, which is
-// at least honest rather than half right.
-HMONITOR MissionMonitor() {
-    const HWND foreground = ::GetForegroundWindow();
-    if (foreground)
-        return ::MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
-
-    POINT cursor{};
-    ::GetCursorPos(&cursor);
-    return ::MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
-}
+// A fixed number rather than the badge's size in pixels: the icon cache is keyed
+// by size, and asking for a different one per display scale would extract and
+// disk-cache the same artwork several times over. 128 is what the switcher
+// already asks for at 100%, so on most machines this is a cache hit.
+constexpr int kMissionIconSize = 128;
 
 // Bring the overlay up to readiness, building it if this is the first time.
 //
@@ -463,18 +453,17 @@ void OpenMission() {
     // can have it.
     if (g_app.gesture.active) return;
 
-    const HMONITOR monitor = MissionMonitor();
-
-    MONITORINFO info{};
-    info.cbSize = sizeof(info);
-    if (!::GetMonitorInfoW(monitor, &info)) return;
-
     std::vector<MissionItem> items;
     int group = 0;
 
     for (const SwitcherApp& app : BuildSwitcherList()) {
+        // Whatever the icon worker already has. A miss queues the work and
+        // WM_MACTAB_ICON_READY brings it back, so an app seen for the first
+        // time gets its icon a moment later rather than never.
         Bitmap icon;
-        icons::Acquire(MakeIconRequest(app, 128), icon);
+        icons::Acquire(MakeIconRequest(app, kMissionIconSize), icon);
+
+        const std::wstring resolved = icons::DisplayName(app.key);
 
         for (const SwitcherWindow& window : app.windows) {
             // Minimized windows are not in macOS' Mission Control either. They
@@ -483,16 +472,11 @@ void OpenMission() {
             // does not currently have one.
             if (window.minimized) continue;
 
-            // Only this display's windows. A window straddling two monitors
-            // belongs to whichever holds its centre.
-            const POINT centre{ (window.bounds.left + window.bounds.right) / 2,
-                                (window.bounds.top + window.bounds.bottom) / 2 };
-            if (::MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST) != monitor) continue;
-
             MissionItem item;
             item.hwnd    = window.hwnd;
             item.title   = window.title;
-            item.appName = app.displayName;
+            item.appName = resolved.empty() ? app.displayName : resolved;
+            item.appKey  = app.key;
             item.icon    = icon;
             item.bounds  = window.bounds;
             item.group   = group;
@@ -513,7 +497,7 @@ void OpenMission() {
     MACTAB_DIAG("mission: opening with %zu window(s) and %zu space(s)",
                 items.size(), spaces.size());
 
-    g_app.mission.Show(monitor, std::move(items), std::move(spaces));
+    g_app.mission.Show(std::move(items), std::move(spaces));
 }
 
 void ActivateFromMission(int index) {
@@ -766,6 +750,14 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_MACTAB_ICON_READY:
+        if (g_app.mission.Visible()) {
+            for (const SwitcherApp& app : BuildSwitcherList()) {
+                Bitmap icon;
+                if (icons::Acquire(MakeIconRequest(app, kMissionIconSize), icon) &&
+                    !icon.Empty())
+                    g_app.mission.UpdateIcon(app.key, icon);
+            }
+        }
         // Tiles usually finish during the hold delay, before the panel is
         // shown, so this must not be gated on the panel being visible; doing
         // that left the first gesture showing placeholders for its whole
@@ -922,12 +914,13 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     // and costs nothing until Mission Control next opens.
     case WM_SETTINGCHANGE:
         if (wParam == SPI_SETDESKWALLPAPER)
-            wallpaper::Invalidate();
+            g_app.mission.InvalidateBackdrop();
         return 0;
 
     case WM_DISPLAYCHANGE:
-        // Monitors moved, so every cached wallpaper is the wrong size.
-        wallpaper::Invalidate();
+        // Monitors moved, so every cached wallpaper is the wrong size and every
+        // baked backdrop is for a screen that is not there any more.
+        g_app.mission.InvalidateBackdrop();
         return 0;
 
     // --- Session state ------------------------------------------------------
