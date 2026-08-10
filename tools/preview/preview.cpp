@@ -640,6 +640,16 @@ void RunSelfChecks() {
         // Alpha passes through untouched.
         Check(m.m[3][3] == 1.0f && m.m[3][0] == 0.0f, "glass matrix leaves alpha alone");
 
+        // Params is initialised positionally, so inserting a member in the
+        // middle silently shifts every value after it and still compiles.
+        // These three orderings hold for both themes and nothing else in the
+        // struct has that shape, so a shifted field trips at least one.
+        Check(p->fallbackAlpha > p->tint[3],
+              "the no-capture base coat is more opaque than the tint");
+        Check(p->rimTop > p->rimBottom, "the rim is brighter at the top");
+        Check(p->gain > 0.0f && p->gain < 1.0f, "gain compresses rather than expands");
+        Check(p->bias >= 0.0f && p->bias < 0.5f, "bias lifts the black point, not the whole image");
+
         // Saturation above 1 must actually push colours apart, not clamp to
         // identity. This is the failure mode CLSID_D2D1Saturation has.
         Check(p->saturation > 1.0f, "the material boosts saturation");
