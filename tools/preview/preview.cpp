@@ -27,6 +27,7 @@
 
 #include "image.h"
 #include "squircle.h"
+#include "panel_layout.h"
 
 using namespace mactab;
 
@@ -238,6 +239,104 @@ int main(int argc, char** argv) {
     if (!WritePng(outDir + "/strip.png", strip)) {
         std::fprintf(stderr, "failed to write strip.png\n");
         ++failures;
+    }
+
+    // A mock of the whole panel at the real layout metrics.
+    //
+    // The tile size, gap, padding and corner radius were all chosen without
+    // being able to see them. This renders the actual shared layout code — not
+    // a copy of it — so the proportions can be judged rather than assumed.
+    {
+        const int count = 6;
+        const layout::Metrics m = layout::Compute(count, 2400.0f, 1.0f);
+
+        const int margin = 40;
+        Bitmap panel = Bitmap::Create(static_cast<int>(m.panelWidth) + margin * 2,
+                                      static_cast<int>(m.panelHeight) + margin * 2);
+
+        // Stand-in for the blurred desktop: a soft gradient, so the glass has
+        // something to sit on and the panel edge is visible.
+        for (int y = 0; y < panel.height; ++y) {
+            for (int x = 0; x < panel.width; ++x) {
+                const int v = 90 + 70 * x / panel.width - 30 * y / panel.height;
+                panel.At(x, y) = MakePixel(static_cast<uint8_t>(v * 0.55),
+                                           static_cast<uint8_t>(v * 0.62),
+                                           static_cast<uint8_t>(v * 0.80), 255);
+            }
+        }
+
+        // The panel body, superellipse-cornered like the real thing.
+        Bitmap body = Bitmap::Create(static_cast<int>(m.panelWidth),
+                                     static_cast<int>(m.panelHeight));
+        for (int y = 0; y < body.height; ++y) {
+            for (int x = 0; x < body.width; ++x)
+                body.At(x, y) = MakePixel(23, 23, 26, 210);
+        }
+        // Approximate the corner treatment by masking with a squircle whose
+        // radius matches; enough to judge whether 24px reads as macOS.
+        {
+            const int r = static_cast<int>(m.radius);
+            const std::vector<uint8_t>& corner = SquircleMask(r * 2);
+            for (int cy = 0; cy < r; ++cy) {
+                for (int cx = 0; cx < r; ++cx) {
+                    const uint8_t a = corner[static_cast<size_t>(cy) * (r * 2) + cx];
+                    auto apply = [&](int x, int y) {
+                        uint32_t& px = body.At(x, y);
+                        px = (px & 0x00FFFFFFu) | (static_cast<uint32_t>(AlphaOf(px) * a / 255) << 24);
+                    };
+                    apply(cx, cy);
+                    apply(body.width - 1 - cx, cy);
+                    apply(cx, body.height - 1 - cy);
+                    apply(body.width - 1 - cx, body.height - 1 - cy);
+                }
+            }
+        }
+        CompositeOver(panel, body, margin, margin);
+
+        // Selection highlight behind tile 1, then the tiles themselves.
+        const int selected = 1;
+        const int inset = static_cast<int>(m.tileSize * layout::kSelectionInset);
+        const int hlSize = static_cast<int>(m.tileSize) + inset * 2;
+        Bitmap highlight = Bitmap::Create(hlSize, hlSize);
+        for (uint32_t& px : highlight.pixels) px = MakePixel(255, 255, 255, 46);
+        // Rounded, matching BakeSelection in panel.cpp — a hard-edged rectangle
+        // next to squircle icons reads as wrong immediately.
+        {
+            const int r = static_cast<int>(m.tileSize * 0.22f);
+            const std::vector<uint8_t>& corner = SquircleMask(r * 2);
+            for (int cy = 0; cy < r; ++cy) {
+                for (int cx = 0; cx < r; ++cx) {
+                    const uint8_t a = corner[static_cast<size_t>(cy) * (r * 2) + cx];
+                    auto apply = [&](int x, int y) {
+                        uint32_t& px = highlight.At(x, y);
+                        px = (px & 0x00FFFFFFu) |
+                             (static_cast<uint32_t>(AlphaOf(px) * a / 255) << 24);
+                    };
+                    apply(cx, cy);
+                    apply(hlSize - 1 - cx, cy);
+                    apply(cx, hlSize - 1 - cy);
+                    apply(hlSize - 1 - cx, hlSize - 1 - cy);
+                }
+            }
+        }
+        CompositeOver(panel, highlight,
+                      margin + static_cast<int>(m.TileX(selected)) - inset,
+                      margin + static_cast<int>(m.padding) - inset);
+
+        for (int i = 0; i < count; ++i) {
+            const Bitmap tile = MakeIconTile(cases[i % 4].make(kSourceSize),
+                                             static_cast<int>(m.tileSize));
+            CompositeOver(panel, tile,
+                          margin + static_cast<int>(m.TileX(i)),
+                          margin + static_cast<int>(m.padding));
+        }
+
+        if (!WritePng(outDir + "/panel.png", panel)) {
+            std::fprintf(stderr, "failed to write panel.png\n");
+            ++failures;
+        }
+        std::printf("\npanel: %d tiles, tile %.0f, panel %.0fx%.0f, radius %.0f\n",
+                    count, m.tileSize, m.panelWidth, m.panelHeight, m.radius);
     }
 
     std::printf("\nwrote PNGs to %s/\n", outDir.c_str());

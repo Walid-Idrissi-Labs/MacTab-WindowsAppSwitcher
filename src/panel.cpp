@@ -27,6 +27,7 @@
 #include "common.h"
 #include "diag.h"
 #include "geometry.h"
+#include "panel_layout.h"
 
 namespace WUC = winrt::Windows::UI::Composition;
 namespace WFN = winrt::Windows::Foundation::Numerics;
@@ -36,16 +37,11 @@ namespace {
 
 constexpr wchar_t kPanelClass[] = L"MacTabPanelWindow";
 
-// Layout constants, in logical pixels at 96 DPI. These are the numbers that
-// decide whether it reads as macOS, so they are named rather than inlined.
-constexpr float kTileSize        = 128.0f;
-constexpr float kTileGap         = 8.0f;
-constexpr float kPanelPadding    = 20.0f;
-constexpr float kPanelRadius     = 24.0f;   // NOT DWM's 8px; this is the point
-constexpr float kLabelHeight     = 28.0f;
-constexpr float kMinTileSize     = 40.0f;
-constexpr float kShadowSigma     = 22.0f;
-constexpr float kBlurSigma       = 34.0f;
+// Tile size, gap, padding, corner radius and the shrink-to-fit rule live in
+// panel_layout.h, which is free of windows.h so tools/preview can render the
+// real geometry natively. Only the rendering-specific constants stay here.
+constexpr float kShadowSigma = 22.0f;
+constexpr float kBlurSigma   = 34.0f;
 
 // Extra desktop captured around the panel so the blur has real pixels to pull
 // from instead of clamping at the edge.
@@ -127,7 +123,7 @@ struct Panel::Impl {
     std::vector<PanelItem> items;
     int    selected  = 0;
     float  dpiScale  = 1.0f;
-    float  tilePx    = kTileSize;
+    float  tilePx    = layout::kTileSize;
     RECT   panelRect{};        // screen coords
     Theme  theme     = MakeTheme(false);
     HMONITOR monitor = nullptr;
@@ -142,6 +138,7 @@ struct Panel::Impl {
 
     void Layout();
     void BakeShadow();
+    void BakeSelection();
     void StartCapture();
     void BakeBackdrop();
     void BakeLabel();
@@ -380,7 +377,7 @@ int  Panel::TileSizePx() const {
 // bound. This is one textured quad per frame instead.
 void Panel::Impl::BakeShadow() {
     const float sigma  = Scaled(kShadowSigma);
-    const float radius = Scaled(kPanelRadius);
+    const float radius = Scaled(layout::kPanelRadius);
     const int   cell   = static_cast<int>(std::ceil(radius + 3.0f * sigma));
     const int   size   = cell * 2 + 4;
 
@@ -468,6 +465,51 @@ void Panel::Impl::StartCapture() {
     std::thread([task] { (*task)(); }).detach();
 }
 
+// Selection highlight.
+//
+// A SpriteVisual with a colour brush is a hard-edged rectangle, which next to
+// squircle icons reads immediately as wrong. The highlight needs the same
+// rounded shape, and it has to resize as the tile size changes — so it is baked
+// once as a squircle and stretched with a nine-grid, exactly like the shadow.
+void Panel::Impl::BakeSelection() {
+    const float radius = Scaled(layout::kTileSize) * 0.22f;
+    const int   cell   = static_cast<int>(std::ceil(radius)) + 2;
+    const int   size   = cell * 2 + 4;
+
+    auto surface = graphics.CreateDrawingSurface(
+        { static_cast<float>(size), static_cast<float>(size) },
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+
+    {
+        SurfaceDraw draw(surface);
+        if (!draw.ok) {
+            MACTAB_WARN("panel: selection BeginDraw failed");
+            return;
+        }
+
+        draw.dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+        auto geometry = CreateSquircleGeometry(d2dFactory.Get(),
+                                               static_cast<float>(size),
+                                               static_cast<float>(size), radius);
+        if (!geometry) return;
+
+        ComPtr<ID2D1SolidColorBrush> brush;
+        draw.dc->CreateSolidColorBrush(theme.selection, brush.Put());
+
+        draw.dc->SetTransform(D2D1::Matrix3x2F::Translation(
+            static_cast<float>(draw.offset.x), static_cast<float>(draw.offset.y)));
+        draw.dc->FillGeometry(geometry.Get(), brush.Get());
+        draw.dc->SetTransform(D2D1::Matrix3x2F::Identity());
+    }
+
+    auto nine = compositor.CreateNineGridBrush();
+    nine.Source(compositor.CreateSurfaceBrush(surface));
+    nine.SetInsets(static_cast<float>(cell));
+    selectionVisual.Brush(nine);
+}
+
 // ---------------------------------------------------------------------------
 // Backdrop
 //
@@ -512,7 +554,7 @@ void Panel::Impl::BakeBackdrop() {
         auto geometry = CreateSquircleGeometry(d2dFactory.Get(),
                                                static_cast<float>(width),
                                                static_cast<float>(height),
-                                               Scaled(kPanelRadius));
+                                               Scaled(layout::kPanelRadius));
         if (!geometry) return;
 
         const D2D1_MATRIX_3X2_F toSurface =
@@ -604,7 +646,7 @@ void Panel::Impl::BakeLabel() {
     const std::wstring& text = items[static_cast<size_t>(index)].label;
 
     const int width  = panelRect.right - panelRect.left;
-    const int height = static_cast<int>(std::ceil(Scaled(kLabelHeight)));
+    const int height = static_cast<int>(std::ceil(Scaled(layout::kLabelHeight)));
     if (width <= 0 || height <= 0) return;
 
     labelSurface = graphics.CreateDrawingSurface(
@@ -649,7 +691,7 @@ void Panel::Impl::BakeLabel() {
     labelVisual.Brush(compositor.CreateSurfaceBrush(labelSurface));
     labelVisual.Size({ static_cast<float>(width), static_cast<float>(height) });
     labelVisual.Offset({ 0.0f, static_cast<float>(panelRect.bottom - panelRect.top) -
-                               Scaled(kPanelPadding) - Scaled(kLabelHeight) + Scaled(4.0f), 0.0f });
+                               Scaled(layout::kPanelPadding) - Scaled(layout::kLabelHeight) + Scaled(4.0f), 0.0f });
 }
 
 // ---------------------------------------------------------------------------
@@ -674,21 +716,11 @@ void Panel::Impl::Layout() {
 
     // macOS shrinks tiles to fit rather than wrapping to a second row, so the
     // panel is always a single strip.
-    tilePx = Scaled(kTileSize);
-    const float gap = Scaled(kTileGap);
-    const float padding = Scaled(kPanelPadding);
+    const layout::Metrics metrics = layout::Compute(count, maxPanelWidth, dpiScale);
+    tilePx = metrics.tileSize;
 
-    auto widthFor = [&](float tile) {
-        return padding * 2 + tile * count + gap * (std::max)(0, count - 1);
-    };
-
-    if (count > 0 && widthFor(tilePx) > maxPanelWidth) {
-        const float available = maxPanelWidth - padding * 2 - gap * (count - 1);
-        tilePx = (std::max)(Scaled(kMinTileSize), available / count);
-    }
-
-    const float panelWidth  = (std::min)(widthFor(tilePx), maxPanelWidth);
-    const float panelHeight = padding * 2 + tilePx + Scaled(kLabelHeight);
+    const float panelWidth  = metrics.panelWidth;
+    const float panelHeight = metrics.panelHeight;
 
     const int width  = static_cast<int>(std::lround(panelWidth));
     const int height = static_cast<int>(std::lround(panelHeight));
@@ -772,8 +804,8 @@ void Panel::Impl::UploadIcon(size_t index) {
 }
 
 void Panel::Impl::PositionTiles(bool animate) {
-    const float padding = Scaled(kPanelPadding);
-    const float gap     = Scaled(kTileGap);
+    const float padding = Scaled(layout::kPanelPadding);
+    const float gap     = Scaled(layout::kTileGap);
 
     for (size_t i = 0; i < tileVisuals.size(); ++i) {
         const float x = padding + static_cast<float>(i) * (tilePx + gap);
@@ -782,7 +814,7 @@ void Panel::Impl::PositionTiles(bool animate) {
     }
 
     if (selected >= 0 && selected < static_cast<int>(tileVisuals.size())) {
-        const float inset = tilePx * 0.06f;
+        const float inset = tilePx * layout::kSelectionInset;
         const float x = padding + static_cast<float>(selected) * (tilePx + gap) - inset;
 
         selectionVisual.Size({ tilePx + inset * 2, tilePx + inset * 2 });
@@ -831,12 +863,7 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
     for (size_t i = 0; i < impl.items.size(); ++i)
         impl.UploadIcon(i);
 
-    impl.selectionVisual.Brush(impl.compositor.CreateColorBrush(
-        WUC::Color{ static_cast<uint8_t>(impl.theme.selection.a * 255),
-                    static_cast<uint8_t>(impl.theme.selection.r * 255),
-                    static_cast<uint8_t>(impl.theme.selection.g * 255),
-                    static_cast<uint8_t>(impl.theme.selection.b * 255) }));
-
+    impl.BakeSelection();
     impl.PositionTiles(false);
     impl.StartCapture();
     impl.BakeLabel();
@@ -918,8 +945,8 @@ int Panel::HitTest(POINT screenPoint) const {
     const Impl& impl = *m_impl;
     if (!impl.visible || impl.items.empty()) return -1;
 
-    const float padding = impl.Scaled(kPanelPadding);
-    const float gap     = impl.Scaled(kTileGap);
+    const float padding = impl.Scaled(layout::kPanelPadding);
+    const float gap     = impl.Scaled(layout::kTileGap);
 
     const float x = static_cast<float>(screenPoint.x - impl.panelRect.left);
     const float y = static_cast<float>(screenPoint.y - impl.panelRect.top);
