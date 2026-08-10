@@ -229,6 +229,61 @@ bool SetTheme(const wchar_t* value) {
     return ok != FALSE;
 }
 
+// Must match AppId in installer/MacTab.iss. Inno appends _is1.
+constexpr wchar_t kUninstallKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+    L"{E2C26C45-D5E7-4EFD-A956-4168F7C3E0D6}_is1";
+
+std::wstring UninstallCommand() {
+    // HKCU first: per-user is the default install. A per-machine install (the
+    // uiAccess route, if a certificate ever appears) writes HKLM instead.
+    for (const HKEY root : { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE }) {
+        wchar_t value[MAX_PATH * 2] = L"";
+        DWORD size = sizeof(value);
+        if (::RegGetValueW(root, kUninstallKey, L"UninstallString",
+                           RRF_RT_REG_SZ, nullptr, value, &size) == ERROR_SUCCESS &&
+            value[0] != L'\0') {
+            return value;
+        }
+    }
+    return {};
+}
+
+bool RunUninstaller() {
+    std::wstring command = UninstallCommand();
+    if (command.empty()) {
+        MACTAB_WARN("config: no uninstall entry, this is not an installed copy");
+        return false;
+    }
+
+    // The value is a quoted path, sometimes with arguments. ShellExecute wants
+    // them separate, so split on the closing quote of the executable.
+    std::wstring file = command;
+    std::wstring args;
+    if (!file.empty() && file.front() == L'"') {
+        const size_t end = file.find(L'"', 1);
+        if (end != std::wstring::npos) {
+            args = file.substr(end + 1);
+            file = file.substr(1, end - 1);
+        }
+    }
+
+    while (!args.empty() && args.front() == L' ')
+        args.erase(args.begin());
+
+    // Inno's own convention for "show the wizard normally". Not /SILENT: the
+    // user asked to uninstall from a tray menu, so they get the confirmation.
+    const HINSTANCE result = ::ShellExecuteW(nullptr, L"open", file.c_str(),
+                                             args.empty() ? nullptr : args.c_str(),
+                                             nullptr, SW_SHOWNORMAL);
+
+    // ShellExecute returns a value <= 32 as an error code, not a handle.
+    const bool ok = reinterpret_cast<INT_PTR>(result) > 32;
+    MACTAB_DIAG("config: uninstaller %s (%s)", ToUtf8(file).c_str(),
+                ok ? "started" : "failed to start");
+    return ok;
+}
+
 bool AutostartEnabled() {
     wchar_t value[MAX_PATH * 2] = L"";
     DWORD size = sizeof(value);

@@ -428,6 +428,13 @@ void ShowTrayMenu(HWND hwnd, POINT screenPt) {
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_LIST, L"Log current switcher list");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_LOG, L"Open diagnostics log");
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+    // Disabled rather than hidden when there is no uninstall entry: running the
+    // bare exe without installing is supported, and a greyed item explains why
+    // nothing happens where a missing one would just look like a bug.
+    const bool installed = !config::UninstallCommand().empty();
+    ::AppendMenuW(menu, MF_STRING | (installed ? 0u : (MF_DISABLED | MF_GRAYED)),
+                  IDM_TRAY_UNINSTALL, L"Uninstall MacTab...");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_QUIT, L"Quit MacTab");
 
     ::SetForegroundWindow(hwnd);
@@ -619,6 +626,22 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
         case IDM_TRAY_OPEN_LOG:
             OpenDiagnosticsLog(hwnd);
+            return 0;
+
+        case IDM_TRAY_UNINSTALL:
+            // Deliberately no PostQuitMessage. The uninstaller posts WM_CLOSE
+            // to our host window before it removes anything, so this process
+            // exits on its own; quitting first would leave nothing running if
+            // the user cancels the wizard.
+            if (!config::RunUninstaller()) {
+                ::MessageBoxW(hwnd,
+                              L"MacTab could not find its uninstaller.\n\n"
+                              L"This usually means it is running as a standalone "
+                              L"executable rather than an installed copy, in which "
+                              L"case there is nothing to uninstall: delete "
+                              L"MacTab.exe and the MacTab folder in %LOCALAPPDATA%.",
+                              L"MacTab", MB_OK | MB_ICONINFORMATION);
+            }
             return 0;
 
         case IDM_TRAY_QUIT:

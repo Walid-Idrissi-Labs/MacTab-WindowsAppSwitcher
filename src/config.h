@@ -69,6 +69,27 @@ bool SetPanelDisplay(PanelDisplay display);
 // another thread the way the themes directory does.
 bool SetTheme(const wchar_t* value);
 
+// --- Uninstall --------------------------------------------------------------
+//
+// Inno Setup writes an UninstallString under
+//   Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppId}_is1
+// in HKCU for a per-user install and HKLM for a per-machine one. The AppId is
+// frozen in installer/MacTab.iss and must not change, or an upgrade forks the
+// lineage and leaves two entries in Add/Remove Programs.
+//
+// Empty when MacTab is running as a standalone exe rather than an installed
+// copy, which is a supported way to use it, so the tray item is disabled rather
+// than hidden in that case.
+std::wstring UninstallCommand();
+
+// Launch the uninstaller and return true if it started.
+//
+// The uninstaller posts WM_CLOSE to our host window before it removes anything,
+// so this process exits on its own; there is deliberately no PostQuitMessage
+// here. Quitting first would leave nothing running if the user then cancels the
+// uninstall wizard.
+bool RunUninstaller();
+
 // --- Autostart --------------------------------------------------------------
 //
 // The Run key is the SINGLE source of truth: there is deliberately no mirrored

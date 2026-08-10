@@ -17,6 +17,8 @@
 #define IDM_TRAY_DISPLAY_MOUSE  211
 #define IDM_TRAY_DISPLAY_MAIN   212
 
+#define IDM_TRAY_UNINSTALL      216
+
 // Settings > Appearance. Same rule: contiguous and in this order.
 #define IDM_TRAY_THEME_AUTO     220
 #define IDM_TRAY_THEME_LIGHT    221
