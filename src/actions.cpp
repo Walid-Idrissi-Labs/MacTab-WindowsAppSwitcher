@@ -43,7 +43,13 @@ void HideApp(const SwitcherApp& app) {
         if (!window.hwnd || !::IsWindow(window.hwnd)) continue;
         // SW_MINIMIZE rather than SW_FORCEMINIMIZE: the latter is for hung
         // windows and skips the animation, which looks broken on a healthy app.
-        ::ShowWindow(window.hwnd, SW_MINIMIZE);
+        //
+        // Async because ShowWindow on another thread's window is synchronous,
+        // and this runs on the UI thread during a gesture. One wedged window in
+        // the app would otherwise freeze the panel and, worse, delay the pending
+        // commit that releases Alt, so the user would be typing chords until the
+        // hang cleared.
+        ::ShowWindowAsync(window.hwnd, SW_MINIMIZE);
     }
 }
 

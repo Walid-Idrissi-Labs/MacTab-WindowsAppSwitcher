@@ -28,6 +28,19 @@
 
 namespace mactab::hotkey {
 
+// "Cycle windows within the highlighted app", the key above Tab.
+//
+// NOT VK_OEM_3. OEM virtual keys move with the keyboard layout: on French
+// AZERTY the key above Tab is the superscript-two key and does not produce
+// VK_OEM_3 at all, so binding the VK would break the feature on the layout this
+// is most likely to be used on. The macOS gesture being copied (Cmd and the key
+// above Tab) is positional, so the hook matches scan code 0x29, which is that
+// physical key on every layout, and reports it as this sentinel instead.
+//
+// Chosen above VK_OEM_CLEAR (0xFE) and below the unassigned 0xE0 range so it
+// cannot collide with a real virtual key.
+inline constexpr WPARAM kActionCycleWindows = 0x1FF;
+
 // Posted to the UI window passed to Start(). All are fire-and-forget.
 enum : UINT {
     // A switch gesture started. wParam: 1 if Shift was held (reverse order).
@@ -52,7 +65,8 @@ enum : UINT {
     WM_MACTAB_CANCEL = WM_APP + 14,
 
     // A quick-action key was pressed while the panel was up.
-    // wParam: the virtual key ('Q', 'W', 'H', VK_OEM_3 for backquote, VK_DOWN).
+    // wParam: the virtual key ('Q', 'W', 'H', VK_DOWN, VK_UP), or
+    // kActionCycleWindows for the key above Tab.
     WM_MACTAB_ACTION = WM_APP + 15,
 };
 

@@ -284,7 +284,17 @@ void RevealPanel() {
 void HandleActionKey(WORD virtualKey) {
     Gesture& g = g_app.gesture;
     if (!g.active || g.apps.empty()) return;
-    if (g.index < 0 || g.index >= static_cast<int>(g.apps.size())) return;
+
+    // Bound g.index against the list it actually indexes, which is the expanded
+    // app's WINDOWS in window mode, not the app list. Testing it against
+    // g.apps.size() meant that expanding an app with more windows than there are
+    // apps and arrowing past that count silently killed every action key,
+    // including the Up that collapses back out, so the only way out was to
+    // release Alt.
+    int n = static_cast<int>(g.apps.size());
+    if (g.windowMode && g.appIndex >= 0 && g.appIndex < n)
+        n = static_cast<int>(g.apps[static_cast<size_t>(g.appIndex)].windows.size());
+    if (g.index < 0 || g.index >= n) return;
 
     // In window mode the highlighted entry is a window, but Q/W/H still act on
     // the owning app, which is the one that was expanded.
@@ -317,7 +327,7 @@ void HandleActionKey(WORD virtualKey) {
         HideApp(app);
         return;
 
-    case VK_OEM_3:      // backquote: cycle windows within the highlighted app
+    case hotkey::kActionCycleWindows:   // the key above Tab
         if (g.windowMode) {
             // Already looking at the windows; just advance the selection.
             AdvanceSelection(1);
@@ -664,6 +674,19 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             MACTAB_DIAG("session: change %llu, aborting any in-flight gesture",
                         static_cast<unsigned long long>(wParam));
             hotkey::AbortGesture();
+
+            // Repair the modifier again once input belongs to this desktop.
+            //
+            // AbortGesture on LOCK injects the replacement Alt-up while Winlogon
+            // owns the input desktop, where SendInput is dropped, so the
+            // swallowed Alt-up is never actually replaced and the first thing
+            // the user types after unlocking is an Alt chord. By UNLOCK the
+            // gesture is already Idle, so nothing else would ever do it.
+            //
+            // Unconditional and harmless: a lone Alt-up when Alt is already up
+            // does nothing, since a key-up on its own never opens a menu bar.
+            if (wParam == WTS_SESSION_UNLOCK)
+                hotkey::NeutralizeAlt(VK_MENU);
 
             // Processes very likely came and went while the session was locked,
             // and PIDs get reused. Cheaper to drop the cache than to validate it.

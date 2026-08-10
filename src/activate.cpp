@@ -6,6 +6,20 @@
 namespace mactab {
 
 bool ActivateWindow(HWND target, WORD altVirtualKey) {
+    // Release Alt FIRST, before anything can return early.
+    //
+    // We swallowed the real Alt-up, so until this runs the system still believes
+    // Alt is held and every subsequent keystroke arrives as an Alt chord: menu
+    // bars open, accelerators fire, and the user has to tap Alt to get out of
+    // it. The dead-target path below is not hypothetical, it is what happens
+    // when the app you were switching to is closed or crashes while the panel is
+    // up, and it used to return without repairing the modifier.
+    //
+    // Injecting a lone Alt-up when Alt is already up is a no-op: a key-up on its
+    // own never activates a menu bar. So there is no cost to doing this
+    // unconditionally and a stuck modifier if it is skipped.
+    hotkey::NeutralizeAlt(altVirtualKey);
+
     if (!target || !::IsWindow(target)) {
         MACTAB_WARN("activate: target window is gone");
         return false;
@@ -25,8 +39,7 @@ bool ActivateWindow(HWND target, WORD altVirtualKey) {
     // qualify. This is why we do not use AttachThreadInput: attaching our
     // input queue to another app's means a hang in that app hangs our hook
     // thread, which would take the keyboard down system-wide.
-    hotkey::NeutralizeAlt(altVirtualKey);
-
+    //
     // If the app has an active modal dialog, focus belongs there rather than on
     // a main window that cannot accept input.
     HWND focusTarget = ::GetLastActivePopup(target);
@@ -35,8 +48,18 @@ bool ActivateWindow(HWND target, WORD altVirtualKey) {
 
     // Restore before taking foreground; the reverse order leaves the window
     // foreground but still iconic on some shells.
-    if (::IsIconic(target))
-        ::ShowWindow(target, SW_RESTORE);
+    //
+    // ShowWindow on another thread's window is SYNCHRONOUS, so a wedged app
+    // would block this thread here, and this thread is the one that has to keep
+    // processing gesture messages. ShowWindowAsync for a hung window only: the
+    // synchronous call in the healthy case is what keeps the restore ordered
+    // before the foreground change.
+    if (::IsIconic(target)) {
+        if (::IsHungAppWindow(target))
+            ::ShowWindowAsync(target, SW_RESTORE);
+        else
+            ::ShowWindow(target, SW_RESTORE);
+    }
 
     if (::SetForegroundWindow(focusTarget))
         return true;

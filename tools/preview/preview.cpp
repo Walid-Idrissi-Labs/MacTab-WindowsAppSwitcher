@@ -609,15 +609,15 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
     const uint8_t hlAlpha = (material.tint[0] > 0.5f) ? 26 : 46;
     const uint8_t hlValue = (material.tint[0] > 0.5f) ? 0 : 255;
     for (uint32_t& px : highlight.pixels) px = MakePixel(hlValue, hlValue, hlValue, hlAlpha);
-    // Rounded, matching BakeSelection in panel.cpp. A hard-edged rectangle next
-    // to squircle icons reads as wrong immediately. This one keeps n = 5,
-    // because it belongs to the icons' shape language rather than the panel's.
+    // Rounded, matching BakeSelection in panel.cpp: the SAME corner as the
+    // backdrop, same extent and same exponent, clamped to half the highlight's
+    // own size. A tighter corner nested inside a rounder one reads as a mistake.
     {
-        const int r = static_cast<int>(m.tileSize * 0.22f);
-        const std::vector<uint8_t>& corner = SquircleMask(r * 2);
+        const int r = static_cast<int>(std::min(m.radius, hlSize * 0.5f));
+        const std::vector<uint8_t> corner = CornerMask(r, layout::kPanelCornerExponent);
         for (int cy = 0; cy < r; ++cy) {
             for (int cx = 0; cx < r; ++cx) {
-                const uint8_t a = corner[static_cast<size_t>(cy) * (r * 2) + cx];
+                const uint8_t a = corner[static_cast<size_t>(cy) * r + cx];
                 auto apply = [&](int x, int y) {
                     uint32_t& px = highlight.At(x, y);
                     px = (px & 0x00FFFFFFu) |

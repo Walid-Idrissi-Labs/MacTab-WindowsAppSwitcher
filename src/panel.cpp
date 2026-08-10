@@ -622,18 +622,21 @@ void Panel::Impl::StartCapture() {
 // rounded shape, and it has to resize as the tile size changes, so it is baked
 // once as a squircle and stretched with a nine-grid.
 //
-// The radius follows the ACTUAL tile size, not the nominal one. Reading
-// layout::kTileSize meant the highlight kept a 28px corner while the tiles it
-// sits behind shrank to 40, which is the wrong shape and, worse, made the
-// highlight's own nine-grid degenerate: two insets of ~31 will not divide a
-// visual only 45 across. SetItems re-bakes this every gesture, so tracking the
-// real size costs nothing.
+// Same corner as the backdrop, literally: same extent, same exponent.
 //
-// Exponent stays at the default 5. This belongs to the icons' shape language,
-// not the panel's.
+// It used to be 0.22 of the tile, which came out at 28px against the panel's 62
+// and read as a noticeably tighter, squarer shape sitting inside a rounder one.
+// The highlight is a smaller rectangle nested in the panel, so the two corners
+// are seen together and any difference between them reads as a mistake rather
+// than as a hierarchy.
+//
+// Clamped to half the highlight's own size for the shrink-to-fit case: at
+// kMinTileSize the box is only 45 across and a 62 extent has no meaning there.
 void Panel::Impl::BakeSelection() {
-    const float tile   = (tilePx > 0.0f) ? tilePx : Scaled(layout::kTileSize);
-    const float radius = tile * 0.22f;
+    const float tile = (tilePx > 0.0f) ? tilePx : Scaled(layout::kTileSize);
+    const float box  = tile * (1.0f + 2.0f * layout::kSelectionInset);
+
+    const float radius = (std::min)(panelRadiusPx, box * 0.5f);
     const int   cell   = static_cast<int>(std::ceil(radius)) + 2;
     const int   size   = cell * 2 + 4;
 
@@ -657,7 +660,8 @@ void Panel::Impl::BakeSelection() {
 
         auto geometry = CreateSquircleGeometry(d2dFactory.Get(),
                                                static_cast<float>(size),
-                                               static_cast<float>(size), radius);
+                                               static_cast<float>(size), radius,
+                                               layout::kPanelCornerExponent);
         if (!geometry) {
             selectionVisual.Brush(nullptr);
             return;
@@ -676,11 +680,9 @@ void Panel::Impl::BakeSelection() {
     nine.Source(compositor.CreateSurfaceBrush(surface));
     nine.SetInsets(static_cast<float>(cell));
 
-    // The highlight is tile * (1 + 2 * kSelectionInset) across, so belt and
-    // braces against the degenerate nine-grid case: two insets must leave a
-    // middle to stretch, or the brush stops rendering.
-    const float destination = tile * (1.0f + 2.0f * layout::kSelectionInset);
-    nine.SetInsetScales((std::min)(1.0f, destination * 0.98f / (2.0f * cell)));
+    // Belt and braces against the degenerate nine-grid case: two insets must
+    // leave a middle to stretch, or the brush stops rendering.
+    nine.SetInsetScales((std::min)(1.0f, box * 0.98f / (2.0f * cell)));
 
     selectionVisual.Brush(nine);
 }

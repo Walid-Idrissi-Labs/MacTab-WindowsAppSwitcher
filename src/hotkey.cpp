@@ -6,6 +6,11 @@
 namespace mactab::hotkey {
 namespace {
 
+// Set 1 scan code for the key above Tab, which is backquote on a US layout and
+// something different on most others. Position, not virtual key: see the note at
+// the use site.
+constexpr DWORD kScanBackquote = 0x29;
+
 // Tag on every key event we synthesise. We must recognise our own injected
 // input and pass it straight through, or we would re-enter the state machine
 // with our own Alt-up and loop.
@@ -174,7 +179,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         case 'H':   // minimise all windows of the app
         case VK_DOWN:      // expand the app's windows
         case VK_UP:        // collapse back to the app row
-        case VK_OEM_3:     // backquote: cycle windows within the app
             // Only meaningful once the panel is visible. Before that the user
             // is mid-quick-switch and these should not fire.
             if (g_state == State::Panel) {
@@ -184,6 +188,20 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
             return 1;   // swallow regardless; do not leak into the background app
 
         default:
+            // Cycle windows within the app, on the key ABOVE TAB.
+            //
+            // Matched by scan code, not by virtual key. VK_OEM_3 is the
+            // backquote on a US layout and something else entirely elsewhere:
+            // on French AZERTY the key above Tab is superscript-two and does
+            // not produce VK_OEM_3 at all, so a VK binding breaks the feature
+            // on the layout this user actually types on. Scan code 0x29 is that
+            // physical key everywhere, which also matches what the macOS
+            // gesture means, since Cmd plus the key above Tab is positional.
+            if (key->scanCode == kScanBackquote) {
+                if (g_state == State::Panel)
+                    PostToUi(WM_MACTAB_ACTION, kActionCycleWindows);
+                return 1;
+            }
             break;
         }
     }
@@ -194,8 +212,23 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
                         vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
         return ::CallNextHookEx(nullptr, code, wParam, lParam);
 
-    // While the switcher owns the keyboard, everything else is sunk rather than
-    // leaked to whatever app happens to be behind the panel.
+    // NEVER sink a key-up, whatever key it is.
+    //
+    // Sinking a key-down is what stops the switcher's keys leaking into the app
+    // behind the panel, and that is the whole point. Sinking the matching key-up
+    // does nothing for that and leaves the system believing the key is still
+    // held. The case that hurts is a key the user was ALREADY holding when the
+    // gesture started, because its key-down passed through in Idle: hold Win,
+    // press Alt+Tab, release Win, and from then on every keystroke is a Win
+    // chord. E opens Explorer, R opens Run, L locks the session.
+    //
+    // A lone key-up whose key-down we swallowed is harmless to whoever receives
+    // it: no app treats an unmatched key-up as a keystroke.
+    if (up)
+        return ::CallNextHookEx(nullptr, code, wParam, lParam);
+
+    // While the switcher owns the keyboard, every other key-down is sunk rather
+    // than leaked to whatever app happens to be behind the panel.
     return 1;
 }
 
