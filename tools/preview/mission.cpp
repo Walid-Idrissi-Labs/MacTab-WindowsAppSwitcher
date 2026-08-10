@@ -189,21 +189,24 @@ void DrawChrome(Bitmap& b, const mission::Placement& p, int index, int group,
     const int cx = static_cast<int>(p.x + p.w * 0.5f);
     const int bottom = static_cast<int>(p.y + p.h);
 
-    // Centred on the bottom edge, half in and half out, which is what makes it
-    // read as belonging to the window rather than floating under it.
-    FillDisc(b, static_cast<float>(cx), static_cast<float>(bottom),
+    // Mostly ON the window rather than under it, sitting over its lower edge.
+    // That is what makes it read as this window's application instead of a
+    // caption floating below a group of rectangles.
+    const int cy = bottom - static_cast<int>(kBadge * 0.16f);
+
+    FillDisc(b, static_cast<float>(cx), static_cast<float>(cy),
              kBadge * 0.5f + 3.0f, MakePixel(18, 18, 22, 210));
-    FillDisc(b, static_cast<float>(cx), static_cast<float>(bottom),
+    FillDisc(b, static_cast<float>(cx), static_cast<float>(cy),
              kBadge * 0.5f, GroupColour(group));
 
     char mark[4];
     std::snprintf(mark, sizeof(mark), "%d", group);
-    DrawWord(b, mark, cx - WordWidth(mark, 3) / 2, bottom - 10, 3,
+    DrawWord(b, mark, cx - WordWidth(mark, 3) / 2, cy - 10, 3,
              MakePixel(255, 255, 255, 255));
 
     const int tw = WordWidth(title, 2);
     const int tx = cx - tw / 2;
-    const int ty = bottom + kBadge / 2 + 10;
+    const int ty = cy + kBadge / 2 + 8;
 
     FillRect(b, tx - 10, ty - 6, tw + 20, kTitleH, MakePixel(0, 0, 0, 150));
     DrawWord(b, title, tx, ty, 2, MakePixel(236, 236, 242, 255));
@@ -478,7 +481,7 @@ int main(int argc, char** argv) {
 
     const float regionW = static_cast<float>(kScreenW - kMargin * 2);
     const float regionH = static_cast<float>(kScreenH - kSpacesBarH - kMargin * 2 -
-                                             kBadge / 2 - kTitleH);
+                                             kBadge / 3 - kTitleH);
 
     std::printf("\nmission control layout, region %.0fx%.0f\n\n", regionW, regionH);
     std::printf("%-10s %7s %7s %7s %7s %7s\n",

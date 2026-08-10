@@ -320,6 +320,21 @@ to walk along.
 
 It is a toggle, not a hold. Mission Control is a place you are in.
 
+| In Mission Control | |
+|---|---|
+| Click a window | Go to it. If it is on another desktop, that takes you there |
+| Click an app's icon, scroll up, or `↓` | Spread that app's pile so its windows can be told apart |
+| Click the background, scroll down, `↑` or `Esc` | Put the pile back, or leave |
+| Click a desktop, or `←` `→` | Look at that desktop's windows without going there |
+| Click the `+` | Add a desktop |
+| `Tab` | Next window |
+| `Enter` | Go to the highlighted window |
+
+`Ctrl+Win+←` and `Ctrl+Win+→` are swallowed while it is open. They switch the
+desktop, and the overlay belongs to the desktop it was created on, so switching
+under it would strand a full-screen window on a desktop nobody is looking at.
+The arrows do the same job from inside instead.
+
 **The arrangement.** One scale for every window, so a large window still looks
 large next to a small one and every aspect ratio is exact. Windows start where
 they really are and shove each other apart until nothing overlaps, which is

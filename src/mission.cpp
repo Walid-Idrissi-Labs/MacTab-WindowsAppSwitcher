@@ -212,6 +212,7 @@ struct Mission::Impl {
         int        item  = -1;     // index into Impl::items
         int        group = 0;
         int        depth = 0;      // 0 is the front of its pile
+        bool       ownName = false;   // name this window, not its application
         float      pileX = 0.0f;   // the pile's box, for anchoring the chrome
         float      pileW = 0.0f;
         float      pileBottom = 0.0f;
@@ -1284,7 +1285,7 @@ void Mission::Impl::BakeChrome(Screen& screen, Tile& tile) {
     // Grouped, the label names the application, because the pile is the
     // application. Ungrouped, every window is its own pile of one and the label
     // names the window.
-    const bool grouped = config::Current().missionGroupByApp;
+    const bool grouped = config::Current().missionGroupByApp && !tile.ownName;
     const std::wstring text =
         (grouped && !item.appName.empty()) ? item.appName
                                            : (item.title.empty() ? item.appName : item.title);
@@ -1871,6 +1872,7 @@ void Mission::Impl::ExpandPile(Screen& screen, int group) {
         tile.pileX      = static_cast<float>(tile.liveRect.left);
         tile.pileW      = place.w;
         tile.pileBottom = static_cast<float>(tile.liveRect.bottom);
+        tile.ownName    = true;   // each of them is its own thing now
     }
 
     for (size_t i = 0; i < screen.tiles.size(); ++i) {
@@ -1900,15 +1902,26 @@ void Mission::Impl::CollapsePile(Screen& screen) {
     const int group = screen.expandedGroup;
     screen.expandedGroup = -1;
 
+    // Where everything is right now, keyed by window, so the rebuilt tiles can
+    // travel back from there rather than from the real desktop. Without this
+    // the pile closing looks like the whole arrangement being revealed again,
+    // with every window flying in from its actual position on screen.
+    std::map<int, RECT> current;
+    for (const Screen& other : screens)
+        for (const Tile& tile : other.tiles)
+            current.emplace(tile.item, tile.liveRect);
+
     // Nothing here knows the collapsed geometry any more, and reconstructing it
-    // by hand would be a second copy of the arrangement. Rebuilding it is one
-    // call and it comes back with the same reveal it had.
+    // by hand would be a second copy of the arrangement.
     BuildForDesktop(browsed, 0);
 
     for (Screen& other : screens) {
         for (Tile& tile : other.tiles) {
             tile.holder.Opacity(1.0f);
             if (tile.chrome) tile.chrome.Opacity(1.0f);
+
+            const auto was = current.find(tile.item);
+            if (was != current.end()) tile.sourceRect = was->second;
         }
         StartReveal(compositor, other,
                     std::chrono::milliseconds(config::Current().missionRevealMs), false);
@@ -1994,29 +2007,22 @@ void Mission::BrowseDesktop(int index) {
     GuardMission(impl, "BrowseDesktop", [&] {
         const int direction = (index > impl.browsed) ? 1 : -1;
         const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
-        auto easing = impl.compositor.CreateCubicBezierEasingFunction({ 0.22f, 1.0f },
-                                                                     { 0.36f, 1.0f });
 
-        // The outgoing arrangement leaves the way you came from. It is animated
-        // before the rebuild because the rebuild throws these visuals away, so
-        // what is actually seen is the incoming set arriving over a backdrop
-        // that never moved. Sliding both would need the old tiles kept alive
-        // through the swap, which is a lot of machinery for a quarter second.
-        for (Impl::Screen& screen : impl.screens) {
+        // The incoming arrangement arrives from the side you are travelling
+        // towards, over a backdrop and a bar that never move. The outgoing one
+        // is not slid out with it: the rebuild throws those visuals away, and
+        // keeping them alive through the swap is a lot of machinery for a
+        // quarter of a second nobody is looking at.
+        for (Impl::Screen& screen : impl.screens)
             screen.outline.Opacity(0.0f);
-            for (Impl::Tile& tile : screen.tiles)
-                tile.holder.Opacity(0.0f);
-            screen.chromeLayer.Opacity(0.0f);
-        }
 
         impl.BuildForDesktop(index, direction);
 
         for (Impl::Screen& screen : impl.screens) {
-            for (Impl::Tile& tile : screen.tiles) tile.holder.Opacity(1.0f);
+            screen.chromeLayer.Opacity(0.0f);
             StartReveal(impl.compositor, screen, duration, false);
         }
 
-        (void)easing;
         MACTAB_DIAG("mission: browsing desktop %d", index);
     });
 }
