@@ -1124,9 +1124,9 @@ void Panel::Impl::BakeLabel() {
         // text.
         //
         // Not decoration. The glass now passes about 0.58 of the backdrop
-        // through, so a white wallpaper under a dark panel reads at roughly
-        // 0.50 and white text on it comes out near 2.6:1, well under the 4.5:1
-        // it needs. The label is the one element sitting directly on the
+        // through, so a white wallpaper under a dark panel reads at 0.62 and
+        // white text on it comes out near 2.7:1, well under the 4.5:1 it
+        // needs. The label is the one element sitting directly on the
         // material with nothing opaque behind it, and this is what buys the
         // transparency without making the name unreadable over a bright
         // desktop. macOS does the same thing.

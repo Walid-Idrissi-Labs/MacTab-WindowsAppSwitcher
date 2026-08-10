@@ -70,24 +70,26 @@ struct Params {
 //
 // The end-to-end gain here is (1 - tintAlpha) * gain, and the end-to-end bias is
 // (1 - tintAlpha) * bias + tintAlpha * tint. The numbers below work out at
-// roughly 0.50 * L + 0.05 for dark and 0.48 * L + 0.35 for light, which puts
-// light within a few percent of the measurement and dark at the same contrast
-// on the other side of the range.
+// 0.58 * L + 0.04 for dark and 0.48 * L + 0.35 for light, which puts light
+// within a few percent of the measurement and dark slightly more transparent
+// than Apple on the other side of the range. 0.1.0's dark material was
+// 0.45 * L + 0.05, which is what "too opaque" meant.
 //
 // Saturation is not a taste knob either. Mixing with a neutral tint at alpha a
 // removes a fraction a of the backdrop's relative saturation, so 1/(1 - a)
-// restores exactly what the tint took away and nothing more. That is 1.43 at
-// alpha 0.30 and 1.47 at 0.32, hence 1.45 for both. This is the difference
-// between a material that looks like glass and one that looks like frosted
-// plastic, and it is the reason CLSID_D2D1Saturation is no use: its property is
-// documented over [0, 1], so it can only ever take saturation away.
+// restores exactly what the tint took away and nothing more: 1.37 at alpha 0.27,
+// 1.47 at 0.32. This is the difference between a material that looks like glass
+// and one that looks like frosted plastic, and it is the reason
+// CLSID_D2D1Saturation is no use: its property is documented over [0, 1], so it
+// can only ever take saturation away.
 
 // Dark.
 //
-// End to end this is about 0.50 * L + 0.05, so a white wallpaper shows through
-// at ~0.55. White label text on that is around 3.3:1, under the 4.5:1 you would
+// End to end this is 0.58 * L + 0.04, so a white wallpaper shows through at
+// 0.62. White label text on that is about 2.7:1, well under the 4.5:1 you would
 // want, which is why BakeLabel draws a shadow under the glyphs. Losing the
-// shadow means pulling the tint back up to about 0.42.
+// shadow means pulling the tint back up to about 0.42, and that is most of the
+// transparency this release is about.
 inline constexpr Params kDark{
     1.37f, 0.80f, 0.02f,
     { 0.09f, 0.09f, 0.11f, 0.27f },
