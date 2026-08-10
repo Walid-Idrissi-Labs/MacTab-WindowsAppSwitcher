@@ -614,6 +614,22 @@ void Panel::Impl::RecoverDevices() {
 // startup and stretched. A DropShadow with a 40px blur is recomputed by the
 // compositor whenever the shadow's size changes, at a cost we cannot see or
 // bound. This is one textured quad per frame instead.
+//
+// KNOWN, and left alone deliberately for 0.2.
+//
+// A nine-grid cell has to cover the corner plus the blur's reach, radius + 3
+// sigma, which at the new 62px radius is 128 logical pixels. The panel is 200
+// tall in the common case and 112 at the minimum tile size, so two cells no
+// longer fit vertically and Composition scales the insets down to make them,
+// which compresses the shadow's corners. Behind a 42% alpha shape blurred at
+// sigma 22 that is not something you can see, and at radius 24 it did not
+// arise in the common case, only with 30-odd apps open.
+//
+// The correct fix is a horizontal-only nine-grid: bake the source at the real
+// panel height and stretch only the width, since width is the only dimension
+// that varies with the number of apps. That is a redesign of a surface nothing
+// on this machine can render, so it is not going in the same release as the
+// radius change that exposed it.
 void Panel::Impl::BakeShadow() {
     const float sigma  = Scaled(kShadowSigma);
     const float radius = panelRadiusPx;
