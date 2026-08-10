@@ -44,7 +44,6 @@ struct Surface {
 struct Optics {
     float bezel = 0.0f;
     float depth = 0.0f;
-    float feather = 0.0f;
     float rimSpan = 0.0f;
     float specInner = 0.0f;
     float specOuter = 0.0f;
@@ -68,7 +67,6 @@ inline Optics OpticsFor(const Surface& s) {
 
     const float ratio = (full > 0.0f) ? (o.bezel / full) : 0.0f;
     o.depth   = kGlassDepth * s.dpiScale * ratio;
-    o.feather = (std::max)(1.0f, kRimTapFeather * s.dpiScale * ratio);
 
     o.rimSpan = (std::min)(kRimSpan * s.dpiScale, shortest * 0.35f);
     o.specInner = kSpecInner * s.dpiScale;
@@ -202,39 +200,6 @@ inline Bitmap BuildDisplacementMap(const Surface& s) {
         }
     }
     return map;
-}
-
-// Where the lightly-blurred tap shows instead of the frosted interior: opaque
-// over the bezel, fading out over kRimTapFeather past it.
-//
-// Held one pixel wide in colour and meaningful only in alpha, because it is used
-// as an alpha mask. It stays opaque outside the outline as well as inside it: the
-// clip layer is what cuts the shape, and letting the mask fall to zero first
-// would leave the half-covered boundary pixels frosted, which is a hairline of
-// the wrong material exactly where the eye is looking.
-inline Bitmap BuildRimMask(const Surface& s) {
-    const int w = static_cast<int>(s.width);
-    const int h = static_cast<int>(s.height);
-    if (w <= 0 || h <= 0) return {};
-
-    const Optics o = OpticsFor(s);
-    Bitmap mask = Bitmap::Create(w, h, 0);
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float nx = 0.0f, ny = 0.0f;
-            const float inside = -SignedDistance(s, x + 0.5f, y + 0.5f, nx, ny);
-
-            float a = 1.0f;
-            if (inside > o.bezel)
-                a = (std::max)(0.0f, 1.0f - (inside - o.bezel) / o.feather);
-            if (a <= 0.0f) continue;
-
-            const int q = static_cast<int>(a * 255.0f + 0.5f);
-            mask.At(x, y) = MakePixel(255, 255, 255,
-                                      static_cast<uint8_t>(q > 255 ? 255 : q));
-        }
-    }
-    return mask;
 }
 
 // The lit edge, as white with the amount to ADD carried in the alpha.

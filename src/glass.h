@@ -27,12 +27,14 @@
 //     the one 0.3 had none of. The optics live in glass_map.h; the numbers that
 //     drive them are below.
 //
-//  2. Seeing through it at all. Blur sigma and how much of the backdrop's
-//     contrast survives. Reverse engineering of shipped macOS materials puts
-//     their gaussian radius at about 30 and their backdrop sample at quarter
-//     scale, which is where kBlurSigma and kBlurDownscale now sit. 0.3 used 52,
-//     which is a sigma at which nothing behind the panel survives except blobs
-//     bigger than the panel, so it was a slab by construction.
+//  2. Seeing through it at all, which is the one this project kept getting
+//     wrong. Blur sigma and how much of the backdrop's contrast survives, and
+//     both are now measured off the reference rather than argued about: sigma
+//     0.044 of the panel's height, and a transfer of 0.71 * L + 0.068.
+//
+//     0.2 blurred at 34, 0.3 at 52 and 0.4.0 at 30, all on the reasoning that
+//     the macOS backdrop is unrecognisable mush. It is not. In the reference you
+//     can count the floors of the building behind it.
 //
 //  3. Saturation, well past unity. macOS vibrancy pushes the backdrop's
 //     saturation up hard. Measuring the reference gives relative saturation
@@ -89,7 +91,21 @@ constexpr float Luma(float r, float g, float b) {
 // number in the material and the preview has to use the same one. Sharing it by
 // comment, which is what this was, means it drifts the first time anybody
 // retunes it on the Windows side.
-inline constexpr float kBlurSigma = 30.0f;
+// Measured, not chosen. tools/measure has the method: the reference screenshot
+// puts the panel as a horizontal band over a photo of a building whose fins run
+// diagonally, so a row just inside the panel and a row just outside it see the
+// same structure shifted sideways by a known slope. Align the two, then fit the
+// blur and the transfer that turn one into the other.
+//
+// That gives sigma 14.6 on a panel 330 screenshot pixels tall, so 0.044 of the
+// panel's own height, which on our 172px panel is 7.6. Rounded to 8.
+//
+// The history here is worth keeping. 0.2 used 34, 0.3 used 52 on the reasoning
+// that the macOS backdrop is "unrecognisable mush". It is not: you can read the
+// window frames of a building through it. 52 was four to seven times too much,
+// and no amount of tuning the tint was ever going to fix a panel that had
+// already thrown the desktop away.
+inline constexpr float kBlurSigma = 8.0f;
 
 // Downsample before blurring. Also what macOS does, and it is nearly free: a
 // 30px sigma at quarter resolution costs what a 7.5px sigma costs, and after the
@@ -97,26 +113,6 @@ inline constexpr float kBlurSigma = 30.0f;
 // at full resolution instead, which is the same picture for more work; it has no
 // frame budget.
 inline constexpr float kBlurDownscale = 0.25f;
-
-// A second, much lighter blur, used only inside the bezel.
-//
-// This is what makes the refraction visible at all, and leaving it out was the
-// mistake that nearly shipped. At sigma 30 the backdrop has no edges left, so
-// bending it moves nothing you can see: rendering the panel with the lens on and
-// with it off gave pixel-for-pixel the same rim.
-//
-// It is also what the real thing does. The bezel is a lens and a lens transmits;
-// only the flat interior is frosted. So the band within a bezel width of the
-// edge is refracted out of a lightly blurred tap of the same capture, and the
-// interior stays at the full sigma.
-//
-// 8 keeps window edges and wallpaper structure readable through the rim while
-// still being a blur. Anything under about 4 starts showing recognisable text.
-inline constexpr float kRimTapSigma = 8.0f;
-
-// How far past the bezel the light tap fades back into the frosted interior. Not
-// zero, or the join is a visible ring exactly where the eye is already looking.
-inline constexpr float kRimTapFeather = 6.0f;
 
 // The bezel: how far in from the edge the surface is curved rather than flat.
 // Fitted from the Tahoe switcher, where the lens band runs about 45 screenshot
@@ -194,23 +190,33 @@ struct Params {
 };
 
 // Dark.
+//
+// The gain and the bias are the fit off the reference: end to end it runs
+// 0.71 * L + 0.068, so nearly three quarters of the desktop's contrast reaches
+// the screen. 0.3 ran 0.42 and 0.4.0 ran 0.53, which is why it still read as a
+// slab after the blur came down.
 inline constexpr Params kDark{
-    1.70f, 0.62f, 0.06f,
-    { 0.09f, 0.09f, 0.11f, 0.14f },
+    1.70f, 0.789f, 0.0654f,
+    { 0.09f, 0.09f, 0.11f, 0.10f },
     0.96f,
     0.065f, 0.035f, 0.045f,
     0.30f,
-    0.14f, 0.38f
+    0.16f, 0.44f
 };
 
 // Light.
+//
+// Same slope, since that is a property of the glass rather than of the theme,
+// and a much higher intercept, since that is what makes it the light one. There
+// is no light-mode reference to fit against, so the intercept is set to put a
+// mid wallpaper at 0.69 and the band is set by what dark text stays readable on.
 inline constexpr Params kLight{
-    2.00f, 0.70f, 0.08f,
-    { 0.97f, 0.97f, 0.98f, 0.14f },
+    1.84f, 0.789f, 0.2199f,
+    { 0.97f, 0.97f, 0.98f, 0.10f },
     0.96f,
     0.085f, 0.045f, 0.055f,
     0.12f,
-    0.53f, 0.82f
+    0.50f, 0.88f
 };
 
 // --- The transfer, end to end -----------------------------------------------
@@ -248,7 +254,7 @@ constexpr float PanelLuma(const Params& p, float backdropLuma) {
 // How much of the desktop's contrast survives the material. The preview fails
 // the build below this, which is what makes "it looks opaque" a regression
 // somebody has to argue with rather than one that creeps back in.
-inline constexpr float kMinEndGain = 0.50f;
+inline constexpr float kMinEndGain = 0.65f;
 
 // Bounds on the adapted bias.
 //
@@ -261,8 +267,8 @@ inline constexpr float kMinEndGain = 0.50f;
 // The floor has 0.007 of margin, which is thin: a dark gain above 0.628 needs it
 // moved. The band assertion will catch that, but it reports the panel landing in
 // the wrong place rather than naming the constant, so look here first.
-inline constexpr float kBiasFloor   = -0.20f;
-inline constexpr float kBiasCeiling =  0.47f;
+inline constexpr float kBiasFloor   = -0.36f;
+inline constexpr float kBiasCeiling =  0.50f;
 
 // Bend the bias so the panel lands inside [targetMin, targetMax].
 //

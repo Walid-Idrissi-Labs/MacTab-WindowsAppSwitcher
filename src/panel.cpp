@@ -53,16 +53,17 @@ using glass::kBlurSigma;
 // Extra desktop captured around the panel so the blur has real pixels to pull
 // from instead of clamping at the edge under D2D1_BORDER_MODE_HARD.
 //
-// Derived from sigma rather than fixed, and scaled with the DPI. It was 48 raw
-// pixels, which was already thin against a 34px sigma and would have smeared
-// visibly on a 150% display.
+// Whichever of the two needs more: the blur wants 1.5 sigma, and the refraction
+// pulls in from up to kMaxDisplacement outside the panel outline.
 //
-// It also has to cover the refraction, which pulls in from up to
-// kMaxDisplacement outside the panel outline. 1.5 sigma is 45 logical pixels
-// against a ceiling of 16, so that is covered with room to spare, but the two
-// numbers are now coupled and moving sigma down far enough would break it.
+// The max is not decoration. When sigma was 30 the blur won by miles, so the
+// lens got its margin for free. At 8 it does not: 1.5 sigma is 12 logical pixels
+// against a displacement ceiling of 16, and taking the blur's number alone would
+// have left the rim sampling four pixels of nothing all the way round.
 inline float BlurMarginPx(float dpiScale) {
-    return std::ceil(kBlurSigma * dpiScale * 1.5f);
+    const float forBlur = kBlurSigma * 1.5f;
+    const float forLens = glass::kMaxDisplacement + 4.0f;
+    return std::ceil((std::max)(forBlur, forLens) * dpiScale);
 }
 
 bool SystemUsesLightTheme() {
@@ -927,9 +928,6 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
             scale->SetInput(0, captured.Get());
             scale->SetValue(D2D1_SCALE_PROP_SCALE,
                             D2D1::Vector2F(kBlurDownscale, kBlurDownscale));
-            // Cached, or the downsample runs once per tap. D2D only keeps an
-            // intermediate when it is asked to, and this one has two consumers.
-            scale->SetValue(D2D1_PROPERTY_CACHED, TRUE);
         }
 
         // Where the capture ACTUALLY landed, not the margin we asked for: near a
@@ -942,20 +940,12 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
         if (scale && config::Current().glassRefraction)
             map = UploadBitmap(dc, glass::BuildDisplacementMap(glassSurface));
 
-        // One tap: blur, treat, place at this piece's origin, and for the rim,
-        // bend.
+        // Blur, treat, place at this piece's origin, bend at the rim.
         //
-        // A lambda because the two taps differ in one number and one flag.
-        // Written out twice they drift, and a rim built from a different material
-        // than the interior it sits in reads as a colour seam rather than as a
-        // bug.
-        //
-        // Only the rim tap refracts. Running the lens on the frosted tap as well
-        // is a provable no-op: everywhere the map is not neutral the rim mask is
-        // fully opaque, so every displaced pixel is painted over, and in the
-        // feather band past the bezel the map is neutral anyway. It is a whole
-        // extra pass over the panel for pixels nobody ever sees.
-        auto buildTap = [&](float sigma, bool refract) -> ComPtr<ID2D1Effect> {
+        // A lambda only so the early returns can each hand back the last stage
+        // that did get built: every step past the blur is optional, and a panel
+        // with no refraction is worth far more than no panel.
+        auto buildTap = [&](float sigma) -> ComPtr<ID2D1Effect> {
             ComPtr<ID2D1Effect> blur, matrix, place;
             dc->CreateEffect(CLSID_D2D1GaussianBlur, blur.Put());
             dc->CreateEffect(CLSID_D2D1ColorMatrix, matrix.Put());
@@ -998,7 +988,7 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
             place->SetValue(D2D1_2DAFFINETRANSFORM_PROP_INTERPOLATION_MODE,
                             D2D1_2DAFFINETRANSFORM_INTERPOLATION_MODE_LINEAR);
 
-            if (!refract || !map) return place;
+            if (!map) return place;
 
             // Extend the placed backdrop by repeating its edge pixels, before
             // anything samples outside it.
@@ -1053,32 +1043,14 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
             return bound;
         };
 
-        ComPtr<ID2D1Effect> frosted =
-            scale ? buildTap(kBlurSigma, false) : ComPtr<ID2D1Effect>{};
-        if (frosted) {
-            dc->DrawImage(frosted.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
-
-            // The bezel band, refracted out of a much lighter blur and masked to
-            // the rim.
-            //
-            // This is what makes the lens visible. With the frosted tap alone the
-            // panel renders pixel for pixel the same with the displacement on and
-            // with it off, because a 30px sigma leaves no edges to bend. Only
-            // built when refraction is on: a clear band that bends nothing is
-            // just a hole in the frosting.
-            ComPtr<ID2D1Bitmap1> rimMask;
-            if (map) rimMask = UploadBitmap(dc, glass::BuildRimMask(glassSurface));
-
-            ComPtr<ID2D1Effect> clear, masked;
-            if (rimMask) clear = buildTap(glass::kRimTapSigma, true);
-            if (clear)   dc->CreateEffect(CLSID_D2D1AlphaMask, masked.Put());
-
-            if (masked) {
-                masked->SetInputEffect(0, clear.Get());
-                masked->SetInput(1, rimMask.Get());
-                dc->DrawImage(masked.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
-            }
-        }
+        // One tap, and one draw.
+        //
+        // There used to be two: a second, clearer tap masked to the bezel, added
+        // because at a 30px sigma the lens had no edges left to bend and did
+        // literally nothing. At 8 it has plenty, so that tap became a blur of 8
+        // composited over a blur of 8, and it is gone.
+        ComPtr<ID2D1Effect> glass = scale ? buildTap(kBlurSigma) : ComPtr<ID2D1Effect>{};
+        if (glass) dc->DrawImage(glass.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
     }
 
     const D2D1_RECT_F area = D2D1::RectF(0.0f, 0.0f, width, height);

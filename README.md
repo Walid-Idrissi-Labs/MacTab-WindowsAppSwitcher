@@ -120,12 +120,19 @@ panel and its shadow use 2.24. And the panel radius follows Apple's concentric
 rule, outer extent equals inner extent plus the padding between them, which puts
 it at 62 logical pixels rather than the 24 it started at.
 
-**Material.** Same screenshot, different measurement: sample the wallpaper just
-outside the rim and the glass just inside it along the top and bottom edges,
-then fit per channel. Red is the only channel whose input spans a useful range
-there, and it gives `out = 0.439 * in + 0.221`, with mean luma rising from 0.467
-outside to 0.550 inside. So the material compresses the backdrop's contrast to a
-little under half and *lifts* it, rather than veiling it.
+**Material.** A second screenshot, over a photo of a building whose fins run
+diagonally, which is what makes the material measurable at all: a row just inside
+the panel and a row just outside it see the same structure shifted sideways by a
+known slope. Align the two and fit the blur and the transfer that turn one into
+the other. [`tools/measure`](tools/measure/measure.py) does it, and it runs on
+MacTab's own screenshots too.
+
+That gives a blur of sigma 14.6 on a panel 330 pixels tall, so 0.044 of the
+panel's own height, and a transfer of `out = 0.709 * in + 0.068`, with mean luma
+falling from 0.569 outside to 0.459 inside. Nearly three quarters of the
+desktop's contrast survives. Earlier releases passed less than half of it through
+a blur four to seven times too strong, which is why they read as frosted plastic
+no matter what else got tuned.
 
 Four things make that read as glass rather than as a blurred rectangle, in the
 order they matter:
@@ -140,18 +147,30 @@ order they matter:
    2.7:1 of compression across the bezel. Built as an 8-bit map on the CPU and
    handed to `D2D1DisplacementMap`.
 
-   The bezel is refracted out of a *separate, much lighter* blur, sigma 8 against
-   the interior's 30, and that is not a detail. A lens transmits; only the flat
-   interior is frosted. Without it the refraction is invisible, because at sigma
-   30 the backdrop has no edges left to bend: the first version of this rendered
-   pixel for pixel identically with the lens on and off, which is why
-   `bars-top-4x.png` and `bars-top-flat-4x.png` exist in the preview output.
-2. **You can see through it.** Reverse engineering of shipped macOS materials
-   puts their gaussian radius near 30 and their backdrop sample at quarter
-   scale. Ours ran at 52 through 0.3, which is a sigma at which nothing survives
-   except blobs bigger than the panel. Sigma 30, tint alpha 0.14, and an end gain
-   of 0.53 dark / 0.60 light, so a little over half the desktop's contrast
-   reaches the screen. The preview fails the build under 0.50.
+   0.4.0 shipped this with a second, lighter blur just for the bezel, because at
+   the sigma of 30 it ran then the backdrop had no edges left to bend and the
+   lens did nothing at all: the panel rendered pixel for pixel identically with
+   it on and off. At sigma 8 that problem is gone and so is the second tap.
+   `bars-top-4x.png` and `bars-top-flat-4x.png` in the preview output are the
+   comparison that catches it if it ever comes back.
+2. **You can see through it**, and this is the number the project kept getting
+   wrong. It is now measured rather than argued about, by
+   [`tools/measure`](tools/measure/measure.py): the reference puts the panel as a
+   horizontal band over a photo whose structure runs diagonally, so a row just
+   inside the panel and a row just outside see the same content shifted sideways
+   by a known slope. Align the two, then fit the blur and the transfer that turn
+   one into the other.
+
+   | | Apple, measured | 0.3 | 0.4.0 | now |
+   |---|---|---|---|---|
+   | blur sigma, as a fraction of panel height | 0.044 | 0.30 | 0.17 | 0.047 |
+   | end gain | 0.71 | 0.42 | 0.53 | 0.71 |
+   | end bias | 0.068 | 0.064 | 0.064 | 0.068 |
+
+   Three releases blurred at 34, 52 and 30 on the reasoning that the macOS
+   backdrop is unrecognisable mush. It is not: in the reference you can count the
+   floors of the building behind the panel. The preview now fails the build if
+   the end gain drops under 0.65.
 3. **The operating point moves.** One affine transfer cannot serve both a white
    wallpaper and a black one: the panel either washes out or turns into a slab.
    Apple does not use one either, it flips treatment on backdrop luminance. What
