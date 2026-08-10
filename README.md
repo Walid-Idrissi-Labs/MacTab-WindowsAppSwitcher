@@ -25,6 +25,8 @@ Two, and they pull against each other:
    radius (62px, not DWM's 8px), a material whose numbers are fitted to a
    screenshot of the real thing, squircle icons synthesised from whatever
    Windows hands us, MRU app grouping, `Q` to quit an app from the switcher.
+   Win+Tab is Mission Control: every window spread out where you left it,
+   with the desktops across the top.
 2. **Cost nothing.** No polling, no timers at rest, no runtime dependencies.
 
 Target budget:
@@ -297,10 +299,58 @@ while the app runs.
 | `H` | Minimise all its windows. Windows has no "hide application" |
 | `Esc` | Cancel without switching |
 | Mouse | Hover selects, click activates |
+| `Win+Tab` | Mission Control: every window, spread out |
 
 A quick tap and release switches to the previous application without the panel
 ever appearing, which is what macOS does. The panel only shows if Alt is held
 past `RevealDelayMs`.
+
+### Mission Control
+
+`Win+Tab` spreads every window on the current display out so none of them
+overlap, and puts the virtual desktops in a strip across the top. Click a
+window to go to it, click a desktop to switch, click the `+` to add one,
+`Esc` or a click on the background to leave. Arrow keys move between windows
+geometrically rather than through a list, because the arrangement has no rows
+to walk along.
+
+It is a toggle, not a hold. Mission Control is a place you are in.
+
+**The arrangement.** One scale for every window, so a large window still looks
+large next to a small one and every aspect ratio is exact. Windows start where
+they really are and shove each other apart until nothing overlaps, which is
+what lets you find something by remembering where you left it. There is a
+number for that, printed in the diagnostics log: every pair of windows votes on
+whether the side it was on is the side it ended up on. A typical desktop scores
+0.80, thirty windows 0.87.
+
+**What you see in each tile** depends on what the machine supports, and the log
+names the tier that won:
+
+| Tier | What it is | What you get |
+|---|---|---|
+| `shared visual` | `dwmapi` ordinal 147, undocumented | Live contents, and the windows fly out from where they really are |
+| `snapshot` | `PrintWindow`, fully documented | One still picture per window, taken when you press the keys |
+| `icon` | Nothing at all | The app's icon on a window-shaped card |
+
+The first is the only one that can be animated by the compositor, which is why
+it is first: that flight is most of what makes the gesture read as Mission
+Control rather than as a dialog. If it misbehaves on your driver, set
+`MissionThumbnails=snapshot` and everything else stays as it is.
+
+**The background is the wallpaper, not the screen.** Mission Control lifts the
+windows off and leaves the desktop, so capturing the screen would put every
+window into the blurred backdrop as well as into the arrangement, and each one
+would appear twice. It also means there is nothing to capture on the reveal
+path.
+
+**Virtual desktops** are read from the registry and driven with the same
+keyboard shortcuts you would press. Everything here is public API. The private
+interface that most tools use is not: its layout was restructured in 24H2
+without its identifier changing, so the type check passed, the call went to the
+wrong function, and the tools using it crashed rather than failed. That is the
+worst failure this project can have, because it would be found out weeks later
+on a machine nobody here can see.
 
 ### Settings
 
@@ -326,6 +376,14 @@ defaults and comments on first run:
 | `PanelDisplay` | active | `active`, `mouse` or `main` |
 | `GlassRefraction` | 1 | Bend the desktop at the panel's rim. Set to 0 if the edge looks doubled or smeared on your machine |
 | `GlassRimTap` | 1 | Bend a sharper copy at the rim than in the middle, which is what makes the edge read as a lens. Set to 0 if the bezel looks doubled or banded |
+| `MissionEnabled` | 1 | 0 leaves Win+Tab to Windows' own Task View |
+| `MissionGroupByApp` | 0 | 1 gathers each app's windows into a cluster. macOS ships this off, and it costs room |
+| `MissionGap` | 26 | Space kept between windows, logical pixels |
+| `MissionClusterGap` | 72 | Space between one app's cluster and the next |
+| `MissionBlurSigma` | 18 | How soft the wallpaper behind the arrangement goes |
+| `MissionDim` | 0.55 | How far back the wallpaper is pushed, 0 to 1 |
+| `MissionRevealMs` | 260 | How long the windows take to fly to their places |
+| `MissionThumbnails` | auto | `auto`, `shared`, `snapshot` or `icon`. Drop to `snapshot` if the windows come out blank or misplaced |
 
 ### Tuning the glass yourself
 
@@ -401,9 +459,9 @@ The image, squircle, panel-layout and glass code is deliberately kept free of
 ./tools/preview/build.sh
 ```
 
-runs a set of regression checks over that layer, then writes PNGs to
-`build-preview/out/`: the icon pipeline case by case, and the whole panel in both
-themes over eleven surfaces. It uses the same `panel_layout.h` and `glass.h` the
+builds and runs two harnesses, then writes PNGs to `build-preview/out/`: the
+icon pipeline case by case, the whole panel in both themes over eleven surfaces,
+and the Mission Control arrangement over seven synthetic desktops. It uses the same `panel_layout.h` and `glass.h` the
 app does, not copies, so the geometry and the colour matrix are the real ones.
 Only the pixel loops differ: Direct2D on Windows, a box blur and a per-pixel
 matrix here.
@@ -423,6 +481,23 @@ The surfaces are chosen to break the material rather than to flatter it:
 | detail | a bar target of decreasing period, measured rather than looked at |
 | ramp | strong colour gradients |
 | photo | sky, sun and a building whose windows should stay countable |
+
+The Mission Control desktops are picked the same way, each one a failure the
+arrangement can have: thirty windows, a window larger than the screen next to
+twenty small ones, five windows of one app, a stack of eight identical maximised
+windows with no direction to separate along, and a clean two-column desktop
+whose only job is to catch the ordering. It asserts that nothing overlaps,
+nothing escapes the region, every window shares one scale, an app's cluster
+never crosses another's, the same input gives byte-identical output twice, and
+the spatial agreement stays above 0.60:
+
+```
+desktop    windows   scale  passes   agree    fill
+typical          6   0.700      13    0.80   54.6%
+crowded         30   0.579      59    0.87   45.8%
+lopsided        21   0.534      49    0.92   58.9%
+columns          6   0.871       1    1.00   57.5%
+```
 
 It prints, and asserts on, the numbers that decide whether the material is right:
 
@@ -475,6 +550,7 @@ concentrate there, which is not a coincidence. Two things narrow that hole:
 - [x] **M7** Config: settings, icon theme packs, autostart
 - [x] **M8** Performance pass
 - [x] **M9** Installer and uninstaller
+- [x] **M10** Mission Control: the spread, the desktops strip, `Win+Tab`
 
 Ordered by risk rather than by user-visible value: the two pieces most likely to
 not work at all (the keyboard hook and the backdrop) come first, so they fail
@@ -505,7 +581,15 @@ useful with the log attached than without it.
 7. **A long app name.** "Visual Studio Code" or similar, with that app first and
    last in the row. The label is anchored under its icon and clamped inside the
    panel, so at the ends it should slide inward rather than overhang.
-8. **Does the panel appear within a frame?** `gesture: reveal ... shown in N ms`.
+8. **Which thumbnail tier Mission Control got.** The log names it at startup.
+   `shared visual` is the good one and the only one that animates; `snapshot`
+   means the undocumented path was refused, which is worth knowing about.
+9. **Win+Tab.** The Start menu must not open when you let go of Win, the
+   arrangement must have no two windows overlapping, and the desktops strip must
+   show the right number with the right one highlighted. *Log virtual desktops*
+   in the tray menu prints what was read out of the registry, which is the one
+   thing about desktops that cannot be reasoned about from here.
+10. **Does the panel appear within a frame?** `gesture: reveal ... shown in N ms`.
    This is the one performance claim that could not be verified from
    documentation, so it is measured rather than assumed.
 
@@ -543,6 +627,18 @@ each of these so the claims can be checked rather than trusted.
   fix is the same `uiAccess` that fixes elevated windows. Nothing renders above
   true exclusive-fullscreen apps either; borderless-windowed is fine.
 - **Windows 10 pre-1803 is unsupported**; that is the Composition floor.
+- **Mission Control shows one display.** macOS puts a separate Mission Control
+  on every screen, each holding that screen's windows. Here the windows on the
+  other displays are simply not in the arrangement, which is at least honest
+  rather than half right.
+- **You cannot drag a window to another desktop.** There is no public way to
+  move another process's window between virtual desktops, and the private
+  interface that can is the one described above. Closing a desktop other than
+  the one you are on has the same problem.
+- **The space miniatures show the wallpaper, not their windows.** Windows on
+  another desktop are shell-cloaked and DWM will not compose a cloaked window
+  through any path available to a normal process.
+- **Minimised windows are not in Mission Control**, which is also true on macOS.
 - **HDR displays** fall back to GDI capture. Desktop duplication hands back
   scRGB float rather than BGRA when HDR is on and does not convert, so the
   duplication path bails rather than showing wrong colours.
