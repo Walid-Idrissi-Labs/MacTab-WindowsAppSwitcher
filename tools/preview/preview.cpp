@@ -187,6 +187,102 @@ struct Case {
     Bitmap (*make)(int);
 };
 
+// --- self-checks -----------------------------------------------------------
+//
+// The pure layer is the only part of MacTab that can be executed off Windows,
+// so it is the only part that can have real regression cover. These assert the
+// properties that are easy to break silently while tuning constants.
+
+int g_checkFailures = 0;
+
+void Check(bool condition, const char* what) {
+    if (!condition) {
+        std::fprintf(stderr, "CHECK FAILED: %s\n", what);
+        ++g_checkFailures;
+    }
+}
+
+void RunSelfChecks() {
+    // Shrink-to-fit: a single strip, never wrapping, never below the floor.
+    {
+        const layout::Metrics few = layout::Compute(3, 2000.0f, 1.0f);
+        Check(few.tileSize == layout::kTileSize,
+              "few apps keep the full tile size");
+
+        const layout::Metrics many = layout::Compute(40, 1200.0f, 1.0f);
+        Check(many.tileSize < layout::kTileSize, "many apps shrink the tiles");
+        Check(many.tileSize >= layout::kMinTileSize, "tiles never go below the floor");
+        Check(many.panelWidth <= 1200.0f + 0.5f, "panel never exceeds the space given");
+
+        // Tiles must not overlap at any count.
+        const layout::Metrics m = layout::Compute(12, 900.0f, 1.0f);
+        for (int i = 1; i < 12; ++i)
+            Check(m.TileX(i) >= m.TileX(i - 1) + m.tileSize, "tiles do not overlap");
+
+        // DPI scaling must be uniform, not applied twice anywhere.
+        const layout::Metrics at200 = layout::Compute(3, 4000.0f, 2.0f);
+        Check(std::fabs(at200.tileSize - few.tileSize * 2.0f) < 0.01f,
+              "tile size scales linearly with DPI");
+    }
+
+    // Resize preserves aspect ratio and never invents opacity.
+    {
+        Bitmap wide = Bitmap::Create(200, 50);
+        for (uint32_t& px : wide.pixels) px = MakePixel(255, 0, 0, 255);
+
+        const Bitmap fitted = FitInto(wide, 100, 100);
+        Check(fitted.width == 100 && fitted.height == 100, "FitInto returns the box size");
+
+        const Bounds content = OpaqueBounds(fitted);
+        Check(content.Width() > content.Height(), "wide art stays wide after fitting");
+        Check(std::abs(content.Width() - 100) <= 2, "wide art fills the constrained axis");
+
+        const Bitmap empty = Bitmap::Create(64, 64);
+        Check(OpaqueBounds(empty).Empty(), "fully transparent art has empty bounds");
+        Check(OpaqueCoverage(empty) == 0.0, "fully transparent art has zero coverage");
+    }
+
+    // The squircle mask is symmetric and actually clips the corners.
+    {
+        const int size = 64;
+        const std::vector<uint8_t>& mask = SquircleMask(size);
+        Check(mask.size() == static_cast<size_t>(size) * size, "mask is the requested size");
+        Check(mask[0] == 0, "mask corner is fully transparent");
+        Check(mask[static_cast<size_t>(size / 2) * size + size / 2] == 255,
+              "mask centre is fully opaque");
+        for (int y = 0; y < size; ++y) {
+            Check(mask[static_cast<size_t>(y) * size] ==
+                  mask[static_cast<size_t>(y) * size + size - 1],
+                  "mask is horizontally symmetric");
+        }
+    }
+
+    // Glyph tiles must stay legible: the generated background has to contrast
+    // with the mark sitting on it. This is the bug the preview caught by eye.
+    {
+        const Bitmap glyph = MakeSmallGlyph(256);
+        const IconAnalysis analysis = AnalyzeIcon(glyph);
+        Check(!analysis.artwork, "a small mark is treated as a glyph");
+
+        auto luma = [](uint32_t c) {
+            return (RedOf(c) * 299 + GreenOf(c) * 587 + BlueOf(c) * 114) / 1000;
+        };
+        // Mean colour of the mark itself.
+        uint64_t r = 0, g = 0, b = 0, n = 0;
+        for (uint32_t px : glyph.pixels) {
+            if (AlphaOf(px) < 128) continue;
+            r += RedOf(px); g += GreenOf(px); b += BlueOf(px); ++n;
+        }
+        Check(n > 0, "the test glyph has opaque pixels");
+        const int glyphLuma = luma(MakePixel(static_cast<uint8_t>(r / n),
+                                             static_cast<uint8_t>(g / n),
+                                             static_cast<uint8_t>(b / n), 255));
+        const int tileLuma = luma(analysis.tintTop);
+        Check(std::abs(tileLuma - glyphLuma) >= 50,
+              "generated tile contrasts with the glyph on it");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -203,6 +299,11 @@ int main(int argc, char** argv) {
     constexpr int kTileSize   = 128;
 
     int failures = 0;
+
+    RunSelfChecks();
+    failures += g_checkFailures;
+    std::printf("self-checks: %s\n\n",
+                g_checkFailures == 0 ? "all passed" : "FAILURES (see above)");
 
     for (const Case& testCase : cases) {
         const Bitmap source = testCase.make(kSourceSize);
