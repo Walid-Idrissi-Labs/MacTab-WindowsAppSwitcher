@@ -41,13 +41,15 @@ bool ActivateWindow(HWND target, WORD altVirtualKey) {
     if (::SetForegroundWindow(focusTarget))
         return true;
 
-    // Denied. Usually means another process holds a foreground lock. Try the
-    // weaker primitives rather than giving up outright.
-    MACTAB_WARN("activate: SetForegroundWindow(%p) refused (err %lu), retrying",
-                static_cast<void*>(focusTarget), ::GetLastError());
+    // Denied. Usually means another process holds a foreground lock.
+    //
+    // No GetLastError here: SetForegroundWindow does not set it, so logging one
+    // would just print whatever unrelated call ran last. SetActiveWindow is not
+    // useful either — it only affects windows owned by the calling thread.
+    MACTAB_WARN("activate: SetForegroundWindow(%p) refused, falling back",
+                static_cast<void*>(focusTarget));
 
     ::BringWindowToTop(focusTarget);
-    ::SetActiveWindow(focusTarget);
 
     const bool ok = (::GetForegroundWindow() == focusTarget);
     if (!ok)

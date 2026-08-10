@@ -27,10 +27,22 @@ public:
 
     // Creates the apartment, compositor, devices and the hidden window.
     // Must be called on the UI thread, and that thread must then pump messages.
-    bool Initialize(HINSTANCE instance);
+    //
+    // Mouse interaction is reported to `notifyWindow`: `hoverMessage` when the
+    // pointer moves over a different tile and `clickMessage` when one is
+    // clicked, both with the item index in wParam (-1 for "no tile").
+    bool Initialize(HINSTANCE instance, HWND notifyWindow,
+                    UINT hoverMessage, UINT clickMessage);
     void Shutdown();
 
     bool Ready() const;
+
+    // Resolve geometry for `itemCount` tiles without changing the contents.
+    //
+    // Callers need TileSizePx() before they can request icons at the right
+    // resolution, but that depends on the monitor and the item count — so the
+    // layout has to be computed first, not inferred from a stale state.
+    void PrepareLayout(int itemCount);
 
     // Replace the contents. Cheap: reuses existing visuals where possible.
     void SetItems(std::vector<PanelItem> items, int selectedIndex);
@@ -56,8 +68,12 @@ public:
     // icon worker can rasterise at exactly the right size.
     int TileSizePx() const;
 
-private:
+    // Opaque; defined in panel.cpp. Public only so the file-local exception
+    // guard there can name it — there is nothing to encapsulate in a forward
+    // declaration.
     struct Impl;
+
+private:
     std::unique_ptr<Impl> m_impl;
 };
 

@@ -25,6 +25,10 @@ constexpr UINT WM_MACTAB_TRAY = WM_APP + 1;
 // Posted by the icon worker when one or more tiles finish.
 constexpr UINT WM_MACTAB_ICON_READY = WM_APP + 2;
 
+// Posted by the panel window when the pointer moves over or clicks a tile.
+constexpr UINT WM_MACTAB_HOVER = WM_APP + 3;
+constexpr UINT WM_MACTAB_CLICK = WM_APP + 4;
+
 UINT g_msgRequestQuit    = 0;   // RegisterWindowMessage(kQuitMessageName)
 UINT g_msgTaskbarCreated = 0;   // RegisterWindowMessage(L"TaskbarCreated")
 
@@ -65,6 +69,7 @@ bool HasFlag(const wchar_t* cmdLine, const wchar_t* flag) {
 // --- Gesture handling ------------------------------------------------------
 
 void PopulatePanel();
+void RefreshIcons();
 
 void BeginGesture(bool reverse) {
     Gesture& g = g_app.gesture;
@@ -91,12 +96,51 @@ void BeginGesture(bool reverse) {
     PopulatePanel();
 }
 
+// The icon request for one app at the panel's current tile size.
+icons::Request MakeIconRequest(const SwitcherApp& app, int tileSize) {
+    icons::Request request;
+    request.key            = app.key;
+    request.exePath        = app.exePath;
+    request.aumid          = app.aumid;
+    request.packaged       = app.packaged;
+    request.fallbackWindow = app.PrimaryWindow();
+    request.size           = tileSize;
+    return request;
+}
+
+// Push newly-arrived tiles into the panel without rebuilding it.
+//
+// A full PopulatePanel per worker completion would re-run layout, re-upload
+// every tile and start another capture — once per icon, during a gesture.
+void RefreshIcons() {
+    Gesture& g = g_app.gesture;
+    if (!g_app.panel.Ready() || g.apps.empty()) return;
+
+    const int tileSize = g_app.panel.TileSizePx();
+
+    for (const SwitcherApp& app : g.apps) {
+        Bitmap icon;
+        if (icons::Acquire(MakeIconRequest(app, tileSize), icon) && !icon.Empty())
+            g_app.panel.UpdateIcon(app.key, icon);
+    }
+}
+
 // Build the panel's item list, pulling whatever icons are already cached and
 // queueing the rest. Tiles that are not ready yet render as placeholders and
 // are filled in when WM_MACTAB_ICON_READY arrives, so this never blocks.
 void PopulatePanel() {
     Gesture& g = g_app.gesture;
     if (!g_app.panel.Ready()) return;
+
+    // Resolve the layout first. TileSizePx() reflects the monitor the panel
+    // will actually appear on; reading it before the panel has been laid out
+    // returns the unscaled default, which on a 150% display would extract and
+    // disk-cache every icon at the wrong size.
+    g_app.panel.PrepareLayout(static_cast<int>(g.windowMode
+        ? (g.appIndex >= 0 && g.appIndex < static_cast<int>(g.apps.size())
+               ? g.apps[static_cast<size_t>(g.appIndex)].windows.size()
+               : 0)
+        : g.apps.size()));
 
     const int tileSize = g_app.panel.TileSizePx();
 
@@ -108,16 +152,8 @@ void PopulatePanel() {
         if (g.appIndex < 0 || g.appIndex >= static_cast<int>(g.apps.size())) return;
         const SwitcherApp& app = g.apps[static_cast<size_t>(g.appIndex)];
 
-        icons::Request request;
-        request.key            = app.key;
-        request.exePath        = app.exePath;
-        request.aumid          = app.aumid;
-        request.packaged       = app.packaged;
-        request.fallbackWindow = app.PrimaryWindow();
-        request.size           = tileSize;
-
         Bitmap shared;
-        icons::Acquire(request, shared);
+        icons::Acquire(MakeIconRequest(app, tileSize), shared);
 
         items.reserve(app.windows.size());
         for (const SwitcherWindow& window : app.windows) {
@@ -143,15 +179,7 @@ void PopulatePanel() {
         const std::wstring resolved = icons::DisplayName(app.key);
         item.label = resolved.empty() ? app.displayName : resolved;
 
-        icons::Request request;
-        request.key            = app.key;
-        request.exePath        = app.exePath;
-        request.aumid          = app.aumid;
-        request.packaged       = app.packaged;
-        request.fallbackWindow = app.PrimaryWindow();
-        request.size           = tileSize;
-
-        icons::Acquire(request, item.icon);   // false just means "not yet"
+        icons::Acquire(MakeIconRequest(app, tileSize), item.icon);   // false = not yet
         items.push_back(std::move(item));
     }
 
@@ -235,7 +263,11 @@ void CancelGesture(WORD altVirtualKey) {
 
 void RevealPanel() {
     Gesture& g = g_app.gesture;
-    if (!g.active || g.apps.empty()) return;
+
+    // Fewer than two apps means BeginGesture returned before populating the
+    // panel, so there is nothing valid to show — revealing would display the
+    // previous gesture's tiles, complete with stale window handles.
+    if (!g.active || g.apps.size() < 2) return;
 
     g.panelShown = true;
 
@@ -428,10 +460,37 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         HandleActionKey(static_cast<WORD>(wParam));
         return 0;
 
+    case WM_MACTAB_HOVER: {
+        // Hovering moves the selection, exactly as arrowing does.
+        const int index = static_cast<int>(wParam);
+        Gesture& g = g_app.gesture;
+        if (g.active && index >= 0 && index != g.index) {
+            g.index = index;
+            g_app.panel.SetSelection(g.index);
+        }
+        return 0;
+    }
+
+    case WM_MACTAB_CLICK: {
+        // Clicking commits immediately. Alt is usually still physically down,
+        // so the same neutralisation the keyboard path uses still applies.
+        const int index = static_cast<int>(wParam);
+        Gesture& g = g_app.gesture;
+        if (g.active && index >= 0) {
+            g.index = index;
+            hotkey::AbortGesture();      // stop the hook waiting for an Alt release
+            CommitGesture(VK_MENU);
+        }
+        return 0;
+    }
+
     case WM_MACTAB_ICON_READY:
-        // A tile finished on the worker. Only matters while the panel is up.
-        if (g_app.gesture.active && g_app.gesture.panelShown)
-            PopulatePanel();
+        // Tiles usually finish during the hold delay, before the panel is
+        // shown, so this must not be gated on the panel being visible — doing
+        // that left the first gesture showing placeholders for its whole
+        // lifetime, because the worker never posts again for a cached tile.
+        if (g_app.gesture.active)
+            RefreshIcons();
         return 0;
 
     // --- Tray ---------------------------------------------------------------
@@ -630,7 +689,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
     // The panel is created and fully pre-warmed at startup, then shown and
     // hidden for the rest of the session. Building the visual tree on demand
     // would make the one-frame reveal budget unreachable.
-    if (!g_app.panel.Initialize(instance)) {
+    if (!g_app.panel.Initialize(instance, g_app.host,
+                                WM_MACTAB_HOVER, WM_MACTAB_CLICK)) {
         ::MessageBoxW(nullptr,
                       L"MacTab could not initialise its rendering layer.\n\n"
                       L"This needs Windows 10 version 1803 or later. Run with --diag "
@@ -672,7 +732,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
 
     MACTAB_DIAG("boot: ready in %.2f ms", NowMs());
 
-    MSG msg;
+    MSG msg{};
     BOOL rc;
     while ((rc = ::GetMessageW(&msg, nullptr, 0, 0)) != 0) {
         if (rc == -1) {

@@ -35,8 +35,16 @@ enum class Source {
 const char* SourceName(Source source);
 
 struct Frame {
-    Bitmap pixels;                 // opaque BGRA, exactly `rect` sized
+    Bitmap pixels;
     Source source = Source::None;
+
+    // Where `pixels` actually came from, in virtual-screen coordinates.
+    //
+    // This is NOT always the rect that was asked for: the inflated capture
+    // region is clamped to the monitor, so a panel near a screen edge gets back
+    // a smaller, shifted frame. Callers must position from this rather than
+    // assuming the requested origin, or the blur slides sideways.
+    RECT bounds{};
 };
 
 // Capture the screen region `rect` (virtual-screen coordinates).

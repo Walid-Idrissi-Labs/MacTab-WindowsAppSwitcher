@@ -73,8 +73,9 @@ DisableDirPage=auto
 ; Requires Inno Setup >= 6.3 (older syntax was "x64").
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-; 1809; raise/lower to match the oldest build you actually test on.
-MinVersion=10.0.17763
+; 1803 (17134) is the Windows.UI.Composition floor the app itself targets.
+; Keep these two in step.
+MinVersion=10.0.17134
 
 ; --- upgrade over a running instance ---------------------------------------
 ; Restart Manager: detects processes holding files we're about to replace and

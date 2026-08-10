@@ -3,6 +3,7 @@
 #include "app_identity.h"
 #include "common.h"
 #include "diag.h"
+#include "config.h"
 #include "foreground_history.h"
 
 namespace mactab {
@@ -236,6 +237,23 @@ std::vector<SwitcherApp> BuildSwitcherList() {
     result.reserve(groups.size());
     for (Group& group : groups)
         result.push_back(std::move(group.app));
+
+    // GroupByApp=0 asks for Windows' own per-window behaviour with macOS
+    // styling. Splitting here rather than skipping the grouping entirely keeps
+    // one code path: the ordering, identity and icon lookup all still work off
+    // the app the window belongs to.
+    if (!config::Current().groupByApp) {
+        std::vector<SwitcherApp> split;
+        for (SwitcherApp& app : result) {
+            for (SwitcherWindow& window : app.windows) {
+                SwitcherApp single = app;
+                single.displayName = window.title.empty() ? app.displayName : window.title;
+                single.windows     = { window };
+                split.push_back(std::move(single));
+            }
+        }
+        return split;
+    }
 
     return result;
 }

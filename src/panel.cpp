@@ -27,10 +27,13 @@
 #include "common.h"
 #include "diag.h"
 #include "geometry.h"
+#include "config.h"
 #include "panel_layout.h"
 
 namespace WUC = winrt::Windows::UI::Composition;
+namespace WUI = winrt::Windows::UI;
 namespace WFN = winrt::Windows::Foundation::Numerics;
+namespace WUCABI = ABI::Windows::UI::Composition;
 
 namespace mactab {
 namespace {
@@ -52,6 +55,16 @@ constexpr int kBlurMarginPx = 48;
 // invisible under a tint.
 constexpr float kBlurDownscale = 0.25f;
 
+// "auto" follows the system app theme; "dark" and "light" pin it. Reading the
+// setting here rather than only at startup means a change takes effect on the
+// next gesture instead of the next launch.
+bool ResolveLightTheme() {
+    const std::wstring& choice = config::Current().theme;
+    if (choice == L"light") return true;
+    if (choice == L"dark")  return false;
+    return SystemUsesLightTheme();
+}
+
 bool SystemUsesLightTheme() {
     DWORD value = 0, size = sizeof(value);
     if (::RegGetValueW(HKEY_CURRENT_USER,
@@ -65,7 +78,7 @@ struct Theme {
     D2D1_COLOR_F tint;
     D2D1_COLOR_F border;
     D2D1_COLOR_F selection;
-    WUC::Color   label;
+    WUI::Color   label;
 };
 
 Theme MakeTheme(bool light) {
@@ -74,12 +87,12 @@ Theme MakeTheme(bool light) {
         theme.tint      = D2D1::ColorF(0.96f, 0.96f, 0.97f, 0.62f);
         theme.border    = D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.10f);
         theme.selection = D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.10f);
-        theme.label     = WUC::Color{ 255, 20, 20, 22 };
+        theme.label     = WUI::Color{ 255, 20, 20, 22 };
     } else {
         theme.tint      = D2D1::ColorF(0.09f, 0.09f, 0.10f, 0.55f);
         theme.border    = D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.10f);
         theme.selection = D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.18f);
-        theme.label     = WUC::Color{ 255, 245, 245, 247 };
+        theme.label     = WUI::Color{ 255, 245, 245, 247 };
     }
     return theme;
 }
@@ -90,7 +103,11 @@ Theme MakeTheme(bool light) {
 
 struct Panel::Impl {
     HINSTANCE instance = nullptr;
-    HWND      hwnd     = nullptr;
+    HWND      hwnd         = nullptr;
+    HWND      notifyWindow = nullptr;
+    UINT      hoverMessage = 0;
+    UINT      clickMessage = 0;
+    int       hoveredIndex = -1;
     bool      visible  = false;
     bool      ready    = false;
 
@@ -101,6 +118,7 @@ struct Panel::Impl {
     WUC::CompositionGraphicsDevice                    graphics{ nullptr };
 
     WUC::ContainerVisual root{ nullptr };
+    WUC::ContainerVisual content{ nullptr };
     WUC::SpriteVisual    shadowVisual{ nullptr };
     WUC::SpriteVisual    backdropVisual{ nullptr };
     WUC::SpriteVisual    selectionVisual{ nullptr };
@@ -127,16 +145,20 @@ struct Panel::Impl {
     RECT   panelRect{};        // screen coords
     Theme  theme     = MakeTheme(false);
     HMONITOR monitor = nullptr;
+    float    shadowMarginPx = 0.0f;
+    float    bakedShadowScale = 0.0f;
 
     bool CreateDevices();
-    bool CreateWindow();
+    bool CreatePanelWindow();
+    void RecoverDevices();
     bool CreateVisualTree();
 
     // The captured desktop frame, in flight. Started when the gesture begins and
     // consumed when the panel is actually revealed.
     std::future<capture::Frame> pendingCapture;
+    capture::Frame              lastFrame;   // reused when relaying out while visible
 
-    void Layout();
+    void Layout(int count);
     void BakeShadow();
     void BakeSelection();
     void StartCapture();
@@ -144,6 +166,7 @@ struct Panel::Impl {
     void BakeLabel();
     void PositionTiles(bool animate);
     void UploadIcon(size_t index);
+    int  HitTestScreen(POINT screenPoint) const;
 
     float Scaled(float logical) const { return logical * dpiScale; }
 };
@@ -155,11 +178,11 @@ namespace {
 struct SurfaceDraw {
     ComPtr<ID2D1DeviceContext> dc;
     POINT                      offset{};
-    winrt::com_ptr<::ICompositionDrawingSurfaceInterop> interop;
+    winrt::com_ptr<WUCABI::ICompositionDrawingSurfaceInterop> interop;
     bool ok = false;
 
     explicit SurfaceDraw(const WUC::CompositionDrawingSurface& surface) {
-        interop = surface.as<::ICompositionDrawingSurfaceInterop>();
+        interop = surface.try_as<WUCABI::ICompositionDrawingSurfaceInterop>();
         if (!interop) return;
         ok = SUCCEEDED(interop->BeginDraw(nullptr, __uuidof(ID2D1DeviceContext),
                                           dc.PutVoid(), &offset));
@@ -169,7 +192,35 @@ struct SurfaceDraw {
     }
 };
 
+bool IsDeviceLost(HRESULT hr) {
+    return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+           hr == D2DERR_RECREATE_TARGET;
+}
+
 } // namespace
+
+// Every C++/WinRT call throws on failure, and these run inside a window
+// procedure — an escaping hresult_error would unwind straight out of wWinMain
+// into std::terminate. Device loss after a driver update or a resume is not
+// hypothetical for a process that lives for weeks in a tray, so the panel has
+// to survive it rather than take the app down with it.
+template <typename F>
+static bool GuardPanel(Panel::Impl& impl, const char* what, F&& fn) {
+    if (!impl.ready) return false;
+    try {
+        fn();
+        return true;
+    } catch (const winrt::hresult_error& e) {
+        const HRESULT hr = e.code();
+        MACTAB_FAIL("panel: %s threw 0x%08lX", what, static_cast<unsigned long>(hr));
+        if (IsDeviceLost(hr))
+            impl.RecoverDevices();
+        return false;
+    } catch (...) {
+        MACTAB_FAIL("panel: %s threw a non-WinRT exception", what);
+        return false;
+    }
+}
 
 // ---------------------------------------------------------------------------
 
@@ -222,20 +273,51 @@ bool Panel::Impl::CreateDevices() {
     }
 
     // Hand the D2D device to the compositor.
-    auto interop = compositor.as<::ICompositorInterop>();
-    winrt::com_ptr<::IInspectable> inspectable;
-    if (FAILED(interop->CreateGraphicsDevice(d2dDevice.Get(), inspectable.put()))) {
+    auto interop = compositor.as<WUCABI::ICompositorInterop>();
+    winrt::com_ptr<WUCABI::ICompositionGraphicsDevice> abiGraphics;
+    if (FAILED(interop->CreateGraphicsDevice(d2dDevice.Get(), abiGraphics.put()))) {
         MACTAB_FAIL("panel: CreateGraphicsDevice failed");
         return false;
     }
-    graphics = inspectable.as<WUC::CompositionGraphicsDevice>();
+    graphics = abiGraphics.as<WUC::CompositionGraphicsDevice>();
     return true;
 }
 
-bool Panel::Impl::CreateWindow() {
+// Mouse handling.
+//
+// WS_EX_NOREDIRECTIONBITMAP means the window has no surface to hit-test
+// against, so the whole rect receives input and the tile under the pointer has
+// to be resolved against the layout. That is the design, not a workaround.
+LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* impl = reinterpret_cast<Panel::Impl*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (!impl)
+        return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+
+    if (msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP) {
+        POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ::ClientToScreen(hwnd, &point);
+        const int index = impl->HitTestScreen(point);
+
+        if (msg == WM_LBUTTONUP) {
+            if (index >= 0 && impl->notifyWindow)
+                ::PostMessageW(impl->notifyWindow, impl->clickMessage,
+                               static_cast<WPARAM>(index), 0);
+        } else if (index != impl->hoveredIndex) {
+            impl->hoveredIndex = index;
+            if (index >= 0 && impl->notifyWindow)
+                ::PostMessageW(impl->notifyWindow, impl->hoverMessage,
+                               static_cast<WPARAM>(index), 0);
+        }
+        return 0;
+    }
+
+    return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+bool Panel::Impl::CreatePanelWindow() {
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);
-    wc.lpfnWndProc   = ::DefWindowProcW;   // owner window routes input; see main.cpp
+    wc.lpfnWndProc   = PanelWndProc;
     wc.hInstance     = instance;
     wc.lpszClassName = kPanelClass;
     wc.hCursor       = ::LoadCursorW(nullptr, IDC_ARROW);
@@ -261,6 +343,8 @@ bool Panel::Impl::CreateWindow() {
         MACTAB_FAIL("panel: CreateWindowEx failed (err %lu)", ::GetLastError());
         return false;
     }
+
+    ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
     return true;
 }
 
@@ -281,26 +365,38 @@ bool Panel::Impl::CreateVisualTree() {
     // Order matters: shadow underneath, then the glass, then the selection
     // highlight, then tiles, then the label.
     shadowVisual    = compositor.CreateSpriteVisual();
+    content         = compositor.CreateContainerVisual();
     backdropVisual  = compositor.CreateSpriteVisual();
     selectionVisual = compositor.CreateSpriteVisual();
     tileLayer       = compositor.CreateContainerVisual();
     labelVisual     = compositor.CreateSpriteVisual();
 
+    // The window is inflated by the shadow margin, so everything that belongs
+    // to the panel proper hangs off `content`, which carries that offset once.
+    // Positioning each layer against the window origin instead is how the
+    // selection highlight and label ended up drawn in the shadow gutter.
     auto children = root.Children();
     children.InsertAtTop(shadowVisual);
-    children.InsertAtTop(backdropVisual);
-    children.InsertAtTop(selectionVisual);
-    children.InsertAtTop(tileLayer);
-    children.InsertAtTop(labelVisual);
+    children.InsertAtTop(content);
+
+    auto contentChildren = content.Children();
+    contentChildren.InsertAtTop(backdropVisual);
+    contentChildren.InsertAtTop(selectionVisual);
+    contentChildren.InsertAtTop(tileLayer);
+    contentChildren.InsertAtTop(labelVisual);
 
     // The whole panel fades and scales as one unit.
     root.Opacity(0.0f);
     return true;
 }
 
-bool Panel::Initialize(HINSTANCE instance) {
+bool Panel::Initialize(HINSTANCE instance, HWND notifyWindow,
+                       UINT hoverMessage, UINT clickMessage) {
     Impl& impl = *m_impl;
-    impl.instance = instance;
+    impl.instance     = instance;
+    impl.notifyWindow = notifyWindow;
+    impl.hoverMessage = hoverMessage;
+    impl.clickMessage = clickMessage;
 
     // Explicit STA.
     //
@@ -336,13 +432,16 @@ bool Panel::Initialize(HINSTANCE instance) {
         return false;
     }
 
-    impl.theme = MakeTheme(SystemUsesLightTheme());
+    impl.theme = MakeTheme(ResolveLightTheme());
 
-    if (!impl.CreateWindow())      return false;
+    if (!impl.CreatePanelWindow()) return false;
     if (!impl.CreateDevices())     return false;
     if (!impl.CreateVisualTree())  return false;
 
+    // Pre-bake at 100% so the common case is warm; Layout re-bakes if the
+    // panel lands on a monitor with a different scale.
     impl.BakeShadow();
+    impl.bakedShadowScale = impl.dpiScale;
 
     impl.ready = true;
     MACTAB_DIAG("panel: initialised and pre-warmed");
@@ -353,11 +452,59 @@ void Panel::Shutdown() {
     Impl& impl = *m_impl;
     if (!impl.ready && !impl.hwnd) return;
 
+    impl.ready = false;
+
+    // B4: a capture may still be running on a detached thread inside DXGI/GDI.
+    // Let it finish before COM and the CRT start tearing down underneath it.
+    if (impl.pendingCapture.valid()) {
+        impl.pendingCapture.wait_for(std::chrono::milliseconds(500));
+        impl.pendingCapture = {};
+    }
+
+    // Release the Composition graph HERE, not from Impl's destructor.
+    //
+    // g_app is a global, so its destructor runs during CRT exit — after
+    // wWinMain has returned and this thread has stopped pumping its dispatcher
+    // queue. Releasing thread-affine Composition objects and a live
+    // DispatcherQueueController at that point is a well-known exit hang/crash.
+    try {
+        if (impl.target) impl.target.Root(nullptr);
+
+        impl.tileVisuals.clear();
+        impl.labelVisual     = nullptr;
+        impl.tileLayer       = nullptr;
+        impl.selectionVisual = nullptr;
+        impl.backdropVisual  = nullptr;
+        impl.shadowVisual    = nullptr;
+        impl.root            = nullptr;
+
+        impl.backdropSurface = nullptr;
+        impl.labelSurface    = nullptr;
+        impl.shadowBrush     = nullptr;
+
+        impl.target     = nullptr;
+        impl.graphics    = nullptr;
+        impl.compositor  = nullptr;
+        impl.dispatcher  = nullptr;
+    } catch (const winrt::hresult_error& e) {
+        MACTAB_WARN("panel: teardown threw 0x%08lX",
+                    static_cast<unsigned long>(e.code()));
+    }
+
+    impl.dwriteFactory.Reset();
+    impl.d2dDevice.Reset();
+    impl.d2dFactory.Reset();
+    impl.d3dDevice.Reset();
+
     if (impl.hwnd) {
         ::DestroyWindow(impl.hwnd);
         impl.hwnd = nullptr;
     }
-    impl.ready = false;
+}
+
+void Panel::PrepareLayout(int itemCount) {
+    Impl& impl = *m_impl;
+    GuardPanel(impl, "PrepareLayout", [&] { impl.Layout(itemCount); });
 }
 
 bool Panel::Ready() const   { return m_impl->ready; }
@@ -365,6 +512,44 @@ bool Panel::Visible() const { return m_impl->visible; }
 HWND Panel::Hwnd() const    { return m_impl->hwnd; }
 int  Panel::TileSizePx() const {
     return static_cast<int>(std::lround(m_impl->tilePx));
+}
+
+// Rebuild the graphics stack after device loss.
+//
+// The compositor, the desktop target and the visual tree all survive a lost
+// adapter — only the D3D/D2D devices and anything drawn through them do not.
+// So this recreates the devices and the surfaces baked at startup; per-gesture
+// surfaces are rebuilt by the next SetItems anyway.
+void Panel::Impl::RecoverDevices() {
+    MACTAB_WARN("panel: graphics device lost, rebuilding");
+
+    graphics = nullptr;
+    dwriteFactory.Reset();
+    d2dDevice.Reset();
+    d2dFactory.Reset();
+    d3dDevice.Reset();
+
+    backdropSurface = nullptr;
+    labelSurface    = nullptr;
+    shadowBrush     = nullptr;
+
+    if (!CreateDevices()) {
+        MACTAB_FAIL("panel: could not rebuild the graphics device; panel disabled");
+        ready = false;
+        return;
+    }
+
+    try {
+        BakeShadow();
+        BakeSelection();
+    } catch (const winrt::hresult_error& e) {
+        MACTAB_FAIL("panel: re-baking after device loss threw 0x%08lX",
+                    static_cast<unsigned long>(e.code()));
+        ready = false;
+        return;
+    }
+
+    MACTAB_DIAG("panel: graphics device rebuilt");
 }
 
 // ---------------------------------------------------------------------------
@@ -396,34 +581,52 @@ void Panel::Impl::BakeShadow() {
 
         draw.dc->Clear(D2D1::ColorF(0, 0, 0, 0));
 
-        // Silhouette into an offscreen, then blur it.
+        // Render the silhouette through a PRIVATE device context, not by
+        // retargeting the interop one.
+        //
+        // The DC handed back by BeginDraw carries an update clip in atlas
+        // coordinates, and D2D's clip stack is context state rather than target
+        // state — so drawing to an offscreen through it can be clipped against
+        // wherever this surface happens to sit in the atlas, and leaves the
+        // context in a state EndDraw did not expect.
+        ComPtr<ID2D1DeviceContext> silhouetteDc;
+        if (FAILED(d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                                                  silhouetteDc.Put()))) {
+            MACTAB_WARN("panel: could not create a device context for the shadow");
+            return;
+        }
+
         ComPtr<ID2D1Bitmap1> silhouette;
         const D2D1_SIZE_U pixelSize{ static_cast<UINT32>(size), static_cast<UINT32>(size) };
         D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
             D2D1_BITMAP_OPTIONS_TARGET,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
 
-        if (FAILED(draw.dc->CreateBitmap(pixelSize, nullptr, 0, &props, silhouette.Put())))
+        if (FAILED(silhouetteDc->CreateBitmap(pixelSize, nullptr, 0, &props, silhouette.Put())))
             return;
 
-        ComPtr<ID2D1Image> previousTarget;
-        draw.dc->GetTarget(previousTarget.Put());
-        draw.dc->SetTarget(silhouette.Get());
-        draw.dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-
         auto geometry = CreateSquircleGeometry(d2dFactory.Get(),
-                                               static_cast<float>(size - 2 * 2),
-                                               static_cast<float>(size - 2 * 2), radius);
-        if (geometry) {
-            ComPtr<ID2D1SolidColorBrush> black;
-            draw.dc->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.42f), black.Put());
-            draw.dc->SetTransform(D2D1::Matrix3x2F::Translation(2.0f, 2.0f));
-            draw.dc->FillGeometry(geometry.Get(), black.Get());
-            draw.dc->SetTransform(D2D1::Matrix3x2F::Identity());
+                                               static_cast<float>(size - 4),
+                                               static_cast<float>(size - 4), radius);
+        if (!geometry) return;
+
+        silhouetteDc->SetTarget(silhouette.Get());
+        silhouetteDc->BeginDraw();
+        silhouetteDc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+        ComPtr<ID2D1SolidColorBrush> black;
+        silhouetteDc->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.42f), black.Put());
+        silhouetteDc->SetTransform(D2D1::Matrix3x2F::Translation(2.0f, 2.0f));
+        silhouetteDc->FillGeometry(geometry.Get(), black.Get());
+        silhouetteDc->SetTransform(D2D1::Matrix3x2F::Identity());
+
+        if (FAILED(silhouetteDc->EndDraw())) {
+            MACTAB_WARN("panel: shadow silhouette EndDraw failed");
+            return;
         }
+        silhouetteDc->SetTarget(nullptr);
 
-        draw.dc->SetTarget(previousTarget.Get());
-
+        // Only the finished blur touches the interop context.
         ComPtr<ID2D1Effect> blur;
         if (SUCCEEDED(draw.dc->CreateEffect(CLSID_D2D1GaussianBlur, blur.Put()))) {
             blur->SetInput(0, silhouette.Get());
@@ -532,15 +735,16 @@ void Panel::Impl::BakeBackdrop() {
     // delay to finish, so in practice this never waits — but it is bounded
     // anyway, because a wedged GPU must degrade to a flat tint rather than
     // stall the reveal.
-    capture::Frame frame;
     if (pendingCapture.valid()) {
         if (pendingCapture.wait_for(std::chrono::milliseconds(10)) ==
             std::future_status::ready) {
-            frame = pendingCapture.get();
+            lastFrame = pendingCapture.get();
         } else {
             MACTAB_WARN("panel: capture not ready at reveal, using flat tint");
         }
+        pendingCapture = {};
     }
+    const capture::Frame& frame = lastFrame;
 
     {
         SurfaceDraw draw(backdropSurface);
@@ -601,11 +805,18 @@ void Panel::Impl::BakeBackdrop() {
 
                     // Undo the downscale on the way out, and shift so the
                     // panel's own area lands at the surface origin.
+                    //
+                    // Offset comes from where the capture ACTUALLY landed, not
+                    // from the margin we asked for: near a screen edge the grab
+                    // is clamped to the monitor and comes back shifted, and
+                    // assuming the requested origin slides the blur sideways.
+                    const float dx = static_cast<float>(frame.bounds.left - panelRect.left);
+                    const float dy = static_cast<float>(frame.bounds.top  - panelRect.top);
                     draw.dc->SetTransform(
                         D2D1::Matrix3x2F::Scale(1.0f / kBlurDownscale, 1.0f / kBlurDownscale) *
                         D2D1::Matrix3x2F::Translation(
-                            static_cast<float>(draw.offset.x - kBlurMarginPx),
-                            static_cast<float>(draw.offset.y - kBlurMarginPx)) );
+                            static_cast<float>(draw.offset.x) + dx,
+                            static_cast<float>(draw.offset.y) + dy) );
                     draw.dc->DrawImage(blur.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
                     draw.dc->SetTransform(toSurface);
                 }
@@ -690,13 +901,16 @@ void Panel::Impl::BakeLabel() {
 
     labelVisual.Brush(compositor.CreateSurfaceBrush(labelSurface));
     labelVisual.Size({ static_cast<float>(width), static_cast<float>(height) });
-    labelVisual.Offset({ 0.0f, static_cast<float>(panelRect.bottom - panelRect.top) -
-                               Scaled(layout::kPanelPadding) - Scaled(layout::kLabelHeight) + Scaled(4.0f), 0.0f });
+    labelVisual.Offset({ 0.0f,
+                         static_cast<float>(panelRect.bottom - panelRect.top) -
+                             Scaled(layout::kPanelPadding) - Scaled(layout::kLabelHeight) +
+                             Scaled(4.0f),
+                         0.0f });
 }
 
 // ---------------------------------------------------------------------------
 
-void Panel::Impl::Layout() {
+void Panel::Impl::Layout(int count) {
     // Follow the foreground window's monitor, which matches Alt+Tab semantics
     // better than following the cursor.
     const HWND foreground = ::GetForegroundWindow();
@@ -710,13 +924,14 @@ void Panel::Impl::Layout() {
     ::GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
     dpiScale = static_cast<float>(dpiX) / 96.0f;
 
-    const int count = static_cast<int>(items.size());
     const float workWidth = static_cast<float>(monitorInfo.rcWork.right - monitorInfo.rcWork.left);
     const float maxPanelWidth = workWidth - Scaled(80.0f);
 
     // macOS shrinks tiles to fit rather than wrapping to a second row, so the
     // panel is always a single strip.
-    const layout::Metrics metrics = layout::Compute(count, maxPanelWidth, dpiScale);
+    const layout::Metrics metrics = layout::Compute(
+        count, maxPanelWidth, dpiScale,
+        static_cast<float>(config::Current().tileSize));
     tilePx = metrics.tileSize;
 
     const float panelWidth  = metrics.panelWidth;
@@ -733,28 +948,32 @@ void Panel::Impl::Layout() {
     panelRect.right  = panelRect.left + width;
     panelRect.bottom = panelRect.top + height;
 
-    // The window is inflated by the shadow margin so the shadow has somewhere
-    // to draw; the visual tree offsets everything back by that amount.
+    // The window is inflated by the shadow margin so the shadow has room to
+    // draw outside the panel.
     const int shadowMargin = static_cast<int>(std::ceil(Scaled(kShadowSigma) * 3.0f));
+    shadowMarginPx = static_cast<float>(shadowMargin);
 
     ::SetWindowPos(hwnd, HWND_TOPMOST,
                    panelRect.left - shadowMargin, panelRect.top - shadowMargin,
                    width + shadowMargin * 2, height + shadowMargin * 2,
                    SWP_NOACTIVATE | SWP_NOREDRAW);
 
-    const WFN::float3 panelOrigin{ static_cast<float>(shadowMargin),
-                                   static_cast<float>(shadowMargin), 0.0f };
+    // One offset for the whole panel; children position in panel-local space.
+    content.Offset({ shadowMarginPx, shadowMarginPx, 0.0f });
+    content.Size({ panelWidth, panelHeight });
 
-    backdropVisual.Offset(panelOrigin);
-    labelVisual.Offset({ panelOrigin.x, panelOrigin.y, 0.0f });
-    tileLayer.Offset(panelOrigin);
-    selectionVisual.Offset(panelOrigin);
-
-    shadowVisual.Offset({ static_cast<float>(shadowMargin) - Scaled(kShadowSigma) * 0.5f,
-                          static_cast<float>(shadowMargin) - Scaled(kShadowSigma) * 0.5f +
-                              Scaled(8.0f),
+    shadowVisual.Offset({ shadowMarginPx - Scaled(kShadowSigma) * 0.5f,
+                          shadowMarginPx - Scaled(kShadowSigma) * 0.5f + Scaled(8.0f),
                           0.0f });
     shadowVisual.Size({ panelWidth + Scaled(kShadowSigma), panelHeight + Scaled(kShadowSigma) });
+
+    // C8: the shadow is baked from dpiScale, which is only known once a monitor
+    // has been chosen. Re-bake whenever it changes rather than keeping the 96
+    // DPI version baked at startup.
+    if (std::fabs(dpiScale - bakedShadowScale) > 0.01f) {
+        BakeShadow();
+        bakedShadowScale = dpiScale;
+    }
 }
 
 void Panel::Impl::UploadIcon(size_t index) {
@@ -766,7 +985,7 @@ void Panel::Impl::UploadIcon(size_t index) {
     if (icon.Empty()) {
         // Neutral placeholder until the worker delivers. Never leave a hole —
         // an empty slot reads as a bug, a grey tile reads as loading.
-        visual.Brush(compositor.CreateColorBrush(WUC::Color{ 60, 255, 255, 255 }));
+        visual.Brush(compositor.CreateColorBrush(WUI::Color{ 60, 255, 255, 255 }));
         return;
     }
 
@@ -838,14 +1057,13 @@ void Panel::Impl::PositionTiles(bool animate) {
 
 void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
     Impl& impl = *m_impl;
-    if (!impl.ready) return;
-
+    GuardPanel(impl, "SetItems", [&] {
     MACTAB_DIAG_TIMER("panel: SetItems");
 
     impl.items    = std::move(items);
     impl.selected = selectedIndex;
 
-    impl.Layout();
+    impl.Layout(static_cast<int>(impl.items.size()));
 
     // Reuse existing tile visuals; only create or trim the difference. Rebuilding
     // the whole tree per invocation would blow the one-frame budget.
@@ -865,35 +1083,49 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
 
     impl.BakeSelection();
     impl.PositionTiles(false);
-    impl.StartCapture();
     impl.BakeLabel();
+
+    // C4: a relayout while the panel is already up (window expansion, an app
+    // quitting) resizes panelRect, so the glass has to be re-baked at the new
+    // size or it keeps the previous one. Reuse the frame already captured
+    // rather than grabbing the desktop again with our own panel on it.
+    if (impl.visible)
+        impl.BakeBackdrop();
+    else
+        impl.StartCapture();
+    });
 }
 
 void Panel::SetSelection(int index) {
     Impl& impl = *m_impl;
-    if (!impl.ready || impl.items.empty()) return;
+    if (impl.items.empty()) return;
 
-    impl.selected = (std::max)(0, (std::min)(index, static_cast<int>(impl.items.size()) - 1));
-    impl.PositionTiles(true);
-    impl.BakeLabel();
+    GuardPanel(impl, "SetSelection", [&] {
+        impl.selected =
+            (std::max)(0, (std::min)(index, static_cast<int>(impl.items.size()) - 1));
+        impl.PositionTiles(true);
+        impl.BakeLabel();
+    });
 }
 
 void Panel::UpdateIcon(const std::wstring& key, const Bitmap& icon) {
     Impl& impl = *m_impl;
-    if (!impl.ready) return;
 
-    for (size_t i = 0; i < impl.items.size(); ++i) {
-        if (impl.items[i].key != key) continue;
-        impl.items[i].icon = icon;
-        impl.UploadIcon(i);
-        return;
-    }
+    GuardPanel(impl, "UpdateIcon", [&] {
+        for (size_t i = 0; i < impl.items.size(); ++i) {
+            if (impl.items[i].key != key) continue;
+            impl.items[i].icon = icon;
+            impl.UploadIcon(i);
+            return;
+        }
+    });
 }
 
 void Panel::Show() {
     Impl& impl = *m_impl;
-    if (!impl.ready || impl.visible) return;
+    if (impl.visible) return;
 
+    const bool ok = GuardPanel(impl, "Show", [&] {
     // Compose the glass now, from the frame captured when the gesture started.
     impl.BakeBackdrop();
 
@@ -913,26 +1145,35 @@ void Panel::Show() {
     // Scale from the panel's centre, not its corner.
     const float w = static_cast<float>(impl.panelRect.right - impl.panelRect.left);
     const float h = static_cast<float>(impl.panelRect.bottom - impl.panelRect.top);
-    impl.root.CenterPoint({ w * 0.5f, h * 0.5f, 0.0f });
+    impl.root.CenterPoint({ impl.shadowMarginPx + w * 0.5f,
+                            impl.shadowMarginPx + h * 0.5f, 0.0f });
 
     auto grow = impl.compositor.CreateVector3KeyFrameAnimation();
     grow.InsertKeyFrame(0.0f, { 0.96f, 0.96f, 1.0f });
     grow.InsertKeyFrame(1.0f, { 1.0f, 1.0f, 1.0f });
     grow.Duration(std::chrono::milliseconds(120));
     impl.root.StartAnimation(L"Scale", grow);
+    });
 
+    if (!ok) return;
     impl.visible = true;
 }
 
 void Panel::Hide() {
     Impl& impl = *m_impl;
-    if (!impl.ready || !impl.visible) return;
+    if (!impl.visible) return;
 
+    GuardPanel(impl, "Hide", [&] {
     // Hidden immediately rather than fading out: the eye is already following
     // the window being activated, and a lingering panel reads as lag.
     impl.root.Opacity(0.0f);
     ::ShowWindow(impl.hwnd, SW_HIDE);
-    impl.visible = false;
+    });
+
+    // The window must end up hidden even if the compositor threw.
+    ::ShowWindow(impl.hwnd, SW_HIDE);
+    impl.visible      = false;
+    impl.hoveredIndex = -1;
 
     // Abandon any capture that was still in flight. The detached thread
     // finishes harmlessly; dropping the future here keeps a stale frame from
@@ -941,24 +1182,27 @@ void Panel::Hide() {
         impl.pendingCapture = {};
 }
 
-int Panel::HitTest(POINT screenPoint) const {
-    const Impl& impl = *m_impl;
-    if (!impl.visible || impl.items.empty()) return -1;
+int Panel::Impl::HitTestScreen(POINT screenPoint) const {
+    if (!visible || items.empty()) return -1;
 
-    const float padding = impl.Scaled(layout::kPanelPadding);
-    const float gap     = impl.Scaled(layout::kTileGap);
+    const float padding = Scaled(layout::kPanelPadding);
+    const float gap     = Scaled(layout::kTileGap);
 
-    const float x = static_cast<float>(screenPoint.x - impl.panelRect.left);
-    const float y = static_cast<float>(screenPoint.y - impl.panelRect.top);
+    const float x = static_cast<float>(screenPoint.x - panelRect.left);
+    const float y = static_cast<float>(screenPoint.y - panelRect.top);
 
-    if (y < padding || y > padding + impl.tilePx) return -1;
+    if (y < padding || y > padding + tilePx) return -1;
 
-    for (size_t i = 0; i < impl.items.size(); ++i) {
-        const float left = padding + static_cast<float>(i) * (impl.tilePx + gap);
-        if (x >= left && x <= left + impl.tilePx)
+    for (size_t i = 0; i < items.size(); ++i) {
+        const float left = padding + static_cast<float>(i) * (tilePx + gap);
+        if (x >= left && x <= left + tilePx)
             return static_cast<int>(i);
     }
     return -1;
+}
+
+int Panel::HitTest(POINT screenPoint) const {
+    return m_impl->HitTestScreen(screenPoint);
 }
 
 } // namespace mactab

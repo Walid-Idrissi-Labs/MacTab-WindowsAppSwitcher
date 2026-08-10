@@ -45,13 +45,14 @@ struct Metrics {
 //
 // macOS shrinks the tiles to fit rather than wrapping to a second row or
 // scrolling, so the panel is always a single strip however many apps are open.
-inline Metrics Compute(int count, float availableWidth, float dpiScale) {
+inline Metrics Compute(int count, float availableWidth, float dpiScale,
+                       float baseTileSize = kTileSize) {
     Metrics m;
     m.padding     = kPanelPadding * dpiScale;
     m.gap         = kTileGap      * dpiScale;
     m.radius      = kPanelRadius  * dpiScale;
     m.labelHeight = kLabelHeight  * dpiScale;
-    m.tileSize    = kTileSize     * dpiScale;
+    m.tileSize    = baseTileSize  * dpiScale;
 
     if (count <= 0) {
         m.panelWidth  = m.padding * 2;

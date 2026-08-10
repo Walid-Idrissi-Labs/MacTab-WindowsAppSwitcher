@@ -160,6 +160,7 @@ target_link_libraries(MacTab PRIVATE
     dwmapi
     wtsapi32       # session lock/unlock notifications
     d2d1
+    dxguid         # CLSID_D2D1GaussianBlur / CLSID_D2D1Scale live here
     d3d11
     dxgi
     dwrite

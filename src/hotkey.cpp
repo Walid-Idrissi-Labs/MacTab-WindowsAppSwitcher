@@ -123,7 +123,15 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     // --- A gesture is in flight (Armed or Panel) ---------------------------
 
     // Alt released: commit.
-    if (up && IsAltKey(vk)) {
+    //
+    // Only the Alt that actually opened the gesture counts. With leftAltOnly,
+    // tapping and releasing the right Alt would otherwise commit a gesture it
+    // had nothing to do with. VK_MENU is accepted because some injectors send
+    // the generic form.
+    const bool releasesGestureAlt =
+        IsAltKey(vk) && (vk == g_gestureAltVk || vk == VK_MENU || g_gestureAltVk == 0);
+
+    if (up && releasesGestureAlt) {
         // Record the exact VK we are swallowing so the UI thread can inject a
         // matching key-up. Symmetry matters — releasing VK_MENU when the user
         // held VK_LMENU can leave the async state inconsistent.

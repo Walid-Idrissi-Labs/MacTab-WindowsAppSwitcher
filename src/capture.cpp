@@ -192,8 +192,14 @@ Frame GrabWithDuplication(const RECT& rect) {
                     frame.pixels = ReadStagingTexture(context.Get(), staging.Get(),
                                                       static_cast<int>(stagingDesc.Width),
                                                       static_cast<int>(stagingDesc.Height));
-                    if (!frame.pixels.Empty())
+                    if (!frame.pixels.Empty()) {
                         frame.source = Source::DesktopDuplication;
+                        // Report the clamped region, not the requested one.
+                        frame.bounds.left   = outputBounds.left + static_cast<LONG>(box.left);
+                        frame.bounds.top    = outputBounds.top  + static_cast<LONG>(box.top);
+                        frame.bounds.right  = frame.bounds.left + frame.pixels.width;
+                        frame.bounds.bottom = frame.bounds.top  + frame.pixels.height;
+                    }
                 }
             }
         }
@@ -244,6 +250,7 @@ Frame GrabWithBitBlt(const RECT& rect) {
             for (uint32_t& pixel : frame.pixels.pixels)
                 pixel |= 0xFF000000u;
             frame.source = Source::GdiBitBlt;
+            frame.bounds = rect;   // BitBlt reads the virtual screen, no clamping
         }
 
         ::SelectObject(memory, previous);
@@ -280,9 +287,10 @@ Frame GrabRegion(const RECT& rect) {
     if (frame.source == Source::None)
         frame = GrabWithBitBlt(rect);
 
-    MACTAB_DIAG("capture: %s, %dx%d in %.2f ms",
+    MACTAB_DIAG("capture: %s, %dx%d at (%ld,%ld) in %.2f ms",
                 SourceName(frame.source),
-                frame.pixels.width, frame.pixels.height, NowMs() - started);
+                frame.pixels.width, frame.pixels.height,
+                frame.bounds.left, frame.bounds.top, NowMs() - started);
 
     return frame;
 }

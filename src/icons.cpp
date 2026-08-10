@@ -256,8 +256,13 @@ Bitmap ProduceTile(const Request& request) {
     }
 
     if (!displayName.empty()) {
-        std::lock_guard<std::mutex> guard(g_lock);
-        g_displayNames[request.key] = displayName;
+        {
+            std::lock_guard<std::mutex> guard(g_lock);
+            g_displayNames[request.key] = displayName;
+        }
+        // Also publish it to the identity cache, which deliberately stays
+        // COM-free and so cannot read package manifests itself.
+        SetDisplayName(request.key, displayName);
     }
 
     return MakeIconTile(source, request.size);
@@ -354,6 +359,10 @@ void Stop() {
         std::lock_guard<std::mutex> guard(g_lock);
         if (!g_worker.joinable()) return;
         g_stopping = true;
+        // Abandon anything still queued. Draining it would mean up to a 200ms
+        // SendMessageTimeout per pending request, which can add seconds to
+        // shutdown — right when Restart Manager is timing us during an upgrade.
+        g_queue.clear();
     }
     g_wake.notify_all();
 

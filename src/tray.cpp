@@ -54,9 +54,12 @@ bool Tray::Create(HINSTANCE instance, HWND owner, UINT callbackMsg, UINT iconRes
         instance, MAKEINTRESOURCEW(iconResourceId), IMAGE_ICON,
         ::GetSystemMetrics(SM_CXSMICON), ::GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
 
+    m_ownsIcon = (m_icon != nullptr);
+
     if (!m_icon) {
         MACTAB_WARN("tray: icon resource %u failed to load (err %lu), using system fallback",
                     iconResourceId, ::GetLastError());
+        // Shared system icon — must NOT be destroyed.
         m_icon = ::LoadIconW(nullptr, IDI_APPLICATION);
     }
 
@@ -117,10 +120,10 @@ void Tray::Destroy() {
         m_added = false;
     }
 
-    if (m_icon) {
+    if (m_icon && m_ownsIcon)
         ::DestroyIcon(m_icon);
-        m_icon = nullptr;
-    }
+    m_icon     = nullptr;
+    m_ownsIcon = false;
     m_owner = nullptr;
 }
 

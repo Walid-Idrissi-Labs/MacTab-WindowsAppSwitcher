@@ -42,6 +42,7 @@ private:
     HICON        m_icon        = nullptr;
     std::wstring m_tooltip;
     bool         m_added       = false;
+    bool         m_ownsIcon    = false;   // the IDI_APPLICATION fallback is shared
 };
 
 } // namespace mactab
