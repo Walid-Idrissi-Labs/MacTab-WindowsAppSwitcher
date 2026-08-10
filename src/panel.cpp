@@ -1187,7 +1187,13 @@ HMONITOR ChooseMonitor(HWND fallbackWindow) {
 } // namespace
 
 void Panel::Impl::Layout(int count) {
-    monitor = ChooseMonitor(hwnd);
+    // Pick the display once per gesture, not once per layout. Layout runs again
+    // mid-gesture whenever the item count changes, which is every window
+    // expansion and every app quit, and with PanelDisplay=mouse a cursor that
+    // has since crossed to another monitor would teleport a panel that is
+    // already on screen.
+    if (!visible || !monitor)
+        monitor = ChooseMonitor(hwnd);
 
     MONITORINFO monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
