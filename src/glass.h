@@ -192,7 +192,13 @@ inline Params Adapt(const Params& base, float backdropLuma) {
         p.bias -= (panel - p.targetMax) / (1.0f - a);
 
     // A negative bias is legitimate: pinning a bright wallpaper down to the dark
-    // theme's ceiling needs one. The floor only stops it inverting.
+    // theme's ceiling needs one, and at the current numbers that case lands on
+    // exactly -0.05. The floor only stops it inverting.
+    //
+    // The clamp CAN therefore leave the panel outside its band if the gain is
+    // ever raised, silently. That is what the preview's band assertion is for:
+    // it renders both themes over solid black and solid white and fails the
+    // build if either lands outside, so this cannot rot unnoticed.
     p.bias = (std::min)(0.45f, (std::max)(-0.05f, p.bias));
     return p;
 }
