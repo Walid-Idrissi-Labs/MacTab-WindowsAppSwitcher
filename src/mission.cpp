@@ -829,6 +829,44 @@ void Mission::InvalidateBackdrop() {
     MACTAB_DIAG("mission: backdrops invalidated");
 }
 
+void Mission::DisplaysChanged() {
+    Impl& impl = *m_impl;
+    if (!impl.ready) return;
+
+    Hide();
+    wallpaper::Invalidate();
+
+    for (Impl::Screen& screen : impl.screens) {
+        impl.ReleaseTiles(screen);
+        screen.root            = nullptr;
+        screen.backdrop        = nullptr;
+        screen.tileLayer       = nullptr;
+        screen.chromeLayer     = nullptr;
+        screen.outline         = nullptr;
+        screen.bar             = nullptr;
+        screen.backdropSurface = nullptr;
+        screen.barSurface      = nullptr;
+        screen.target          = nullptr;
+        if (screen.hwnd) ::DestroyWindow(screen.hwnd);
+    }
+    impl.screens.clear();
+
+    if (!GuardMission(impl, "DisplaysChanged", [&] {
+            if (!impl.BuildScreens()) {
+                MACTAB_FAIL("mission: could not rebuild the overlays");
+                impl.ready = false;
+                return;
+            }
+            impl.BakeTextures();
+        })) {
+        impl.ready = false;
+        return;
+    }
+
+    Prewarm();
+    MACTAB_DIAG("mission: rebuilt for %zu display(s)", impl.screens.size());
+}
+
 void Mission::Shutdown() {
     Impl& impl = *m_impl;
     if (!impl.ready && impl.screens.empty()) return;
@@ -1653,6 +1691,12 @@ void Mission::Hide(bool restoreFocus) {
 
     impl.items.clear();
     impl.spaces.clear();
+
+    // The uploaded icons go with them. They exist so an app's five windows
+    // share one upload within a single invocation, which is where the saving
+    // is; keeping them across a session that opens and closes hundreds of
+    // applications would grow without a bound.
+    impl.iconBitmaps.clear();
 
     if (restoreFocus && impl.restoreWindow && ::IsWindow(impl.restoreWindow))
         ::SetForegroundWindow(impl.restoreWindow);

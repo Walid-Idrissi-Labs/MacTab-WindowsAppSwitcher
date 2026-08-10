@@ -918,9 +918,10 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_DISPLAYCHANGE:
-        // Monitors moved, so every cached wallpaper is the wrong size and every
-        // baked backdrop is for a screen that is not there any more.
-        g_app.mission.InvalidateBackdrop();
+        // A monitor came or went, so the overlays are sized and positioned for
+        // a desktop that no longer exists. Dropping the wallpapers is not
+        // enough; the windows themselves have to be made again.
+        g_app.mission.DisplaysChanged();
         return 0;
 
     // --- Session state ------------------------------------------------------

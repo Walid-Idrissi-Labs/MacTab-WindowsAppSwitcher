@@ -80,8 +80,16 @@ public:
     // A late icon from the worker. Redraws only the windows of that app.
     void UpdateIcon(const std::wstring& appKey, const Bitmap& icon);
 
-    // Drop the baked backdrops, for a wallpaper or display change.
+    // Drop the baked backdrops, for a wallpaper change.
     void InvalidateBackdrop();
+
+    // Rebuild the per-display overlays.
+    //
+    // Not the same as invalidating the backdrops. A monitor that was unplugged
+    // leaves an overlay sized and positioned for a screen that no longer
+    // exists, and a new one has no overlay at all, so the windows themselves
+    // have to be made again.
+    void DisplaysChanged();
 
     struct Impl;
 
