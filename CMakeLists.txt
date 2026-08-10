@@ -101,10 +101,12 @@ add_executable(MacTab WIN32
     src/main.cpp
     src/activate.cpp
     src/app_identity.cpp
+    src/capture.cpp
     src/com.cpp
     src/common.cpp
     src/diag.cpp
     src/foreground_history.cpp
+    src/geometry.cpp
     src/hotkey.cpp
     src/icon_source.cpp
     src/icons.cpp
@@ -154,6 +156,10 @@ target_link_libraries(MacTab PRIVATE
     ole32
     dwmapi
     wtsapi32       # session lock/unlock notifications
+    d2d1
+    d3d11
+    dxgi
+    dwrite
     version        # FileDescription from executables' version resources
 )
 
