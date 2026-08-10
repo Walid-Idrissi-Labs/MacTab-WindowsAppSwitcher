@@ -39,6 +39,38 @@ bool IsCloaked(HWND hwnd) {
     return SUCCEEDED(hr) && cloaked != 0;
 }
 
+// Where a window visually is, which is not what GetWindowRect returns.
+//
+// Since Vista a resizable window's rect includes an invisible border used only
+// for grabbing the edge, around 7 physical pixels a side at 100% DPI. It does
+// not draw anything, so a Mission Control tile built from GetWindowRect is
+// consistently too wide and too tall, and worse, by a fixed amount, which reads
+// as small windows having thicker margins than large ones.
+// DWMWA_EXTENDED_FRAME_BOUNDS is the rect the window actually occupies.
+//
+// A minimized window has no meaningful rect at all; GetWindowRect gives it an
+// off-screen placeholder well outside the desktop. Its restored placement is
+// the only sensible geometry, and that is what GetWindowPlacement carries.
+RECT BoundsOf(HWND hwnd, bool minimized) {
+    RECT bounds{};
+
+    if (minimized) {
+        WINDOWPLACEMENT placement{};
+        placement.length = sizeof(placement);
+        if (::GetWindowPlacement(hwnd, &placement))
+            return placement.rcNormalPosition;
+    }
+
+    if (SUCCEEDED(::DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                          &bounds, sizeof(bounds))) &&
+        bounds.right > bounds.left && bounds.bottom > bounds.top) {
+        return bounds;
+    }
+
+    ::GetWindowRect(hwnd, &bounds);
+    return bounds;
+}
+
 bool HasCoreWindowChild(HWND frame) {
     HWND found = nullptr;
     ::EnumChildWindows(
@@ -180,6 +212,7 @@ std::vector<SwitcherApp> BuildSwitcherList() {
         window.hwnd      = hwnd;
         window.title     = TitleOf(hwnd);
         window.minimized = ::IsIconic(hwnd) != FALSE;
+        window.bounds    = BoundsOf(hwnd, window.minimized);
 
         const int windowRank = rankOf(hwnd, z);
 
@@ -273,9 +306,12 @@ void LogSwitcherList() {
                     app.windows.size());
 
         for (const SwitcherWindow& window : app.windows) {
-            MACTAB_DIAG("        %p %s\"%s\"",
+            MACTAB_DIAG("        %p %s%ldx%ld at %ld,%ld \"%s\"",
                         static_cast<void*>(window.hwnd),
                         window.minimized ? "[min] " : "",
+                        window.bounds.right - window.bounds.left,
+                        window.bounds.bottom - window.bounds.top,
+                        window.bounds.left, window.bounds.top,
                         ToUtf8(window.title).c_str());
         }
     }

@@ -10,6 +10,18 @@ struct SwitcherWindow {
     HWND         hwnd      = nullptr;
     std::wstring title;
     bool         minimized = false;
+
+    // Where the window actually sits, in virtual-screen coordinates.
+    //
+    // The switcher does not care: it draws icons, not windows. Mission Control
+    // does, because the arrangement is built from the real geometry and has to
+    // preserve both the relative sizes and roughly the positions. Filled in
+    // here rather than re-enumerated later so there is one definition of which
+    // windows exist and where.
+    //
+    // For a minimized window this is the restored placement, not the
+    // meaningless off-screen rect GetWindowRect returns while it is iconic.
+    RECT         bounds{};
 };
 
 struct SwitcherApp {
