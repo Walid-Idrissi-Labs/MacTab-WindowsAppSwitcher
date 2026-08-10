@@ -260,3 +260,33 @@ void CheckMenu(HMENU m) {
     ::CheckMenuRadioItem(m, 210, 212, 211, MF_BYCOMMAND);
     ::AppendMenuW(m, MF_POPUP, reinterpret_cast<UINT_PTR>(m), L"Settings");
 }
+
+// The bitmap brush the space chips are filled with.
+//
+// Here because MSVC rejected the obvious spelling of this and nothing on this
+// side of the build noticed. ID2D1DeviceContext declares its own overloads of
+// CreateBitmapBrush, which hide every one ID2D1RenderTarget had, so the plain
+// D2D1_BITMAP_BRUSH_PROPERTIES form does not resolve at all.
+void CheckBitmapBrush(ID2D1DeviceContext* dc, ID2D1Bitmap1* bitmap) {
+    D2D1_BITMAP_BRUSH_PROPERTIES1 properties{};
+    properties.extendModeX       = D2D1_EXTEND_MODE_CLAMP;
+    properties.extendModeY       = D2D1_EXTEND_MODE_CLAMP;
+    properties.interpolationMode = D2D1_INTERPOLATION_MODE_LINEAR;
+
+    ID2D1BitmapBrush1* brush = nullptr;
+    if (FAILED(dc->CreateBitmapBrush(bitmap, &properties, nullptr, &brush)) || !brush)
+        return;
+
+    brush->SetTransform(D2D1::Matrix3x2F::Translation(12.0f, 8.0f));
+    brush->Release();
+}
+
+// The rounded capsule behind the window title, and the geometry stroke around
+// a space chip.
+void CheckMissionChrome(ID2D1DeviceContext* dc, ID2D1PathGeometry* geometry,
+                        ID2D1SolidColorBrush* brush) {
+    const D2D1_ROUNDED_RECT capsule{ D2D1::RectF(0.0f, 0.0f, 200.0f, 30.0f),
+                                     15.0f, 15.0f };
+    dc->FillRoundedRectangle(capsule, brush);
+    dc->DrawGeometry(geometry, brush, 2.5f);
+}

@@ -724,17 +724,23 @@ void Mission::Impl::BakeSpaces() {
     // desktop are shell-cloaked, and DWM does not compose a cloaked window
     // through any path available here, so there is nothing to show but the
     // desktop itself. Saying so in the release notes beats pretending.
-    ComPtr<ID2D1BitmapBrush> paperBrush;
+    // ID2D1BitmapBrush1 and the ...PROPERTIES1 struct, not the plain ones.
+    // ID2D1DeviceContext declares its own overloads of CreateBitmapBrush, which
+    // hide every one the render target had, so the older form does not resolve.
+    ComPtr<ID2D1BitmapBrush1> paperBrush;
     if (!chips.empty()) {
         const int chipW = (std::max)(1, static_cast<int>(chips[0].w));
         const int chipH = (std::max)(1, static_cast<int>(chips[0].h));
         Bitmap paper = wallpaper::ForMonitor(monitor, chipW, chipH);
         if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(paper))) {
-            D2D1_BITMAP_BRUSH_PROPERTIES props{};
+            D2D1_BITMAP_BRUSH_PROPERTIES1 props{};
             props.extendModeX = D2D1_EXTEND_MODE_CLAMP;
             props.extendModeY = D2D1_EXTEND_MODE_CLAMP;
-            props.interpolationMode = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
-            dc->CreateBitmapBrush(bitmap.Get(), &props, paperBrush.Put());
+            props.interpolationMode = D2D1_INTERPOLATION_MODE_LINEAR;
+            // Four arguments, with no brush properties. The three-argument
+            // convenience form is an inline helper that only some SDK
+            // versions carry, and the explicit one resolves on all of them.
+            dc->CreateBitmapBrush(bitmap.Get(), &props, nullptr, paperBrush.Put());
         }
     }
 
