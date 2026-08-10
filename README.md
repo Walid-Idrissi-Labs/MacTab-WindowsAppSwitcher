@@ -1,5 +1,7 @@
 # MacTab
 
+[![build](https://github.com/Walid-Idrissi-Labs/MacTab-WindowsAppSwitcher/actions/workflows/build.yml/badge.svg)](https://github.com/Walid-Idrissi-Labs/MacTab-WindowsAppSwitcher/actions/workflows/build.yml)
+
 A macOS-style application switcher for Windows 10 and 11.
 
 Windows' Alt+Tab is a per-window grid. macOS' Cmd-Tab is a per-*application* row
@@ -219,7 +221,15 @@ and a square selection highlight sitting next to squircle icons.
 
 `src/panel.cpp` is the one file neither tool reaches, because C++/WinRT ships
 only with the Windows SDK. Every review round so far has found that defects
-concentrate there, which is not a coincidence.
+concentrate there, which is not a coincidence. Two things narrow that hole:
+
+- `tools/d2d-check.cpp` mirrors the Direct2D and DirectWrite calls panel.cpp
+  makes, with no WinRT in it, so mingw type-checks that half. Nothing enforces
+  that the mirror stays in step, and it says so at the top of the file.
+- The `build` workflow compiles the whole thing on `windows-latest` on every
+  push. That runner is the MSVC this project does not otherwise have. In 0.1.0
+  it only ran on tags, and the first tag failed twice on real compiler errors
+  that three review rounds had missed, so now it runs per push.
 
 ## Milestones
 
