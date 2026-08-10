@@ -8,4 +8,5 @@
 #define IDM_TRAY_OPEN_LOG       201
 #define IDM_TRAY_RELOAD_HOOK    202
 #define IDM_TRAY_DUMP_LIST      203
-#define IDM_TRAY_QUIT           204
+#define IDM_TRAY_AUTOSTART      204
+#define IDM_TRAY_QUIT           205

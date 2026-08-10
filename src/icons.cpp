@@ -10,6 +10,7 @@
 #include "icons.h"
 #include "app_identity.h"
 #include "com.h"
+#include "config.h"
 #include "common.h"
 #include "diag.h"
 #include "icon_source.h"
@@ -235,8 +236,12 @@ Bitmap ExtractWindowIcon(HWND window) {
 Bitmap ProduceTile(const Request& request) {
     std::wstring displayName;
 
-    Bitmap source;
-    if (request.packaged)
+    // A user-supplied override wins over anything we can synthesise. Some apps
+    // ship an icon that no amount of analysis will make look right, and this is
+    // the escape hatch for exactly those.
+    Bitmap source = config::LoadThemeOverride(request.exePath, request.aumid);
+
+    if (source.Empty() && request.packaged)
         source = ExtractPackaged(request, displayName);
 
     if (source.Empty())

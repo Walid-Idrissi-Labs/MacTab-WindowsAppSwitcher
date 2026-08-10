@@ -6,6 +6,7 @@
 #include "app.h"
 #include "app_identity.h"
 #include "common.h"
+#include "config.h"
 #include "diag.h"
 #include "foreground_history.h"
 #include "hotkey.h"
@@ -254,6 +255,9 @@ void ShowTrayMenu(HWND hwnd, POINT screenPt) {
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(menu, MF_STRING | (hotkey::IsRunning() ? 0u : MF_DISABLED),
                   IDM_TRAY_RELOAD_HOOK, L"Reload keyboard hook");
+    ::AppendMenuW(menu, MF_STRING | (config::AutostartEnabled() ? MF_CHECKED : 0u),
+                  IDM_TRAY_AUTOSTART, L"Start when I sign in");
+    ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_LIST, L"Log current switcher list");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_LOG, L"Open diagnostics log");
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -366,6 +370,13 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 g_app.tray.ShowBalloon(L"MacTab", L"Keyboard hook reinstalled.");
             else
                 g_app.tray.ShowBalloon(L"MacTab", L"Could not reinstall the keyboard hook.");
+            return 0;
+
+        case IDM_TRAY_AUTOSTART:
+            // Read-modify-write the Run key itself. There is deliberately no
+            // mirrored setting: the key, this menu and Task Manager's Startup
+            // tab all read the same place and cannot disagree.
+            config::SetAutostart(!config::AutostartEnabled());
             return 0;
 
         case IDM_TRAY_DUMP_LIST:
@@ -487,6 +498,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
     g_app.diagRequested = HasFlag(cmdLine, L"--diag");
 
     diag::Init(g_app.diagRequested);
+    config::Load();
     MACTAB_DIAG("boot: command line \"%s\"", ToUtf8(cmdLine ? cmdLine : L"").c_str());
 
     if (!ClaimSingleInstance()) {
@@ -558,6 +570,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
         MACTAB_WARN("boot: MRU tracking unavailable; switching will be unordered");
 
     hotkey::Options hotkeyOptions{};
+    hotkeyOptions.revealDelayMs = config::Current().revealDelayMs;
+    hotkeyOptions.leftAltOnly   = config::Current().leftAltOnly;
     if (!hotkey::Start(g_app.host, hotkeyOptions)) {
         ::MessageBoxW(nullptr,
                       L"MacTab could not install its keyboard hook, so Alt+Tab cannot "

@@ -105,6 +105,7 @@ add_executable(MacTab WIN32
     src/app_identity.cpp
     src/capture.cpp
     src/com.cpp
+    src/config.cpp
     src/common.cpp
     src/diag.cpp
     src/foreground_history.cpp
@@ -163,6 +164,7 @@ target_link_libraries(MacTab PRIVATE
     dxgi
     dwrite
     shcore         # GetDpiForMonitor
+    windowscodecs  # PNG decoding for icon theme packs
     version        # FileDescription from executables' version resources
 )
 
