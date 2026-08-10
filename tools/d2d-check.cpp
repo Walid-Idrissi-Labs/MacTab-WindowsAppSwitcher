@@ -66,41 +66,48 @@ void CheckMaterial(ID2D1DeviceContext* dc, ID2D1Bitmap1* captured) {
 void CheckRim(ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& toSurface, float height) {
     const glass::Params& m = glass::kDark;
 
+    // Dark outer stroke, source-over.
     ID2D1SolidColorBrush* dark = nullptr;
     dc->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, m.rimOuterDark), &dark);
 
-    const D2D1_GRADIENT_STOP stops[] = {
-        { 0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, m.rimTop) },
-        { 1.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, m.rimBottom) },
+    // Bright rim. The stop colours are the amount to ADD, hence grey levels at
+    // alpha 1 rather than white at an alpha, and the blend is ADD not over.
+    const D2D1_GRADIENT_STOP rimStops[] = {
+        { 0.0f, D2D1::ColorF(m.rimTop,    m.rimTop,    m.rimTop,    1.0f) },
+        { 1.0f, D2D1::ColorF(m.rimBottom, m.rimBottom, m.rimBottom, 1.0f) },
     };
-    ID2D1GradientStopCollection* collection = nullptr;
-    dc->CreateGradientStopCollection(stops, ARRAYSIZE(stops), &collection);
+    ID2D1GradientStopCollection* rimCollection = nullptr;
+    dc->CreateGradientStopCollection(rimStops, ARRAYSIZE(rimStops), &rimCollection);
 
     ID2D1LinearGradientBrush* rim = nullptr;
     dc->CreateLinearGradientBrush(
         D2D1::LinearGradientBrushProperties(D2D1::Point2F(0.0f, 0.0f),
                                             D2D1::Point2F(0.0f, height)),
-        collection, &rim);
+        rimCollection, &rim);
 
     dc->SetTransform(D2D1::Matrix3x2F::Translation(2.0f, 2.0f) * toSurface);
-
-    // Additive rim. The stop colours are the amount to ADD, so alpha 1 on them
-    // means "add all of this" rather than "cover with this".
     dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD);
     dc->DrawGeometry(nullptr, rim, 1.0f);
     dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
 
-    // Inner glow: four-stop vertical gradient filled over the whole panel.
-    const D2D1_GRADIENT_STOP glow[] = {
+    // Inner glow: a four-stop vertical gradient filled over the whole shape,
+    // white at an alpha this time, source-over, inside the clip layer.
+    const D2D1_GRADIENT_STOP glowStops[] = {
         { 0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, m.glowTop) },
         { 0.1f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.0f) },
         { 0.9f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.0f) },
         { 1.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, m.glowBottom) },
     };
-    ID2D1GradientStopCollection* glowStops = nullptr;
-    dc->CreateGradientStopCollection(glow, ARRAYSIZE(glow), &glowStops);
-    dc->FillRectangle(D2D1::RectF(0.0f, 0.0f, 100.0f, height), rim);
+    ID2D1GradientStopCollection* glowCollection = nullptr;
+    dc->CreateGradientStopCollection(glowStops, ARRAYSIZE(glowStops), &glowCollection);
 
+    ID2D1LinearGradientBrush* glow = nullptr;
+    dc->CreateLinearGradientBrush(
+        D2D1::LinearGradientBrushProperties(D2D1::Point2F(0.0f, 0.0f),
+                                            D2D1::Point2F(0.0f, height)),
+        glowCollection, &glow);
+
+    dc->FillRectangle(D2D1::RectF(0.0f, 0.0f, 100.0f, height), glow);
     dc->SetTransform(toSurface);
 }
 

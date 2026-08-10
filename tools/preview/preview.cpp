@@ -405,8 +405,11 @@ Bitmap MakeWallpaper(int width, int height, Wallpaper kind) {
         // Not perfectly flat. A dead-flat field would hide a blur that is too
         // weak, and the point of these two is the ENDS of the range, not the
         // texture, so a few percent of structure is enough.
-        const uint8_t base = (kind == Wallpaper::White) ? 250 : 6;
-        const uint8_t alt  = (kind == Wallpaper::White) ? 236 : 20;
+        // Genuinely the ends of the range. A 250/236 checker means the "white"
+        // case never actually reaches white, and the adaptive step's clamp can
+        // then bind without any assertion noticing.
+        const uint8_t base = (kind == Wallpaper::White) ? 255 : 0;
+        const uint8_t alt  = (kind == Wallpaper::White) ? 246 : 9;
         for (int y = 0; y < height; ++y)
             for (int x = 0; x < width; ++x) {
                 const uint8_t v = ((x / 40) + (y / 40)) % 2 ? alt : base;
@@ -446,6 +449,66 @@ Bitmap MakeWallpaper(int width, int height, Wallpaper kind) {
     block(width * 5 / 8, height / 5, width / 5, height / 2, 6);
 
     return out;
+}
+
+// Rim. Dark stroke on the outermost opaque pixel, additive bright rim one pixel
+// inside it, matching the inset scheme panel.cpp strokes with.
+//
+// Shared by the panel and the app name's capsule, because panel.cpp's DrawGlass
+// draws the rim on both and a 28px-tall capsule is about a fifth edge band. A
+// preview that left it off the capsule was showing a shape the build does not
+// produce.
+void ApplyRim(Bitmap& body, const glass::Params& material) {
+    const int w = body.width, h = body.height;
+
+    auto darken = [&](int x, int y, float alpha) {
+        if (x < 0 || y < 0 || x >= w || y >= h) return;
+        uint32_t& px = body.At(x, y);
+        px = MakePixel(static_cast<uint8_t>(RedOf(px)   * (1.0f - alpha)),
+                       static_cast<uint8_t>(GreenOf(px) * (1.0f - alpha)),
+                       static_cast<uint8_t>(BlueOf(px)  * (1.0f - alpha)),
+                       AlphaOf(px));
+    };
+    auto add = [&](int x, int y, float amount) {
+        if (x < 0 || y < 0 || x >= w || y >= h) return;
+        uint32_t& px = body.At(x, y);
+        auto plus = [&](uint8_t c) {
+            const int v = static_cast<int>(c + amount * 255.0f);
+            return static_cast<uint8_t>(v > 255 ? 255 : v);
+        };
+        px = MakePixel(plus(RedOf(px)), plus(GreenOf(px)), plus(BlueOf(px)), AlphaOf(px));
+    };
+    auto rimAt = [&](int y) {
+        const float t = (h > 1) ? static_cast<float>(y) / (h - 1) : 0.0f;
+        return material.rimTop + (material.rimBottom - material.rimTop) * t;
+    };
+
+    for (int y = 0; y < h; ++y) {
+        int first = -1, last = -1;
+        for (int x = 0; x < w; ++x)
+            if (AlphaOf(body.At(x, y)) >= 200) { first = x; break; }
+        for (int x = w - 1; x >= 0; --x)
+            if (AlphaOf(body.At(x, y)) >= 200) { last = x; break; }
+        if (first < 0) continue;
+
+        darken(first, y, material.rimOuterDark);
+        darken(last,  y, material.rimOuterDark);
+        add(first + 1, y, rimAt(y));
+        add(last  - 1, y, rimAt(y));
+    }
+    for (int x = 0; x < w; ++x) {
+        int first = -1, last = -1;
+        for (int y = 0; y < h; ++y)
+            if (AlphaOf(body.At(x, y)) >= 200) { first = y; break; }
+        for (int y = h - 1; y >= 0; --y)
+            if (AlphaOf(body.At(x, y)) >= 200) { last = y; break; }
+        if (first < 0) continue;
+
+        darken(x, first, material.rimOuterDark);
+        darken(x, last,  material.rimOuterDark);
+        add(x, first + 1, material.rimTop);
+        add(x, last  - 1, material.rimBottom);
+    }
 }
 
 // What the render measured, so the numbers can be diffed against the reference
@@ -534,59 +597,7 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
         }
     }
 
-    // Rim. Dark stroke on the outermost opaque pixel, additive bright rim one
-    // pixel inside it, matching the inset scheme panel.cpp strokes with.
-    {
-        auto darken = [&](int x, int y, float alpha) {
-            if (x < 0 || y < 0 || x >= panelW || y >= panelH) return;
-            uint32_t& px = body.At(x, y);
-            px = MakePixel(static_cast<uint8_t>(RedOf(px)   * (1.0f - alpha)),
-                           static_cast<uint8_t>(GreenOf(px) * (1.0f - alpha)),
-                           static_cast<uint8_t>(BlueOf(px)  * (1.0f - alpha)),
-                           AlphaOf(px));
-        };
-        auto add = [&](int x, int y, float amount) {
-            if (x < 0 || y < 0 || x >= panelW || y >= panelH) return;
-            uint32_t& px = body.At(x, y);
-            auto plus = [&](uint8_t c) {
-                const int v = static_cast<int>(c + amount * 255.0f);
-                return static_cast<uint8_t>(v > 255 ? 255 : v);
-            };
-            px = MakePixel(plus(RedOf(px)), plus(GreenOf(px)), plus(BlueOf(px)), AlphaOf(px));
-        };
-
-        auto rimAt = [&](int y) {
-            const float t = (panelH > 1) ? static_cast<float>(y) / (panelH - 1) : 0.0f;
-            return material.rimTop + (material.rimBottom - material.rimTop) * t;
-        };
-
-        for (int y = 0; y < panelH; ++y) {
-            int first = -1, last = -1;
-            for (int x = 0; x < panelW; ++x)
-                if (AlphaOf(body.At(x, y)) >= 200) { first = x; break; }
-            for (int x = panelW - 1; x >= 0; --x)
-                if (AlphaOf(body.At(x, y)) >= 200) { last = x; break; }
-            if (first < 0) continue;
-
-            darken(first, y, material.rimOuterDark);
-            darken(last,  y, material.rimOuterDark);
-            add(first + 1, y, rimAt(y));
-            add(last  - 1, y, rimAt(y));
-        }
-        for (int x = 0; x < panelW; ++x) {
-            int first = -1, last = -1;
-            for (int y = 0; y < panelH; ++y)
-                if (AlphaOf(body.At(x, y)) >= 200) { first = y; break; }
-            for (int y = panelH - 1; y >= 0; --y)
-                if (AlphaOf(body.At(x, y)) >= 200) { last = y; break; }
-            if (first < 0) continue;
-
-            darken(x, first, material.rimOuterDark);
-            darken(x, last,  material.rimOuterDark);
-            add(x, first + 1, material.rimTop);
-            add(x, last  - 1, material.rimBottom);
-        }
-    }
+    ApplyRim(body, material);
 
     CompositeOver(canvas, body, margin, margin);
 
@@ -635,13 +646,14 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
     // the text itself is a bar of the width a name like "Visual Studio Code"
     // occupies; the capsule and its placement are what need looking at.
     {
-        const float labelWidth =
-            std::min(2.0f * (m.tileSize + m.gap),
-                     std::min(m.panelWidth - m.padding * 2.0f, 170.0f));
+        // Same cap and same clamp BakeLabel uses. They had drifted, which made
+        // panel-label-end.png, the render whose whole job is to show the clamp,
+        // show a position up to 22px away from the one that ships.
+        const float labelWidth = std::min(2.0f * (m.tileSize + m.gap), m.panelWidth);
         const float centre = m.TileCentreX(selected);
-        const float x = std::max(m.padding,
+        const float x = std::max(0.0f,
                                  std::min(centre - labelWidth * 0.5f,
-                                          m.panelWidth - m.padding - labelWidth));
+                                          m.panelWidth - labelWidth));
 
         const int pillW = static_cast<int>(labelWidth);
         const int pillH = static_cast<int>(m.labelHeight);
@@ -678,6 +690,8 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
                     apply(pillW - 1 - cx, pillH - 1 - cy);
                 }
         }
+
+        ApplyRim(pill, material);
 
         if (stats) {
             const float pillLuma = MeanLuma(pill);

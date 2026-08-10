@@ -599,8 +599,14 @@ void Panel::Impl::RecoverDevices() {
 void Panel::Impl::StartCapture() {
     const int margin = static_cast<int>(BlurMarginPx(dpiScale));
 
+    // Asymmetric at the bottom, because the app name's capsule lives down there
+    // and is glass too. It sits labelGap + labelHeight below panelRect and needs
+    // its own blur reach underneath that, so a symmetric margin leaves the
+    // capsule's lower half blurred against a clamped edge, and a relayout that
+    // grows the panel can push the capsule out of the captured region entirely.
     RECT captureRect = panelRect;
     ::InflateRect(&captureRect, margin, margin);
+    captureRect.bottom += static_cast<int>(std::ceil(labelBandPx));
 
     auto task = std::make_shared<std::packaged_task<capture::Frame()>>(
         [captureRect] { return capture::GrabRegion(captureRect); });
@@ -845,11 +851,14 @@ void Panel::Impl::CollectFrame() {
     //
     // Re-capturing is not an option, our own panel is on screen by then, so
     // drop to the flat fallback instead. Shrinking is fine and stays blurred.
+    //
+    // The test covers the capsule as well as the panel: it is the piece that
+    // hangs lowest, so it is the one that leaves the frame first.
     if (!lastFrame.pixels.Empty() &&
         (panelRect.left   < lastFrame.bounds.left  ||
          panelRect.top    < lastFrame.bounds.top   ||
          panelRect.right  > lastFrame.bounds.right ||
-         panelRect.bottom > lastFrame.bounds.bottom)) {
+         panelRect.bottom + std::ceil(labelBandPx) > lastFrame.bounds.bottom)) {
         MACTAB_WARN("panel: relayout grew past the captured region, using the flat fallback");
         lastFrame = {};
     }
@@ -999,8 +1008,8 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
     }
 
     ComPtr<ID2D1SolidColorBrush> tintBrush;
-    dc->CreateSolidColorBrush(TintColour(material), tintBrush.Put());
-    dc->FillRectangle(area, tintBrush.Get());
+    if (SUCCEEDED(dc->CreateSolidColorBrush(TintColour(material), tintBrush.Put())))
+        dc->FillRectangle(area, tintBrush.Get());
 
     DrawInnerGlow(dc, width, height);
 
@@ -1239,11 +1248,22 @@ float Panel::Impl::CapsuleLuma(const RECT& screenRect) const {
     if (lastFrame.pixels.Empty())
         return glass::TintLuma(material);
 
+    // Sample the blur's NEIGHBOURHOOD, not the capsule's own strip.
+    //
+    // What ends up under the capsule is a sigma-52 blur, so each pixel there is
+    // an average over roughly a sigma in every direction, and the capsule is
+    // only 28 logical pixels tall. Measuring the strip alone gets this badly
+    // wrong in exactly the case the shadow exists for: a hard bright/dark
+    // boundary just above the capsule. A dark strip under a bright neighbourhood
+    // measures 0.12 and skips the shadow, while what renders is nearer 0.50 and
+    // needs it.
+    const int reach = static_cast<int>(Scaled(kBlurSigma));
+
     const uint32_t mean = MeanColourIn(lastFrame.pixels,
-                                       screenRect.left   - lastFrame.bounds.left,
-                                       screenRect.top    - lastFrame.bounds.top,
-                                       screenRect.right  - lastFrame.bounds.left,
-                                       screenRect.bottom - lastFrame.bounds.top);
+                                       screenRect.left   - lastFrame.bounds.left - reach,
+                                       screenRect.top    - lastFrame.bounds.top  - reach,
+                                       screenRect.right  - lastFrame.bounds.left + reach,
+                                       screenRect.bottom - lastFrame.bounds.top  + reach);
 
     const float in[3]  = { RedOf(mean) / 255.0f, GreenOf(mean) / 255.0f,
                            BlueOf(mean) / 255.0f };
@@ -1504,6 +1524,11 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
         impl.CollectFrame();
         impl.BakeBackdrop();
     } else {
+        // No frame yet, so nothing to adapt to. Reset the material rather than
+        // leaving the previous gesture's adapted copy, which after a theme flip
+        // is the wrong theme entirely. Show() re-adapts and re-bakes before any
+        // of this reaches the screen; this only keeps the invariant true.
+        impl.material = impl.theme.material;
         impl.StartCapture();
     }
 
