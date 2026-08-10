@@ -83,6 +83,24 @@ void CheckRim(ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& toSurface, float 
         collection, &rim);
 
     dc->SetTransform(D2D1::Matrix3x2F::Translation(2.0f, 2.0f) * toSurface);
+
+    // Additive rim. The stop colours are the amount to ADD, so alpha 1 on them
+    // means "add all of this" rather than "cover with this".
+    dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD);
+    dc->DrawGeometry(nullptr, rim, 1.0f);
+    dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+
+    // Inner glow: four-stop vertical gradient filled over the whole panel.
+    const D2D1_GRADIENT_STOP glow[] = {
+        { 0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, m.glowTop) },
+        { 0.1f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.0f) },
+        { 0.9f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.0f) },
+        { 1.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, m.glowBottom) },
+    };
+    ID2D1GradientStopCollection* glowStops = nullptr;
+    dc->CreateGradientStopCollection(glow, ARRAYSIZE(glow), &glowStops);
+    dc->FillRectangle(D2D1::RectF(0.0f, 0.0f, 100.0f, height), rim);
+
     dc->SetTransform(toSurface);
 }
 
