@@ -43,6 +43,7 @@ constexpr float kSpacesStripHeight = 132.0f;   // the whole band
 constexpr float kSpaceChipHeight   = 92.0f;    // one desktop miniature
 constexpr float kSpaceChipGap      = 18.0f;
 constexpr float kSpaceChipRadius   = 10.0f;
+constexpr float kSpaceLabelHeight  = 22.0f;   // the name under each miniature
 constexpr float kOuterMargin       = 56.0f;
 constexpr float kTitleHeight       = 30.0f;
 constexpr float kTitleGap          = 10.0f;
@@ -258,6 +259,20 @@ void FillSquircle(ID2D1DeviceContext* dc, ID2D1Factory* factory,
     dc->GetTransform(const_cast<D2D1_MATRIX_3X2_F*>(&saved));
     dc->SetTransform(D2D1::Matrix3x2F::Translation(x, y) * saved);
     dc->FillGeometry(geometry.Get(), brush.Get());
+    dc->SetTransform(saved);
+}
+
+void FillSquircleWith(ID2D1DeviceContext* dc, ID2D1Factory* factory,
+                      float x, float y, float w, float h, float radius,
+                      ID2D1Brush* brush) {
+    ComPtr<ID2D1PathGeometry> geometry =
+        CreateSquircleGeometry(factory, w, h, radius, 5.0f);
+    if (!geometry || !brush) return;
+
+    D2D1_MATRIX_3X2_F saved{};
+    dc->GetTransform(&saved);
+    dc->SetTransform(D2D1::Matrix3x2F::Translation(x, y) * saved);
+    dc->FillGeometry(geometry.Get(), brush);
     dc->SetTransform(saved);
 }
 
@@ -659,7 +674,10 @@ void Mission::Impl::BakeSpaces() {
     }
 
     const float height = static_cast<float>(monitorRect.bottom - monitorRect.top);
-    chips = mission::LayoutSpaces(static_cast<int>(spaces.size()), width, strip,
+    // Centre the miniatures in the band ABOVE the labels, not in the whole
+    // band, so the names have somewhere to sit.
+    chips = mission::LayoutSpaces(static_cast<int>(spaces.size()), width,
+                                  strip - Scaled(kSpaceLabelHeight),
                                   Scaled(kSpaceChipHeight),
                                   (height > 0.0f) ? width / height : 1.6f,
                                   Scaled(kSpaceChipGap));
@@ -699,29 +717,73 @@ void Mission::Impl::BakeSpaces() {
 
     const float radius = Scaled(kSpaceChipRadius);
 
+    // Every desktop shows the wallpaper, which is what an empty one looks like
+    // and is a great deal closer to the real thing than a grey rectangle.
+    //
+    // Not a picture of what is actually on each desktop. Windows on another
+    // desktop are shell-cloaked, and DWM does not compose a cloaked window
+    // through any path available here, so there is nothing to show but the
+    // desktop itself. Saying so in the release notes beats pretending.
+    ComPtr<ID2D1BitmapBrush> paperBrush;
+    if (!chips.empty()) {
+        const int chipW = (std::max)(1, static_cast<int>(chips[0].w));
+        const int chipH = (std::max)(1, static_cast<int>(chips[0].h));
+        Bitmap paper = wallpaper::ForMonitor(monitor, chipW, chipH);
+        if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(paper))) {
+            D2D1_BITMAP_BRUSH_PROPERTIES props{};
+            props.extendModeX = D2D1_EXTEND_MODE_CLAMP;
+            props.extendModeY = D2D1_EXTEND_MODE_CLAMP;
+            props.interpolationMode = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+            dc->CreateBitmapBrush(bitmap.Get(), &props, paperBrush.Put());
+        }
+    }
+
     for (const mission::SpaceChip& chip : chips) {
         const bool current = !chip.add &&
                              chip.index >= 0 &&
                              chip.index < static_cast<int>(spaces.size()) &&
                              spaces[static_cast<size_t>(chip.index)].current;
 
-        FillSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h, radius,
-                     current ? theme.chipCurrent : theme.chip);
+        if (!chip.add && paperBrush) {
+            paperBrush->SetTransform(D2D1::Matrix3x2F::Translation(chip.x, chip.y));
+            FillSquircleWith(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h,
+                             radius, paperBrush.Get());
 
-        if (current)
-            StrokeSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h,
-                           radius, Scaled(2.0f), theme.chipBorder);
+            // The desktop you are not on is pushed back, the same way the
+            // wallpaper behind the arrangement is.
+            if (!current)
+                FillSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h,
+                             radius,
+                             themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.45f)
+                                          : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.45f));
+        } else {
+            FillSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h, radius,
+                         current ? theme.chipCurrent : theme.chip);
+        }
+
+        StrokeSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h,
+                       radius, Scaled(current ? 2.5f : 1.0f),
+                       current ? theme.chipBorder
+                               : D2D1::ColorF(theme.chipBorder.r, theme.chipBorder.g,
+                                              theme.chipBorder.b,
+                                              theme.chipBorder.a * 0.35f));
 
         if (!format || !textBrush) continue;
 
-        const D2D1_RECT_F box = D2D1::RectF(chip.x, chip.y,
-                                            chip.x + chip.w, chip.y + chip.h);
         if (chip.add) {
-            dc->DrawTextW(L"+", 1, format.Get(), box, textBrush.Get());
+            dc->DrawTextW(L"+", 1, format.Get(),
+                          D2D1::RectF(chip.x, chip.y, chip.x + chip.w, chip.y + chip.h),
+                          textBrush.Get());
         } else if (chip.index >= 0 && chip.index < static_cast<int>(spaces.size())) {
+            // Under the miniature, not on it. A name printed over a photograph
+            // is unreadable on some fraction of all wallpapers, and there is no
+            // colour that fixes that.
             const std::wstring& name = spaces[static_cast<size_t>(chip.index)].name;
             dc->DrawTextW(name.c_str(), static_cast<UINT32>(name.size()),
-                          format.Get(), box, textBrush.Get());
+                          format.Get(),
+                          D2D1::RectF(chip.x, chip.y + chip.h,
+                                      chip.x + chip.w, strip),
+                          textBrush.Get());
         }
     }
 
