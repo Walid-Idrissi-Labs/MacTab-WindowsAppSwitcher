@@ -41,6 +41,17 @@ struct Settings {
 
     // Where the panel opens. Default matches what v0.1 shipped with.
     PanelDisplay panelDisplay = PanelDisplay::ActiveWindow;
+
+    // Bend the backdrop at the panel's rim, which is what makes it read as a
+    // pane of glass rather than a blurred rectangle.
+    //
+    // Here as a switch because it is the one part of the material that goes
+    // through a Direct2D path nothing off Windows can exercise: the generated
+    // map is checked hard by tools/preview, but whether D2D1DisplacementMap
+    // lines its two inputs up the way the documentation says is only knowable on
+    // real hardware. If it comes out doubled or smeared on some driver, turning
+    // this off in settings.ini gets a working panel back without a new build.
+    bool glassRefraction = true;
 };
 
 const Settings& Current();

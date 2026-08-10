@@ -130,27 +130,47 @@ little under half and *lifts* it, rather than veiling it.
 Four things make that read as glass rather than as a blurred rectangle, in the
 order they matter:
 
-1. **The operating point moves.** One affine transfer cannot serve both a white
+1. **The rim refracts.** A pane with thickness bends what is behind it, so
+   content just outside the panel is pulled inward and squeezed against the
+   edge. The surface profile is the convex squircle
+   `h(x) = (1 - (1-x)^4) ^ (1/4)`, which is what Apple uses and is chosen for its
+   join: it meets the flat interior with zero slope, so the bending fades out
+   instead of stopping at a visible ring. Displacement is one Snell event at
+   `n = 1.5`, giving a peak of 12.5px about 0.7px in from the edge, and about
+   2.7:1 of compression across the bezel. Built as an 8-bit map on the CPU and
+   handed to `D2D1DisplacementMap`.
+
+   The bezel is refracted out of a *separate, much lighter* blur, sigma 8 against
+   the interior's 30, and that is not a detail. A lens transmits; only the flat
+   interior is frosted. Without it the refraction is invisible, because at sigma
+   30 the backdrop has no edges left to bend: the first version of this rendered
+   pixel for pixel identically with the lens on and off, which is why
+   `bars-top-4x.png` and `bars-top-flat-4x.png` exist in the preview output.
+2. **You can see through it.** Reverse engineering of shipped macOS materials
+   puts their gaussian radius near 30 and their backdrop sample at quarter
+   scale. Ours ran at 52 through 0.3, which is a sigma at which nothing survives
+   except blobs bigger than the panel. Sigma 30, tint alpha 0.14, and an end gain
+   of 0.53 dark / 0.60 light, so a little over half the desktop's contrast
+   reaches the screen. The preview fails the build under 0.50.
+3. **The operating point moves.** One affine transfer cannot serve both a white
    wallpaper and a black one: the panel either washes out or turns into a slab.
-   Apple avoids this with a stack of lighten and darken blends that have soft
-   knees at both ends, which is not something one colour matrix can do. What is
-   available here and not to Apple is that the backdrop is a *frozen frame*, so
-   its mean luma is known before a pixel is drawn. `Adapt()` bends the bias per
-   gesture to land the panel inside a per-theme band. The gain never moves: how
-   much of the desktop's contrast survives is a property of the material, where
-   that window sits is a property of what is behind it today.
-2. **Saturation, well past unity.** Measured on the reference, relative
-   saturation goes 0.737 outside the panel to 0.642 inside, a ratio of 0.87. The
-   light material's 2.80 lands on 0.877. `CLSID_D2D1Saturation` is no use for
-   this at all: its property is documented over `[0, 1]`, so it can only ever
-   desaturate, and asking for more clamps to identity without complaining.
-3. **An inner glow at the top edge.** The reference's interior luma is 161 just
-   inside the top rim, decaying to 148.8 about 45px in, with a quarter of that
-   along the bottom. That falloff is what reads as a lit curved surface.
-4. **The rim is additive and nearly symmetric.** Measured lift over the adjacent
-   interior is +33 luma at the top, +23 at the bottom, +22 at the sides, so 1.4:1
-   rather than the 4:1 that looks plausible, and the colour delta at the peak is
-   near neutral. It adds rather than covering.
+   Apple does not use one either, it flips treatment on backdrop luminance. What
+   is available here and not to Apple is that the backdrop is a *frozen frame*,
+   so its mean luma is known before a pixel is drawn. `Adapt()` bends the bias
+   per gesture to land the panel inside a per-theme band. The gain never moves:
+   how much of the desktop's contrast survives is a property of the material,
+   where that window sits is a property of what is behind it today.
+4. **Saturation, well past unity, and a lit edge that follows the surface.**
+   Relative saturation goes 0.737 outside the panel to 0.642 inside on the
+   reference, a ratio of 0.87, and the light material lands on 0.863.
+   `CLSID_D2D1Saturation` is no use for this at all: its property is documented
+   over `[0, 1]`, so it can only ever desaturate, and asking for more clamps to
+   identity without complaining. The rim's measured lift over the adjacent
+   interior is +33 luma at the top, +23 at the bottom and +22 at the sides, which
+   is left-right symmetric, so the light is straight overhead. Modelled as
+   ambient plus an upward-facing lobe plus a thin filament, all evaluated from
+   the surface normal, so the corners sweep between the top and side values on
+   their own. It adds rather than covering.
 
 The coefficients live in [`src/glass.h`](src/glass.h), free of `windows.h`, so
 the preview harness below applies the identical matrix and prints the numbers
@@ -242,6 +262,7 @@ defaults and comments on first run:
 | `Theme` | auto | `auto`, `light` or `dark` |
 | `GroupByApp` | 1 | 0 gives one tile per window instead of one per application |
 | `PanelDisplay` | active | `active`, `mouse` or `main` |
+| `GlassRefraction` | 1 | Bend the desktop at the panel's rim. Set to 0 if the edge looks doubled or smeared on your machine |
 
 Drop a PNG into `%LOCALAPPDATA%\MacTab\themes\` named after an executable
 (`chrome.png`, `code.png`) to override that app's generated tile. Some icons will

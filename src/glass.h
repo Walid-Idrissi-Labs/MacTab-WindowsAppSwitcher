@@ -12,46 +12,60 @@
 // exact material to a wallpaper and writes a PNG, and panel.cpp hands the same
 // coefficients to Direct2D. The pixel loops differ, the coefficients cannot.
 //
-// Four things make it a material rather than a blurred rectangle, in order of
-// how much each contributes:
+// The target is Liquid Glass, the macOS 26 material, not the older frosted
+// NSVisualEffectView one. The geometry in panel_layout.h was already fitted to a
+// Tahoe screenshot, and the two things this material was missing (you could not
+// see through it, and it did not bend anything) are exactly the two things
+// Liquid Glass added over the old vibrancy stack.
 //
-//  1. Adaptive operating point. A fixed transfer cannot serve both a white
-//     wallpaper and a black one: the panel either washes out or goes to a slab.
-//     Apple gets away with a fixed material because theirs is a stack of
-//     lighten and darken blends with soft knees at both ends, which is not
-//     reproducible in one colour matrix. What IS available here and not to
-//     Apple is that the backdrop is a FROZEN frame, so its mean luma is known
-//     before anything is drawn and the bias can be bent per gesture to land the
-//     panel inside a target band. See Adapt().
+// Four things make it glass rather than a blurred rectangle, in order of how
+// much each contributes:
 //
-//  2. Saturation, well past unity. macOS vibrancy pushes the backdrop's
+//  1. Refraction at the rim. A pane with thickness bends what is behind it, so
+//     content just outside the panel gets pulled inward and squeezed against the
+//     edge. This is the cue that separates glass from frosted plastic, and it is
+//     the one 0.3 had none of. The optics live in glass_map.h; the numbers that
+//     drive them are below.
+//
+//  2. Seeing through it at all. Blur sigma and how much of the backdrop's
+//     contrast survives. Reverse engineering of shipped macOS materials puts
+//     their gaussian radius at about 30 and their backdrop sample at quarter
+//     scale, which is where kBlurSigma and kBlurDownscale now sit. 0.3 used 52,
+//     which is a sigma at which nothing behind the panel survives except blobs
+//     bigger than the panel, so it was a slab by construction.
+//
+//  3. Saturation, well past unity. macOS vibrancy pushes the backdrop's
 //     saturation up hard. Measuring the reference gives relative saturation
 //     0.737 outside the panel against 0.642 inside, a ratio of 0.87, which is
-//     far past the 1/(1 - tintAlpha) that merely undoes what the tint took
-//     away. This is most of the difference between "glass" and "frosted
-//     plastic".
+//     far past the 1/(1 - tintAlpha) that merely undoes what the tint took away.
 //
 //     The light number is tuned against that ratio rather than by eye: the
-//     preview prints relative saturation in and out on a blue-gradient
-//     wallpaper, and 2.80 lands on 0.877 against the reference's 0.87. Dark
-//     needs less because its tint is near black, and mixing toward black barely
-//     touches relative saturation at all.
+//     preview prints relative saturation in and out on a blue-gradient wallpaper
+//     and fails the build if the ratio leaves [0.84, 0.90]. Dark needs less
+//     because its tint is near black, and mixing toward black barely touches
+//     relative saturation at all.
 //
 //     CLSID_D2D1Saturation cannot do any of it: its property is documented over
 //     [0, 1], so it can only desaturate, and asking for more clamps to identity
 //     without complaining. A colour matrix can.
 //
-//  3. An inner glow at the top edge. Measured on the reference: interior luma
-//     161 just inside the top rim, decaying to 148.8 about 45px in, then rising
-//     again as the wallpaper's own gradient reasserts. The bottom shows the same
-//     shape at a quarter of the strength. That falloff is what reads as a lit
-//     curved surface rather than a flat pane.
+//  4. The lit edge. Measured on the reference, the rim's lift over the adjacent
+//     interior is +33 luma at the top, +23 at the bottom and +22 at the sides.
+//     That is symmetric left to right, so the light is straight overhead rather
+//     than up and to the left. Modelled as an ambient lift on the whole rim plus
+//     a lobe that only the upward-facing part of the surface sees, plus a thin
+//     bright filament along the top. All three come off the surface normal, so
+//     the corners sweep between top and side on their own.
 //
-//  4. The rim, which is additive and very nearly symmetric. The measured lift
-//     over the adjacent interior is +33 luma at the top, +23 at the bottom and
-//     +22 at the sides: a ratio of 1.4:1, not the 4:1 that looks plausible. The
-//     colour delta at the peak is (19,22,13), near neutral, and it adds rather
-//     than covering, so it is drawn with D2D1_PRIMITIVE_BLEND_ADD.
+//     0.3 did this as a vertical gradient stroke plus a separate inner glow,
+//     which is two disconnected guesses at one physical thing, and the gradient
+//     put the mid-height sides at 0.11 where they measure 0.086.
+//
+// The adaptive operating point in Adapt() stays. A fixed transfer cannot serve
+// both a white wallpaper and a black one, and Apple does not use one either: it
+// flips treatment on backdrop luminance and offers a higher-opacity state for
+// busy content. What we have and Apple does not is that our backdrop is a FROZEN
+// frame, so its mean luma is known before anything is drawn.
 
 namespace mactab::glass {
 
@@ -64,26 +78,87 @@ constexpr float Luma(float r, float g, float b) {
     return kLumaR * r + kLumaG * g + kLumaB * b;
 }
 
-// Backdrop blur, in logical pixels at 96 DPI.
+// --- Optics -----------------------------------------------------------------
+//
+// Theme-independent: the shape of a piece of glass does not change with the
+// colour scheme. All in logical pixels at 96 DPI.
+
+// Backdrop blur.
 //
 // Here rather than in panel.cpp because it is the single most visually decisive
 // number in the material and the preview has to use the same one. Sharing it by
 // comment, which is what this was, means it drifts the first time anybody
 // retunes it on the Windows side.
-//
-// The macOS switcher's backdrop is unrecognisable mush. 34 left window edges
-// readable through the glass, which gives it away immediately as a blurred
-// screenshot rather than a material.
-inline constexpr float kBlurSigma = 52.0f;
+inline constexpr float kBlurSigma = 30.0f;
 
-// Downsample before blurring. A 52px sigma at quarter resolution costs what a
-// 13px sigma costs, and after the matching upscale the difference is invisible
-// under a tint. The preview blurs at full resolution instead, which is the same
-// picture for more work; it has no frame budget.
+// Downsample before blurring. Also what macOS does, and it is nearly free: a
+// 30px sigma at quarter resolution costs what a 7.5px sigma costs, and after the
+// matching upscale the difference is invisible under a tint. The preview blurs
+// at full resolution instead, which is the same picture for more work; it has no
+// frame budget.
 inline constexpr float kBlurDownscale = 0.25f;
 
+// A second, much lighter blur, used only inside the bezel.
+//
+// This is what makes the refraction visible at all, and leaving it out was the
+// mistake that nearly shipped. At sigma 30 the backdrop has no edges left, so
+// bending it moves nothing you can see: rendering the panel with the lens on and
+// with it off gave pixel-for-pixel the same rim.
+//
+// It is also what the real thing does. The bezel is a lens and a lens transmits;
+// only the flat interior is frosted. So the band within a bezel width of the
+// edge is refracted out of a lightly blurred tap of the same capture, and the
+// interior stays at the full sigma.
+//
+// 8 keeps window edges and wallpaper structure readable through the rim while
+// still being a blur. Anything under about 4 starts showing recognisable text.
+inline constexpr float kRimTapSigma = 8.0f;
+
+// How far past the bezel the light tap fades back into the frosted interior. Not
+// zero, or the join is a visible ring exactly where the eye is already looking.
+inline constexpr float kRimTapFeather = 6.0f;
+
+// The bezel: how far in from the edge the surface is curved rather than flat.
+// Fitted from the Tahoe switcher, where the lens band runs about 45 screenshot
+// pixels on a 588px-tall panel, scaled to our 172px panel height.
+inline constexpr float kBezelWidth = 14.0f;
+
+// How thick the pane is. Sets the peak displacement through the Snell formula
+// below rather than being a displacement in its own right: at 24 against a 14px
+// bezel the peak comes out at 12.5px, which is the ratio (peak about 0.9 of the
+// bezel width) that shader recreations of Liquid Glass converge on.
+inline constexpr float kGlassDepth = 24.0f;
+
+// Crown glass. Not a free parameter, it is what glass is.
+inline constexpr float kRefractiveIndex = 1.5f;
+
+// Ceiling on the displacement, and the scale the 8-bit map is encoded against.
+// The physics peaks at 12.5, so there is headroom to retune kGlassDepth without
+// re-plumbing the encoding. Also a safety bound: the capture margin is 1.5
+// sigma, so nothing can be pulled in from outside the captured frame.
+inline constexpr float kMaxDisplacement = 16.0f;
+
+// How far in the lit edge reaches before it is gone. From the reference, where
+// interior luma runs 161 just inside the top rim and 148.8 about 45 screenshot
+// pixels in.
+inline constexpr float kRimSpan = 13.0f;
+
+// How tightly the overhead lobe wraps around the corner. 2 puts the 45 degree
+// point midway between the top and side values, which is the sweep the reference
+// shows.
+inline constexpr float kRimExp = 2.0f;
+
+// The filament is confined to the near-horizontal top run and is gone by the
+// corners, so it needs a much tighter exponent than the lobe.
+inline constexpr float kSpecExp = 6.0f;
+
+// Where the filament sits, as distance in from the edge. Starts at 1.0 so it
+// clears the 1px dark outer stroke instead of fighting it.
+inline constexpr float kSpecInner = 1.0f;
+inline constexpr float kSpecOuter = 2.5f;
+
 struct Params {
-    float saturation;   // s. See note 2 above; this is well above 1.
+    float saturation;   // s. See note 3 above; this is well above 1.
     float gain;         // g, multiplies the backdrop's luma range
     float bias;         // b, added after the gain. Adapt() moves this one.
 
@@ -98,17 +173,18 @@ struct Params {
     // because there is no blur to soften window edges into the material.
     float fallbackAlpha;
 
-    // Inner glow. Alpha at the edge, and how far in it takes to reach zero, in
-    // logical pixels at 96 DPI.
-    float glowTop,    glowTopSpan;
-    float glowBottom, glowBottomSpan;
+    // The lit edge, as ADDITIVE amounts rather than alphas over. Measured to be
+    // near neutral in colour, so one number each rather than three.
+    //
+    //   ambient   the whole rim gets this, whichever way it faces
+    //   lobe      extra for the part of the surface facing up, falling off as
+    //             cos(angle from vertical) ^ kRimExp
+    //   specLine  the thin bright filament along the top run
+    float rimAmbient;
+    float rimLobe;
+    float specLine;
 
-    // Rim, as ADDITIVE grey levels rather than an alpha over. Measured to be
-    // near neutral and near symmetric; the vertical gradient between these two
-    // puts the sides in the middle, which is where they measured.
-    float rimTop, rimBottom;
-
-    // A darker stroke outside the bright one. Not optional now that there is no
+    // A darker stroke on the outermost pixel. Not optional now that there is no
     // drop shadow: without it a dark panel on a dark wallpaper has no boundary
     // at all, and a pale one dissolves into a pale wallpaper.
     float rimOuterDark;
@@ -119,24 +195,22 @@ struct Params {
 
 // Dark.
 inline constexpr Params kDark{
-    1.70f, 0.55f, 0.10f,
-    { 0.09f, 0.09f, 0.11f, 0.24f },
+    1.70f, 0.62f, 0.06f,
+    { 0.09f, 0.09f, 0.11f, 0.14f },
     0.96f,
-    0.11f, 13.0f,  0.03f, 10.0f,
-    0.10f, 0.06f,
+    0.065f, 0.035f, 0.045f,
     0.30f,
-    0.15f, 0.38f
+    0.14f, 0.38f
 };
 
 // Light.
 inline constexpr Params kLight{
-    2.80f, 0.59f, 0.14f,
-    { 0.97f, 0.97f, 0.98f, 0.24f },
+    2.00f, 0.70f, 0.08f,
+    { 0.97f, 0.97f, 0.98f, 0.14f },
     0.96f,
-    0.11f, 13.0f,  0.03f, 10.0f,
-    0.13f, 0.09f,
+    0.085f, 0.045f, 0.055f,
     0.12f,
-    0.55f, 0.85f
+    0.53f, 0.82f
 };
 
 // --- The transfer, end to end -----------------------------------------------
@@ -149,7 +223,10 @@ inline constexpr Params kLight{
 // which is affine in L. These spell out its slope and intercept, because every
 // decision below is made in terms of those rather than the four knobs that
 // produce them. The reference measures 0.44 * L + 0.22 for Apple's light
-// material, fitted on the only channel whose input spans a useful range.
+// material, fitted on the only channel whose input spans a useful range. We now
+// run a steeper slope than that on purpose: the fit was taken through the
+// frosted interior of one screenshot, and the verdict on 0.3 was that the
+// shipped result reads opaque.
 
 constexpr float TintLuma(const Params& p) {
     return Luma(p.tint[0], p.tint[1], p.tint[2]);
@@ -168,16 +245,31 @@ constexpr float PanelLuma(const Params& p, float backdropLuma) {
     return EndGain(p) * backdropLuma + EndBias(p);
 }
 
+// How much of the desktop's contrast survives the material. The preview fails
+// the build below this, which is what makes "it looks opaque" a regression
+// somebody has to argue with rather than one that creeps back in.
+inline constexpr float kMinEndGain = 0.50f;
+
+// Bounds on the adapted bias.
+//
+// Both ends are load-bearing rather than round numbers. The dark theme over a
+// pure white desktop needs -0.178 to reach its ceiling, and the light theme over
+// pure black needs 0.458 to reach its floor. A clamp inside either of those
+// strands the panel outside its band, which the preview's band assertion then
+// fails, so these move whenever the gain or a target does.
+inline constexpr float kBiasFloor   = -0.20f;
+inline constexpr float kBiasCeiling =  0.47f;
+
 // Bend the bias so the panel lands inside [targetMin, targetMax].
 //
 // This is the step that makes one material work over a white wallpaper and a
 // black one. Only the bias moves: the gain sets how much of the desktop's
-// contrast survives, which is a property of the material, while the bias is
-// only where that window sits, which is a property of what is behind it today.
+// contrast survives, which is a property of the material, while the bias is only
+// where that window sits, which is a property of what is behind it today.
 //
 // `backdropLuma` is the mean luma of the captured frame under the panel, in the
-// same 0..1 sRGB-encoded space everything else here uses. With no captured
-// frame there is no mean, so the caller must use the base parameters unadapted.
+// same 0..1 sRGB-encoded space everything else here uses. With no captured frame
+// there is no mean, so the caller must use the base parameters unadapted.
 inline Params Adapt(const Params& base, float backdropLuma) {
     Params p = base;
 
@@ -191,19 +283,10 @@ inline Params Adapt(const Params& base, float backdropLuma) {
     else if (panel > p.targetMax)
         p.bias -= (panel - p.targetMax) / (1.0f - a);
 
-    // A negative bias is legitimate: pinning a bright wallpaper down to the dark
-    // theme's ceiling needs one, and a pure white desktop wants -0.079. The
-    // floor is -0.10 rather than -0.05 so that case is inside it; at -0.05 the
-    // clamp bound and left the dark panel about 0.02 above its ceiling.
-    //
-    // Nothing below the floor is dangerous anyway, because the matrix output is
-    // clamped at zero, so a more negative bias only crushes blacks.
-    //
-    // The clamp can still strand the panel outside its band if the gain is ever
-    // raised. That is what the preview's band assertion is for: it renders both
-    // themes over solid black and solid white and fails the build if either
-    // lands outside, so it cannot rot unnoticed.
-    p.bias = (std::min)(0.45f, (std::max)(-0.10f, p.bias));
+    // Nothing below the floor is dangerous, because the matrix output is clamped
+    // at zero, so a more negative bias only crushes blacks. The floor is there
+    // to stop a retune from wandering, not to protect anything.
+    p.bias = (std::min)(kBiasCeiling, (std::max)(kBiasFloor, p.bias));
     return p;
 }
 
@@ -229,27 +312,33 @@ inline float ContrastRatio(float srgbA, float srgbB) {
 
 inline constexpr float kMinTextContrast = 4.5f;
 
-// Mean alpha the inner glow adds over a shape `height` physical pixels tall.
+// Mean amount the lit edge adds over a shape `height` physical pixels tall.
 //
-// The falloff is linear from each edge, so each edge contributes alpha * span / 2
-// of area. Spans are clamped exactly as DrawInnerGlow clamps them, because on a
-// short shape (the app name's capsule is 28 logical pixels tall against a 13px
-// top span) the glow covers most of it and is not a rounding error.
+// The top run gets ambient plus the full lobe and the bottom run gets ambient
+// alone, both falling off linearly over the rim span, so each contributes its
+// amplitude times half the span. The filament adds its own amount over the 1.5px
+// band it occupies.
+//
+// Spans are clamped exactly as the generator clamps them, because on a short
+// shape (the app name's capsule is 28 logical pixels tall against a 13px span)
+// the lit edge covers most of it and is not a rounding error.
 //
 // This exists so the estimate of what the capsule will read at, which is made
 // before it is drawn, matches what actually gets drawn. Without it the estimate
 // is systematically too dark and the text shadow switches on when it is not
 // needed.
-inline float MeanGlowAlpha(const Params& p, float height, float dpiScale) {
+inline float MeanRimAlpha(const Params& p, float height, float dpiScale) {
     if (height <= 0.0f) return 0.0f;
 
-    const float topSpan    = (std::min)(p.glowTopSpan    * dpiScale, height * 0.45f);
-    const float bottomSpan = (std::min)(p.glowBottomSpan * dpiScale, height * 0.45f);
+    const float span = (std::min)(kRimSpan * dpiScale, height * 0.35f);
+    const float top    = (p.rimAmbient + p.rimLobe) * span * 0.5f;
+    const float bottom =  p.rimAmbient              * span * 0.5f;
+    const float line   =  p.specLine * (kSpecOuter - kSpecInner) * dpiScale;
 
-    return (p.glowTop * topSpan * 0.5f + p.glowBottom * bottomSpan * 0.5f) / height;
+    return (top + bottom + line) / height;
 }
 
-// White composited over `luma` at `alpha`, which is what the glow does.
+// White composited over `luma` at `alpha`, which is what the lit edge does.
 constexpr float LitBy(float luma, float alpha) {
     return luma * (1.0f - alpha) + alpha;
 }
@@ -302,7 +391,7 @@ constexpr float ColumnSum(const Matrix5x4& m, int column) {
 // Run one colour through the whole material: matrix, clamp, tint over.
 //
 // The clamp sits on the matrix output because that is where Direct2D's
-// D2D1_COLORMATRIX_PROP_CLAMP_OUTPUT does it, and a saturation of 2.0 drives
+// D2D1_COLORMATRIX_PROP_CLAMP_OUTPUT does it, and a saturation above 2 drives
 // strongly coloured pixels well out of range. Clamping only the final pixel
 // instead carries a fraction (1 - a) of the overshoot into the result.
 inline void Apply(const Params& p, const float in[3], float out[3]) {

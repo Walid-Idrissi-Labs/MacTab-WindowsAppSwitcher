@@ -42,7 +42,12 @@ const wchar_t* kDefaultIni =
     L";   mouse  = the display the mouse pointer is on\r\n"
     L";   main   = always the main display\r\n"
     L"; Also settable from the tray menu.\r\n"
-    L"PanelDisplay=active\r\n";
+    L"PanelDisplay=active\r\n"
+    L"\r\n"
+    L"; Bend the desktop at the panel's rim, the way a real pane of glass would.\r\n"
+    L"; Set to 0 if the edge of the panel looks doubled or smeared on your\r\n"
+    L"; machine; everything else about the glass stays as it is.\r\n"
+    L"GlassRefraction=1\r\n";
 
 std::wstring ReadString(const wchar_t* key, const wchar_t* fallback) {
     wchar_t buffer[128] = L"";
@@ -182,13 +187,15 @@ void Load() {
     g_settings.theme       = ReadString(L"Theme", L"auto");
     g_settings.groupByApp  = ReadInt(L"GroupByApp", 1) != 0;
     g_settings.panelDisplay = ParsePanelDisplay(ReadString(L"PanelDisplay", L"active"));
+    g_settings.glassRefraction = ReadInt(L"GlassRefraction", 1) != 0;
 
     MACTAB_DIAG("config: revealDelay %u ms, leftAltOnly %d, tile %d, theme %s, "
-                "groupByApp %d, panelDisplay %s",
+                "groupByApp %d, panelDisplay %s, glassRefraction %d",
                 g_settings.revealDelayMs, g_settings.leftAltOnly ? 1 : 0,
                 g_settings.tileSize, ToUtf8(g_settings.theme).c_str(),
                 g_settings.groupByApp ? 1 : 0,
-                ToUtf8(PanelDisplayKeyword(g_settings.panelDisplay)).c_str());
+                ToUtf8(PanelDisplayKeyword(g_settings.panelDisplay)).c_str(),
+                g_settings.glassRefraction ? 1 : 0);
 }
 
 bool SetPanelDisplay(PanelDisplay display) {

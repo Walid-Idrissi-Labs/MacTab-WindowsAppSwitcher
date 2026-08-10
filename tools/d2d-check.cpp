@@ -44,71 +44,77 @@ D2D1_MATRIX_5X4_F ToD2D(const glass::Matrix5x4& g) {
         g.m[4][0], g.m[4][1], g.m[4][2], g.m[4][3]);
 }
 
-void CheckMaterial(ID2D1DeviceContext* dc, ID2D1Bitmap1* captured) {
+void CheckMaterial(ID2D1DeviceContext* dc, ID2D1Bitmap1* captured, ID2D1Bitmap1* map) {
     ID2D1Effect *scale = nullptr, *blur = nullptr, *material = nullptr;
+    ID2D1Effect *place = nullptr, *lens = nullptr;
     dc->CreateEffect(CLSID_D2D1Scale, &scale);
     dc->CreateEffect(CLSID_D2D1GaussianBlur, &blur);
     dc->CreateEffect(CLSID_D2D1ColorMatrix, &material);
+    dc->CreateEffect(CLSID_D2D12DAffineTransform, &place);
+    dc->CreateEffect(CLSID_D2D1DisplacementMap, &lens);
 
     scale->SetInput(0, captured);
     scale->SetValue(D2D1_SCALE_PROP_SCALE, D2D1::Vector2F(0.25f, 0.25f));
     blur->SetInputEffect(0, scale);
-    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, 13.0f);
+    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, 7.5f);
     blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
 
     material->SetInputEffect(0, blur);
     material->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX,
                        ToD2D(glass::BuildMatrix(glass::kDark)));
     material->SetValue(D2D1_COLORMATRIX_PROP_CLAMP_OUTPUT, TRUE);
-    dc->DrawImage(material, D2D1_INTERPOLATION_MODE_LINEAR);
+
+    // The upscale and the panel-local placement, inside the graph rather than on
+    // the device context, because the displacement map is a second input and
+    // both inputs have to share a coordinate space.
+    place->SetInputEffect(0, material);
+    place->SetValue(D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX,
+                    D2D1::Matrix3x2F::Scale(4.0f, 4.0f) *
+                    D2D1::Matrix3x2F::Translation(-45.0f, -45.0f));
+    place->SetValue(D2D1_2DAFFINETRANSFORM_PROP_INTERPOLATION_MODE,
+                    D2D1_2DAFFINETRANSFORM_INTERPOLATION_MODE_LINEAR);
+
+    lens->SetInputEffect(0, place);
+    lens->SetInput(1, map);
+    lens->SetValue(D2D1_DISPLACEMENTMAP_PROP_SCALE,
+                   2.0f * glass::kMaxDisplacement);
+    lens->SetValue(D2D1_DISPLACEMENTMAP_PROP_X_CHANNEL_SELECT,
+                   D2D1_CHANNEL_SELECTOR_R);
+    lens->SetValue(D2D1_DISPLACEMENTMAP_PROP_Y_CHANNEL_SELECT,
+                   D2D1_CHANNEL_SELECTOR_G);
+
+    dc->DrawImage(lens, D2D1_INTERPOLATION_MODE_LINEAR);
 }
 
-void CheckRim(ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& toSurface, float height) {
+// The second tap: the same graph off a lighter blur, masked to the bezel band
+// and drawn over the frosted interior.
+void CheckRimTap(ID2D1DeviceContext* dc, ID2D1Effect* clear, ID2D1Bitmap1* rimMask) {
+    ID2D1Effect* masked = nullptr;
+    dc->CreateEffect(CLSID_D2D1AlphaMask, &masked);
+
+    masked->SetInputEffect(0, clear);
+    masked->SetInput(1, rimMask);
+    dc->DrawImage(masked, D2D1_INTERPOLATION_MODE_LINEAR);
+}
+
+void CheckRim(ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& toSurface,
+              ID2D1Bitmap1* edgeLight, float width, float height) {
     const glass::Params& m = glass::kDark;
 
-    // Dark outer stroke, source-over.
+    // Dark outer stroke, source-over, inset by half its own width.
     ID2D1SolidColorBrush* dark = nullptr;
     dc->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, m.rimOuterDark), &dark);
 
-    // Bright rim. The stop colours are the amount to ADD, hence grey levels at
-    // alpha 1 rather than white at an alpha, and the blend is ADD not over.
-    const D2D1_GRADIENT_STOP rimStops[] = {
-        { 0.0f, D2D1::ColorF(m.rimTop,    m.rimTop,    m.rimTop,    1.0f) },
-        { 1.0f, D2D1::ColorF(m.rimBottom, m.rimBottom, m.rimBottom, 1.0f) },
-    };
-    ID2D1GradientStopCollection* rimCollection = nullptr;
-    dc->CreateGradientStopCollection(rimStops, ARRAYSIZE(rimStops), &rimCollection);
-
-    ID2D1LinearGradientBrush* rim = nullptr;
-    dc->CreateLinearGradientBrush(
-        D2D1::LinearGradientBrushProperties(D2D1::Point2F(0.0f, 0.0f),
-                                            D2D1::Point2F(0.0f, height)),
-        rimCollection, &rim);
-
-    dc->SetTransform(D2D1::Matrix3x2F::Translation(2.0f, 2.0f) * toSurface);
-    dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD);
-    dc->DrawGeometry(nullptr, rim, 1.0f);
-    dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
-
-    // Inner glow: a four-stop vertical gradient filled over the whole shape,
-    // white at an alpha this time, source-over, inside the clip layer.
-    const D2D1_GRADIENT_STOP glowStops[] = {
-        { 0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, m.glowTop) },
-        { 0.1f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.0f) },
-        { 0.9f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.0f) },
-        { 1.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, m.glowBottom) },
-    };
-    ID2D1GradientStopCollection* glowCollection = nullptr;
-    dc->CreateGradientStopCollection(glowStops, ARRAYSIZE(glowStops), &glowCollection);
-
-    ID2D1LinearGradientBrush* glow = nullptr;
-    dc->CreateLinearGradientBrush(
-        D2D1::LinearGradientBrushProperties(D2D1::Point2F(0.0f, 0.0f),
-                                            D2D1::Point2F(0.0f, height)),
-        glowCollection, &glow);
-
-    dc->FillRectangle(D2D1::RectF(0.0f, 0.0f, 100.0f, height), glow);
+    dc->SetTransform(D2D1::Matrix3x2F::Translation(0.5f, 0.5f) * toSurface);
+    dc->DrawGeometry(nullptr, dark, 1.0f);
     dc->SetTransform(toSurface);
+
+    // The lit edge: a generated bitmap, premultiplied white with the amount to
+    // add in its alpha, blended ADD rather than over.
+    dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD);
+    dc->DrawBitmap(edgeLight, D2D1::RectF(0.0f, 0.0f, width, height), 1.0f,
+                   D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+    dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
 }
 
 void CheckLabel(IDWriteFactory* dwrite, ID2D1DeviceContext* dc, IDWriteTextFormat* format,

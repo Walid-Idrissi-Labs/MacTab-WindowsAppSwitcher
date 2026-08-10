@@ -28,6 +28,7 @@
 #include "image.h"
 #include "squircle.h"
 #include "glass.h"
+#include "glass_map.h"
 #include "panel_layout.h"
 
 using namespace mactab;
@@ -339,30 +340,155 @@ float MeanSaturation(const Bitmap& image) {
     return static_cast<float>(total / image.pixels.size());
 }
 
-// The inner glow: white at glowTop alpha on the top edge falling to zero over
-// glowTopSpan logical pixels, and the same at the bottom. One gradient fill in
-// panel.cpp, one loop here.
-void ApplyInnerGlow(Bitmap& body, const glass::Params& p) {
-    auto blend = [](uint8_t dst, float alpha) {
-        const float v = dst / 255.0f * (1.0f - alpha) + 1.0f * alpha;
-        return static_cast<uint8_t>((v > 1.0f ? 1.0f : v) * 255.0f + 0.5f);
+// How far outside the panel the refraction can reach, plus slack. The crop that
+// feeds ApplyRefraction has to carry at least this much margin or the rim pulls
+// in pixels that are not there.
+const int kRefractPad = static_cast<int>(glass::kMaxDisplacement) + 2;
+
+// Zero the decoded displacement, so the same shot can be rendered with and
+// without the lens. That comparison is the whole reason the bars wallpaper
+// exists, and it is what caught the single-tap version doing nothing at all.
+bool g_noRefract = false;
+
+// Refraction, by resampling the treated backdrop through the same encoded map
+// panel.cpp hands to D2D1DisplacementMap.
+//
+// Decoding the 8-bit map rather than calling Displacement() directly is
+// deliberate. The quantisation is part of what ships, so it should be part of
+// what is measured, and the encoding is the piece most likely to be wrong in a
+// way that only shows on a machine nobody here has.
+//
+// `source` is the treated backdrop with kRefractPad pixels of margin on every
+// side, because the whole point is that the rim pulls in content from outside
+// the panel.
+Bitmap ApplyRefraction(const Bitmap& source, const glass::Surface& surface,
+                       float* peakOut = nullptr) {
+    const int w = static_cast<int>(surface.width);
+    const int h = static_cast<int>(surface.height);
+
+    const Bitmap map   = glass::BuildDisplacementMap(surface);
+    const float  scale = 2.0f * glass::OpticsFor(surface).maxDisplacement;
+
+    // Bilinear, on opaque pixels, so there is no premultiply to worry about.
+    auto sample = [&](float fx, float fy) {
+        fx = std::min(std::max(fx, 0.0f), static_cast<float>(source.width  - 1));
+        fy = std::min(std::max(fy, 0.0f), static_cast<float>(source.height - 1));
+
+        const int   x0 = static_cast<int>(fx), y0 = static_cast<int>(fy);
+        const int   x1 = std::min(x0 + 1, source.width  - 1);
+        const int   y1 = std::min(y0 + 1, source.height - 1);
+        const float tx = fx - x0, ty = fy - y0;
+
+        auto mix = [&](int shift) {
+            const float a = static_cast<float>((source.At(x0, y0) >> shift) & 0xFF);
+            const float b = static_cast<float>((source.At(x1, y0) >> shift) & 0xFF);
+            const float c = static_cast<float>((source.At(x0, y1) >> shift) & 0xFF);
+            const float d = static_cast<float>((source.At(x1, y1) >> shift) & 0xFF);
+            const float top    = a + (b - a) * tx;
+            const float bottom = c + (d - c) * tx;
+            return static_cast<uint8_t>(top + (bottom - top) * ty + 0.5f);
+        };
+        return MakePixel(mix(16), mix(8), mix(0), 255);
     };
 
-    for (int y = 0; y < body.height; ++y) {
-        const float fromTop    = static_cast<float>(y);
-        const float fromBottom = static_cast<float>(body.height - 1 - y);
+    Bitmap out = Bitmap::Create(w, h);
+    float peak = 0.0f;
 
-        float a = 0.0f;
-        if (p.glowTopSpan > 0.0f && fromTop < p.glowTopSpan)
-            a += p.glowTop * (1.0f - fromTop / p.glowTopSpan);
-        if (p.glowBottomSpan > 0.0f && fromBottom < p.glowBottomSpan)
-            a += p.glowBottom * (1.0f - fromBottom / p.glowBottomSpan);
-        if (a <= 0.0f) continue;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const uint32_t encoded = map.At(x, y);
+            float dx = (RedOf(encoded)   / 255.0f - 0.5f) * scale;
+            float dy = (GreenOf(encoded) / 255.0f - 0.5f) * scale;
+            if (g_noRefract) { dx = 0.0f; dy = 0.0f; }
 
-        for (int x = 0; x < body.width; ++x) {
+            peak = std::max(peak, std::sqrt(dx * dx + dy * dy));
+            out.At(x, y) = sample(static_cast<float>(kRefractPad + x) + dx,
+                                  static_cast<float>(kRefractPad + y) + dy);
+        }
+    }
+
+    if (peakOut) *peakOut = peak;
+    return out;
+}
+
+// The two taps.
+//
+// The interior is refracted out of the fully blurred backdrop, the bezel band out
+// of a lightly blurred one, and the two are blended by the rim mask.
+//
+// This is the step that makes the lens visible at all. With the interior tap
+// alone the panel renders pixel for pixel the same with the displacement on and
+// with it off, because a 30px sigma leaves no edges to bend. Compare bars.png
+// against bars-flat.png with kRimTapSigma set to zero and it is the same image.
+//
+// `originX/originY` locate the shape inside the canvases, which have to carry at
+// least kRefractPad of margin around it on every side.
+Bitmap RefractTap(const Bitmap& sharpCanvas, const Bitmap& frostedCanvas,
+                  const glass::Surface& surface, const glass::Params& material,
+                  int originX, int originY, float* peakOut = nullptr) {
+    const int w = static_cast<int>(surface.width);
+    const int h = static_cast<int>(surface.height);
+
+    // Crop wider than the shape and treat that, because the rim samples from
+    // outside the outline: without this the band it pulls in would be raw
+    // wallpaper sitting against treated glass.
+    auto treated = [&](const Bitmap& from) {
+        Bitmap wide = Bitmap::Create(w + kRefractPad * 2, h + kRefractPad * 2);
+        for (int y = 0; y < wide.height; ++y)
+            for (int x = 0; x < wide.width; ++x)
+                wide.At(x, y) = from.At(originX + x - kRefractPad,
+                                        originY + y - kRefractPad);
+        ApplyMaterial(wide, material);
+        return wide;
+    };
+
+    Bitmap body = ApplyRefraction(treated(frostedCanvas), surface, peakOut);
+
+    Bitmap lightlyBlurred = sharpCanvas;
+    Blur(lightlyBlurred, glass::kRimTapSigma);
+    const Bitmap rim  = ApplyRefraction(treated(lightlyBlurred), surface);
+    const Bitmap mask = glass::BuildRimMask(surface);
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const float a = AlphaOf(mask.At(x, y)) / 255.0f;
+            if (a <= 0.0f) continue;
+
+            const uint32_t frosted = body.At(x, y);
+            const uint32_t clear   = rim.At(x, y);
+            auto mix = [&](uint8_t f, uint8_t c) {
+                return static_cast<uint8_t>(f + (c - f) * a + 0.5f);
+            };
+            body.At(x, y) = MakePixel(mix(RedOf(frosted),   RedOf(clear)),
+                                      mix(GreenOf(frosted), GreenOf(clear)),
+                                      mix(BlueOf(frosted),  BlueOf(clear)), 255);
+        }
+    }
+    return body;
+}
+
+// The lit edge, from the generator panel.cpp uses. The alpha carries the amount
+// to add, so applying it is one loop.
+void ApplyEdgeLight(Bitmap& body, const glass::Surface& surface,
+                    const glass::Params& p) {
+    const Bitmap light = glass::BuildEdgeLight(surface, p);
+    if (light.Empty()) return;
+
+    auto plus = [](uint8_t c, float amount) {
+        const int v = static_cast<int>(c + amount * 255.0f + 0.5f);
+        return static_cast<uint8_t>(v > 255 ? 255 : v);
+    };
+
+    const int w = std::min(body.width,  light.width);
+    const int h = std::min(body.height, light.height);
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const float a = AlphaOf(light.At(x, y)) / 255.0f;
+            if (a <= 0.0f) continue;
             uint32_t& px = body.At(x, y);
-            px = MakePixel(blend(RedOf(px), a), blend(GreenOf(px), a),
-                           blend(BlueOf(px), a), AlphaOf(px));
+            px = MakePixel(plus(RedOf(px), a), plus(GreenOf(px), a),
+                           plus(BlueOf(px), a), AlphaOf(px));
         }
     }
 }
@@ -388,7 +514,7 @@ void Check(bool condition, const char* what) {
 // transfer slope get judged. Black and white are the two ends the adaptive bias
 // exists for: with a fixed transfer the panel washes out over one and goes to a
 // slab over the other, and the app name stops being readable over at least one.
-enum class Wallpaper { Gradient, Black, White };
+enum class Wallpaper { Gradient, Black, White, Bars };
 
 const char* WallpaperName(Wallpaper kind) {
     switch (kind) {
@@ -400,6 +526,19 @@ const char* WallpaperName(Wallpaper kind) {
 
 Bitmap MakeWallpaper(int width, int height, Wallpaper kind) {
     Bitmap out = Bitmap::Create(width, height);
+
+    if (kind == Wallpaper::Bars) {
+        // High-contrast diagonal bars, wide enough to survive the 30px blur, so
+        // the rim has real structure to bend. Diagonal on purpose: horizontal or
+        // vertical bars would only exercise one axis of the displacement.
+        for (int y = 0; y < height; ++y)
+            for (int x = 0; x < width; ++x) {
+                const bool lightBar = ((x + y) / 75) % 2 == 0;
+                const uint8_t v = lightBar ? 230 : 25;
+                out.At(x, y) = MakePixel(v, v, v, 255);
+            }
+        return out;
+    }
 
     if (kind != Wallpaper::Gradient) {
         // Not perfectly flat. A dead-flat field would hide a blur that is too
@@ -451,36 +590,25 @@ Bitmap MakeWallpaper(int width, int height, Wallpaper kind) {
     return out;
 }
 
-// Rim. Dark stroke on the outermost opaque pixel, additive bright rim one pixel
-// inside it, matching the inset scheme panel.cpp strokes with.
+// The dark outer stroke, on the outermost opaque pixel, matching the inset
+// scheme panel.cpp strokes with. All that is left of the old rim: the bright
+// part of it is now the lit edge, which comes off the surface normal instead of
+// a vertical gradient.
 //
-// Shared by the panel and the app name's capsule, because panel.cpp's DrawGlass
-// draws the rim on both and a 28px-tall capsule is about a fifth edge band. A
-// preview that left it off the capsule was showing a shape the build does not
-// produce.
-void ApplyRim(Bitmap& body, const glass::Params& material) {
+// Shared by the panel and the app name's capsule, because panel.cpp draws it on
+// both. A preview that left it off the capsule was showing a shape the build
+// does not produce.
+void ApplyOuterStroke(Bitmap& body, const glass::Params& material) {
     const int w = body.width, h = body.height;
 
-    auto darken = [&](int x, int y, float alpha) {
+    auto darken = [&](int x, int y) {
         if (x < 0 || y < 0 || x >= w || y >= h) return;
+        const float a = material.rimOuterDark;
         uint32_t& px = body.At(x, y);
-        px = MakePixel(static_cast<uint8_t>(RedOf(px)   * (1.0f - alpha)),
-                       static_cast<uint8_t>(GreenOf(px) * (1.0f - alpha)),
-                       static_cast<uint8_t>(BlueOf(px)  * (1.0f - alpha)),
+        px = MakePixel(static_cast<uint8_t>(RedOf(px)   * (1.0f - a)),
+                       static_cast<uint8_t>(GreenOf(px) * (1.0f - a)),
+                       static_cast<uint8_t>(BlueOf(px)  * (1.0f - a)),
                        AlphaOf(px));
-    };
-    auto add = [&](int x, int y, float amount) {
-        if (x < 0 || y < 0 || x >= w || y >= h) return;
-        uint32_t& px = body.At(x, y);
-        auto plus = [&](uint8_t c) {
-            const int v = static_cast<int>(c + amount * 255.0f);
-            return static_cast<uint8_t>(v > 255 ? 255 : v);
-        };
-        px = MakePixel(plus(RedOf(px)), plus(GreenOf(px)), plus(BlueOf(px)), AlphaOf(px));
-    };
-    auto rimAt = [&](int y) {
-        const float t = (h > 1) ? static_cast<float>(y) / (h - 1) : 0.0f;
-        return material.rimTop + (material.rimBottom - material.rimTop) * t;
     };
 
     for (int y = 0; y < h; ++y) {
@@ -491,10 +619,8 @@ void ApplyRim(Bitmap& body, const glass::Params& material) {
             if (AlphaOf(body.At(x, y)) >= 200) { last = x; break; }
         if (first < 0) continue;
 
-        darken(first, y, material.rimOuterDark);
-        darken(last,  y, material.rimOuterDark);
-        add(first + 1, y, rimAt(y));
-        add(last  - 1, y, rimAt(y));
+        darken(first, y);
+        darken(last,  y);
     }
     for (int x = 0; x < w; ++x) {
         int first = -1, last = -1;
@@ -504,11 +630,24 @@ void ApplyRim(Bitmap& body, const glass::Params& material) {
             if (AlphaOf(body.At(x, y)) >= 200) { last = y; break; }
         if (first < 0) continue;
 
-        darken(x, first, material.rimOuterDark);
-        darken(x, last,  material.rimOuterDark);
-        add(x, first + 1, material.rimTop);
-        add(x, last  - 1, material.rimBottom);
+        darken(x, first);
+        darken(x, last);
     }
+}
+
+// Nearest-neighbour crop and magnify. The rim band is about 14 pixels wide, so
+// at 1:1 it is a smudge; this is what makes the lensing and the filament
+// something that can be judged by eye rather than only asserted on.
+Bitmap Zoom(const Bitmap& source, int x0, int y0, int w, int h, int factor) {
+    Bitmap out = Bitmap::Create(w * factor, h * factor);
+    for (int y = 0; y < out.height; ++y) {
+        for (int x = 0; x < out.width; ++x) {
+            const int sx = std::min(source.width  - 1, x0 + x / factor);
+            const int sy = std::min(source.height - 1, y0 + y / factor);
+            out.At(x, y) = source.At(std::max(0, sx), std::max(0, sy));
+        }
+    }
+    return out;
 }
 
 // What the render measured, so the numbers can be diffed against the reference
@@ -520,6 +659,7 @@ struct PanelStats {
     float satAfter     = 0.0f;
     float adaptedBias  = 0.0f;
     float labelContrast = 0.0f;
+    float peakDisplacement = 0.0f;   // largest rim displacement, physical px
 };
 
 // The whole panel at the real layout metrics, over a real blurred wallpaper,
@@ -546,6 +686,10 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
     Bitmap source = canvas;
     if (haveCapture) Blur(source, glass::kBlurSigma);
 
+    const glass::Surface surface{ static_cast<float>(panelW),
+                                  static_cast<float>(panelH),
+                                  m.radius, 1.0f };
+
     Bitmap body = Bitmap::Create(panelW, panelH);
     for (int y = 0; y < panelH; ++y)
         for (int x = 0; x < panelW; ++x)
@@ -565,8 +709,8 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
             stats->adaptedBias  = material.bias;
         }
 
-        ApplyMaterial(body, material);
-        ApplyInnerGlow(body, material);
+        body = RefractTap(canvas, source, surface, material, margin, margin,
+                          stats ? &stats->peakDisplacement : nullptr);
     } else {
         ApplyFallback(body, material);
     }
@@ -596,7 +740,8 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
         }
     }
 
-    ApplyRim(body, material);
+    ApplyOuterStroke(body, material);
+    ApplyEdgeLight(body, surface, material);
 
     CompositeOver(canvas, body, margin, margin);
 
@@ -659,19 +804,22 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
         const int pillX = margin + static_cast<int>(x);
         const int pillY = margin + static_cast<int>(m.panelHeight + m.labelGap);
 
+        // A capsule: corner extent is half the height.
+        const glass::Surface pillSurface{ static_cast<float>(pillW),
+                                          static_cast<float>(pillH),
+                                          static_cast<float>(pillH) * 0.5f, 1.0f };
+
         Bitmap pill = Bitmap::Create(pillW, pillH);
         for (int y = 0; y < pillH; ++y)
             for (int xx = 0; xx < pillW; ++xx)
                 pill.At(xx, y) = source.At(pillX + xx, pillY + y);
 
         if (haveCapture) {
-            ApplyMaterial(pill, material);
-            ApplyInnerGlow(pill, material);
+            pill = RefractTap(canvas, source, pillSurface, material, pillX, pillY);
         } else {
             ApplyFallback(pill, material);
         }
 
-        // A capsule: corner extent is half the height.
         {
             const int r = pillH / 2;
             const std::vector<uint8_t> corner = CornerMask(r, layout::kPanelCornerExponent);
@@ -690,7 +838,8 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
                 }
         }
 
-        ApplyRim(pill, material);
+        ApplyOuterStroke(pill, material);
+        ApplyEdgeLight(pill, pillSurface, material);
 
         if (stats) {
             const float pillLuma = MeanLuma(pill);
@@ -801,15 +950,117 @@ void RunSelfChecks() {
         // struct has that shape, so a shifted field trips at least one.
         Check(p->fallbackAlpha > p->tint[3],
               "the no-capture base coat is more opaque than the tint");
-        Check(p->rimTop > p->rimBottom, "the rim is brighter at the top");
+        Check(p->rimAmbient > p->rimLobe && p->specLine > p->rimLobe,
+              "the rim amplitudes keep their order");
         Check(p->gain > 0.0f && p->gain < 1.0f, "gain compresses rather than expands");
         Check(p->bias >= 0.0f && p->bias < 0.5f, "bias lifts the black point, not the whole image");
+
+        // The user's verdict on 0.3 was that the glass reads opaque. This is
+        // the number that was wrong, so this is the assertion that stops it
+        // coming back: at least half the desktop's contrast reaches the screen.
+        Check(glass::EndGain(*p) >= glass::kMinEndGain,
+              "the material lets enough of the desktop through to read as glass");
 
         // Saturation above 1 must actually push colours apart, not clamp to
         // identity. This is the failure mode CLSID_D2D1Saturation has.
         Check(p->saturation > 1.0f, "the material boosts saturation");
         Check(m.m[0][0] > glass::ColumnSum(m, 0),
               "a channel contributes more to itself than the whole column sums to");
+    }
+
+    // The optics.
+    //
+    // None of this can be looked at on a Windows machine before it ships, and
+    // the D2D side of it (channel selection, the scale property, whether input 1
+    // lines up with input 0) cannot be checked here at all. What CAN be checked
+    // is that the map being handed over is the right map, so this checks it
+    // hard.
+    {
+        const layout::Metrics m = layout::Compute(6, 2400.0f, 1.0f);
+        const glass::Surface surface{ m.panelWidth, m.panelHeight, m.radius, 1.0f };
+        const glass::Optics  optics = glass::OpticsFor(surface);
+
+        const Bitmap map   = glass::BuildDisplacementMap(surface);
+        const Bitmap light = glass::BuildEdgeLight(surface, glass::kDark);
+        const float  scale = 2.0f * optics.maxDisplacement;
+
+        // The interior is flat glass. Anything else there means the bezel is
+        // reaching all the way in, and the whole panel is a lens.
+        const int cx = map.width / 2, cy = map.height / 2;
+        Check(RedOf(map.At(cx, cy)) == 128 && GreenOf(map.At(cx, cy)) == 128,
+              "the middle of the panel displaces nothing");
+        Check(AlphaOf(map.At(cx, cy)) == 255,
+              "the map is opaque, so premultiplying cannot bend it");
+        Check(AlphaOf(light.At(cx, cy)) == 0, "the middle of the panel is not lit");
+
+        // The rim mask decides which of the two taps shows. Opaque out at the
+        // edge, gone by the interior. If it ever covered the whole panel the
+        // frosting would be gone and the switcher would be a window.
+        const Bitmap mask = glass::BuildRimMask(surface);
+        Check(AlphaOf(mask.At(cx, cy)) == 0,
+              "the middle of the panel is frosted, not clear");
+        Check(AlphaOf(mask.At(cx, 0)) == 255 && AlphaOf(mask.At(0, cy)) == 255,
+              "the bezel band shows the clear tap");
+        Check(AlphaOf(mask.At(cx, static_cast<int>(optics.bezel +
+                                                   glass::kRimTapFeather) + 2)) == 0,
+              "the clear tap has faded out by the end of its feather");
+
+        // Peak displacement. The physics puts it at 12.5 against a ceiling of
+        // 16; well under means a retune has quietly flattened the lens, and at
+        // the ceiling means it is clipping and the profile no longer has its
+        // shape.
+        float peak = 0.0f, peakAt = 0.0f;
+        for (float s = 0.05f; s < optics.bezel; s += 0.05f) {
+            const float d = glass::Displacement(s, optics);
+            if (d > peak) { peak = d; peakAt = s; }
+        }
+        Check(peak >= 0.6f * optics.maxDisplacement &&
+              peak <= 1.0f * optics.maxDisplacement,
+              "peak rim displacement sits between 0.6 and 1.0 of the ceiling");
+        Check(glass::Displacement(0.0f, optics) == 0.0f &&
+              glass::Displacement(optics.bezel, optics) == 0.0f,
+              "displacement is zero at both ends of the bezel");
+
+        // Past the peak it has to fall off monotonically. A sign slip in the
+        // profile's derivative gives a lens that gets stronger toward the
+        // middle, which would look like a smear rather than an edge.
+        bool monotone = true;
+        for (float s = peakAt + 0.5f; s + 0.25f < optics.bezel; s += 0.25f) {
+            if (glass::Displacement(s + 0.25f, optics) > glass::Displacement(s, optics) + 1e-4f)
+                monotone = false;
+        }
+        Check(monotone, "displacement falls off monotonically past its peak");
+
+        // The 8-bit round trip. This is what D2D actually reads, so an encoding
+        // that loses more than one step is a visible band at the rim.
+        float worst = 0.0f;
+        for (int x = 0; x < map.width; ++x) {
+            float nx = 0.0f, ny = 0.0f;
+            const float d = glass::SignedDistance(surface, x + 0.5f, 0.5f, nx, ny);
+            if (d >= 0.0f) continue;
+            const float want = glass::Displacement(-d, optics) * ny;
+            const float got  = (GreenOf(map.At(x, 0)) / 255.0f - 0.5f) * scale;
+            worst = std::max(worst, std::fabs(want - got));
+        }
+        Check(worst <= 2.0f * optics.maxDisplacement / 255.0f,
+              "the map round trips within one quantisation step");
+        std::printf("optics: bezel %.1f  depth %.1f  peak %.1f at %.1f in  "
+                    "round trip %.3f px\n",
+                    static_cast<double>(optics.bezel),
+                    static_cast<double>(optics.depth),
+                    static_cast<double>(peak), static_cast<double>(peakAt),
+                    static_cast<double>(worst));
+
+        // The overhead lobe. Sampled four pixels in, past the filament, so this
+        // measures the field alone. The reference has the top rim at +33 luma
+        // against +22 at the sides.
+        for (const glass::Params* p : { &glass::kDark, &glass::kLight }) {
+            const Bitmap lit = glass::BuildEdgeLight(surface, *p);
+            const float top  = AlphaOf(lit.At(lit.width / 2, 4));
+            const float side = AlphaOf(lit.At(4, lit.height / 2));
+            Check(side > 0.0f && top / side >= 1.4f && top / side <= 1.7f,
+                  "the top of the rim is lit about 1.5 times the sides");
+        }
     }
 
     // Glyph tiles must stay legible: the generated background has to contrast
@@ -972,6 +1223,58 @@ int main(int argc, char** argv) {
                   "panel luma lands inside the adaptive band");
             Check(stats.labelContrast >= glass::kMinTextContrast,
                   "app name clears 4.5:1 against its capsule");
+
+            // Vibrancy, against the reference rather than against taste. The
+            // macOS switcher measures relative saturation 0.737 outside the
+            // panel and 0.642 inside, a ratio of 0.87. Only the light material
+            // has a reference, and only a wallpaper with real chroma can measure
+            // it, so this is the one shot that can check it.
+            if (&shot.material == &glass::kLight &&
+                shot.wallpaper == Wallpaper::Gradient && stats.satBefore > 0.0f) {
+                const float ratio = stats.satAfter / stats.satBefore;
+                Check(ratio >= 0.84f && ratio <= 0.90f,
+                      "the light material lands on the reference saturation ratio");
+            }
+        }
+
+        // The rim over structure that survives the blur, with the lens on and
+        // off, top edge and left edge, both at 4x.
+        //
+        // This pair is the only honest test of the refraction. Every other
+        // wallpaper here is smooth enough that bending it changes nothing you
+        // can see, which is exactly how the first version of this shipped a lens
+        // that did nothing: bars-top-4x.png and bars-top-flat-4x.png came out
+        // identical.
+        for (int off = 0; off < 2; ++off) {
+            g_noRefract = (off == 1);
+            const Bitmap panel = RenderPanel(glass::kDark, cases,
+                                             static_cast<int>(std::size(cases)),
+                                             1, true, Wallpaper::Bars, nullptr, 6);
+            const char* topName  = off ? "/bars-top-flat-4x.png"  : "/bars-top-4x.png";
+            const char* leftName = off ? "/bars-left-flat-4x.png" : "/bars-left-4x.png";
+            if (!WritePng(outDir + topName,  Zoom(panel, 330, 40, 150, 80, 4)) ||
+                !WritePng(outDir + leftName, Zoom(panel, 40, 90, 110, 100, 4)) ||
+                !WritePng(outDir + (off ? "/bars-flat.png" : "/bars.png"), panel)) {
+                std::fprintf(stderr, "failed to write bars crops\n");
+                ++failures;
+            }
+        }
+        g_noRefract = false;
+
+
+        // The top-left corner at 4x, both themes. The numbers above say the map
+        // is right; this says whether the result looks like glass, which is the
+        // question that started all of this and the one no assertion answers.
+        for (int i = 0; i < 2; ++i) {
+            const glass::Params& p = i ? glass::kLight : glass::kDark;
+            const Bitmap panel = RenderPanel(p, cases,
+                                             static_cast<int>(std::size(cases)),
+                                             1, true, Wallpaper::Gradient, nullptr, 6);
+            const Bitmap rim = Zoom(panel, 40, 40, 110, 90, 4);
+            if (!WritePng(outDir + (i ? "/rim-light-4x.png" : "/rim-dark-4x.png"), rim)) {
+                std::fprintf(stderr, "failed to write the rim crop\n");
+                ++failures;
+            }
         }
     }
 
