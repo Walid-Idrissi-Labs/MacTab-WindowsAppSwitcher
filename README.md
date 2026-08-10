@@ -315,7 +315,7 @@ useful with the log attached than without it.
 3. **AltGr.** On a French or Arabic layout, typing `@ # { } [ ]` must not open
    the switcher. This is the guard most likely to need tuning; loosen it with
    `LeftAltOnly` in `settings.ini`.
-4. **The switcher list.** Tray → *Log current switcher list*, and compare
+4. **The switcher list.** Tray, then *Log current switcher list*, and compare
    against what Windows' Alt+Tab shows. Minimised windows, a UWP app such as
    Settings, and a second virtual desktop are the interesting cases.
 5. **Which capture path won.** The log names it: `desktop-duplication` is the
