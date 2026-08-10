@@ -50,10 +50,17 @@ jobs:
         run: |
           # Version comes from the tag so the exe's VERSIONINFO and the version
           # the installer registers in Add/Remove Programs cannot disagree.
-          cmake -S . -B build -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DMACTAB_VERSION_STRING=${{ steps.ver.outputs.numeric }}
+          #
+          # Every -D is passed as a QUOTED single token. Unquoted, PowerShell's
+          # native-argument parsing mangles a value like 0.1.0 and CMake ends up
+          # receiving "0" — which fails the version check in a way that looks
+          # like the tag was wrong rather than the shell.
+          $ver = '${{ steps.ver.outputs.numeric }}'
+          Write-Host "Building MacTab $ver"
+          cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=Release" "-DMACTAB_VERSION_STRING=$ver"
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
           cmake --build build
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
           if (-not (Test-Path build/bin/MacTab.exe)) { throw "MacTab.exe missing" }
 
       - name: Ensure Inno Setup
@@ -71,12 +78,15 @@ jobs:
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $version = '${{ steps.ver.outputs.version }}'
+          $numeric = '${{ steps.ver.outputs.numeric }}'
+          # Quoted for the same reason as the cmake arguments above.
           & $iscc `
-            /DMyAppVersion=${{ steps.ver.outputs.version }} `
-            /DMyAppVersionNumeric=${{ steps.ver.outputs.numeric }} `
-            /DSourceDir=$PWD\build\bin `
-            /O$PWD\dist `
-            installer\MacTab.iss
+            "/DMyAppVersion=$version" `
+            "/DMyAppVersionNumeric=$numeric" `
+            "/DSourceDir=$PWD\build\bin" `
+            "/O$PWD\dist" `
+            "installer\MacTab.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
 
       - name: Stage artifacts + checksums
