@@ -30,10 +30,41 @@
 #define D2D1_SCALE_PROP_SCALE ((D2D1_PROPERTY)0)
 #endif
 
+#include "com.h"
 #include "glass.h"
+#include "image.h"
 #include "panel_layout.h"
 
 using namespace mactab;
+
+// Mirrors panel.cpp's UploadBitmap, and uses ComPtr rather than raw pointers on
+// purpose.
+//
+// The rest of this file holds raw interface pointers, which is fine for checking
+// call shapes but misses a whole class of mistake: ComPtr in src/com.h is
+// hand-rolled and deliberately small, so it has no assignment from nullptr and
+// no implicit conversion to bool. Writing `ptr = nullptr` compiles against every
+// other smart pointer in the world and fails here, which is exactly what got
+// through to CI once.
+ComPtr<ID2D1Bitmap1> CheckUpload(ID2D1DeviceContext* dc, Bitmap image) {
+    ComPtr<ID2D1Bitmap1> result;
+    if (image.Empty()) return result;
+
+    PremultiplyInPlace(image);
+
+    const D2D1_SIZE_U size{ static_cast<UINT32>(image.width),
+                            static_cast<UINT32>(image.height) };
+    D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_NONE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+    if (FAILED(dc->CreateBitmap(size, image.pixels.data(),
+                                static_cast<UINT32>(image.width * 4),
+                                &props, result.Put()))) {
+        result.Reset();
+    }
+    return result;
+}
 
 D2D1_MATRIX_5X4_F ToD2D(const glass::Matrix5x4& g) {
     return D2D1::Matrix5x4F(
@@ -84,6 +115,38 @@ void CheckMaterial(ID2D1DeviceContext* dc, ID2D1Bitmap1* captured, ID2D1Bitmap1*
                    D2D1_CHANNEL_SELECTOR_G);
 
     dc->DrawImage(lens, D2D1_INTERPOLATION_MODE_LINEAR);
+}
+
+// The tap builder, in ComPtr terms. Same reason as CheckUpload: this is where
+// the returns-an-empty-ComPtr and the ternary-on-a-ComPtr live, and both of
+// those are hand-rolled behaviour rather than anything the standard guarantees.
+ComPtr<ID2D1Effect> CheckTap(ID2D1DeviceContext* dc, ID2D1Effect* scale,
+                             ID2D1Bitmap1* map, float sigma) {
+    ComPtr<ID2D1Effect> blur, matrix, place;
+    dc->CreateEffect(CLSID_D2D1GaussianBlur, blur.Put());
+    dc->CreateEffect(CLSID_D2D1ColorMatrix, matrix.Put());
+    dc->CreateEffect(CLSID_D2D12DAffineTransform, place.Put());
+    if (!blur || !matrix || !place) return {};
+
+    blur->SetInputEffect(0, scale);
+    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, sigma * 0.25f);
+    matrix->SetInputEffect(0, blur.Get());
+    place->SetInputEffect(0, matrix.Get());
+    if (!map) return place;
+
+    ComPtr<ID2D1Effect> lens;
+    dc->CreateEffect(CLSID_D2D1DisplacementMap, lens.Put());
+    if (!lens) return place;
+
+    lens->SetInputEffect(0, place.Get());
+    lens->SetInput(1, map);
+    return lens;
+}
+
+void CheckTapChoice(ID2D1DeviceContext* dc, ID2D1Effect* scale, ID2D1Bitmap1* map) {
+    ComPtr<ID2D1Effect> frosted =
+        scale ? CheckTap(dc, scale, map, glass::kBlurSigma) : ComPtr<ID2D1Effect>{};
+    if (frosted) dc->DrawImage(frosted.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
 }
 
 // The second tap: the same graph off a lighter blur, masked to the bezel band

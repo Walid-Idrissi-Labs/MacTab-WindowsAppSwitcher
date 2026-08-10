@@ -712,7 +712,7 @@ ComPtr<ID2D1Bitmap1> UploadBitmap(ID2D1DeviceContext* dc, Bitmap image) {
     if (FAILED(dc->CreateBitmap(size, image.pixels.data(),
                                 static_cast<UINT32>(image.width * 4),
                                 &props, result.Put()))) {
-        result = nullptr;
+        result.Reset();
     }
     return result;
 }
