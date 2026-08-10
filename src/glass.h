@@ -253,10 +253,14 @@ inline constexpr float kMinEndGain = 0.50f;
 // Bounds on the adapted bias.
 //
 // Both ends are load-bearing rather than round numbers. The dark theme over a
-// pure white desktop needs -0.178 to reach its ceiling, and the light theme over
+// pure white desktop needs -0.193 to reach its ceiling, and the light theme over
 // pure black needs 0.458 to reach its floor. A clamp inside either of those
 // strands the panel outside its band, which the preview's band assertion then
 // fails, so these move whenever the gain or a target does.
+//
+// The floor has 0.007 of margin, which is thin: a dark gain above 0.628 needs it
+// moved. The band assertion will catch that, but it reports the panel landing in
+// the wrong place rather than naming the constant, so look here first.
 inline constexpr float kBiasFloor   = -0.20f;
 inline constexpr float kBiasCeiling =  0.47f;
 

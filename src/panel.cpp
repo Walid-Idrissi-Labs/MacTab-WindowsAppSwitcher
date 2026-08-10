@@ -927,6 +927,9 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
             scale->SetInput(0, captured.Get());
             scale->SetValue(D2D1_SCALE_PROP_SCALE,
                             D2D1::Vector2F(kBlurDownscale, kBlurDownscale));
+            // Cached, or the downsample runs once per tap. D2D only keeps an
+            // intermediate when it is asked to, and this one has two consumers.
+            scale->SetValue(D2D1_PROPERTY_CACHED, TRUE);
         }
 
         // Where the capture ACTUALLY landed, not the margin we asked for: near a
@@ -939,12 +942,20 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
         if (scale && config::Current().glassRefraction)
             map = UploadBitmap(dc, glass::BuildDisplacementMap(glassSurface));
 
-        // One tap: blur, treat, place at this piece's origin, then bend.
+        // One tap: blur, treat, place at this piece's origin, and for the rim,
+        // bend.
         //
-        // A lambda because the two taps differ in exactly one number. Written out
-        // twice they drift, and a rim built from a different material than the
-        // interior it sits in reads as a colour seam rather than as a bug.
-        auto buildTap = [&](float sigma) -> ComPtr<ID2D1Effect> {
+        // A lambda because the two taps differ in one number and one flag.
+        // Written out twice they drift, and a rim built from a different material
+        // than the interior it sits in reads as a colour seam rather than as a
+        // bug.
+        //
+        // Only the rim tap refracts. Running the lens on the frosted tap as well
+        // is a provable no-op: everywhere the map is not neutral the rim mask is
+        // fully opaque, so every displaced pixel is painted over, and in the
+        // feather band past the bezel the map is neutral anyway. It is a whole
+        // extra pass over the panel for pixels nobody ever sees.
+        auto buildTap = [&](float sigma, bool refract) -> ComPtr<ID2D1Effect> {
             ComPtr<ID2D1Effect> blur, matrix, place;
             dc->CreateEffect(CLSID_D2D1GaussianBlur, blur.Put());
             dc->CreateEffect(CLSID_D2D1ColorMatrix, matrix.Put());
@@ -987,11 +998,31 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
             place->SetValue(D2D1_2DAFFINETRANSFORM_PROP_INTERPOLATION_MODE,
                             D2D1_2DAFFINETRANSFORM_INTERPOLATION_MODE_LINEAR);
 
-            if (!map) return place;
+            if (!refract || !map) return place;
+
+            // Extend the placed backdrop by repeating its edge pixels, before
+            // anything samples outside it.
+            //
+            // Not optional, and the reason is the screen edge. StartCapture asks
+            // for the panel plus a blur margin and the grab is clamped to the
+            // monitor, so a panel wide enough to reach the edge comes back with
+            // no margin at all on that side. The lens then samples up to 12px
+            // past the placed image, where a HARD-border blur leaves transparent
+            // black, and that whole run of rim renders as tint over nothing: a
+            // dark band exactly where the glass should be. Clamping turns that
+            // into a smear of the edge pixel, which is what the blur does at the
+            // same boundary anyway.
+            ComPtr<ID2D1Effect> extend;
+            dc->CreateEffect(CLSID_D2D1Border, extend.Put());
+            if (!extend) return place;
+
+            extend->SetInputEffect(0, place.Get());
+            extend->SetValue(D2D1_BORDER_PROP_EDGE_MODE_X, D2D1_BORDER_EDGE_MODE_CLAMP);
+            extend->SetValue(D2D1_BORDER_PROP_EDGE_MODE_Y, D2D1_BORDER_EDGE_MODE_CLAMP);
 
             // Refraction. The map is panel-local and starts at the origin, which
-            // is exactly where the step above puts the backdrop, so the two line
-            // up by construction rather than by arithmetic.
+            // is exactly where the placement step puts the backdrop, so the two
+            // line up by construction rather than by arithmetic.
             //
             // The effect samples at p + scale * (channel - 0.5), so a scale of
             // twice the ceiling makes the encoding in glass_map.h exact.
@@ -999,7 +1030,7 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
             dc->CreateEffect(CLSID_D2D1DisplacementMap, lens.Put());
             if (!lens) return place;
 
-            lens->SetInputEffect(0, place.Get());
+            lens->SetInputEffect(0, extend.Get());
             lens->SetInput(1, map.Get());
             lens->SetValue(D2D1_DISPLACEMENTMAP_PROP_SCALE,
                            2.0f * Scaled(glass::kMaxDisplacement));
@@ -1007,10 +1038,23 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
                            D2D1_CHANNEL_SELECTOR_R);
             lens->SetValue(D2D1_DISPLACEMENTMAP_PROP_Y_CHANNEL_SELECT,
                            D2D1_CHANNEL_SELECTOR_G);
-            return lens;
+
+            // Bound it again. The clamp above makes the image infinite, and an
+            // infinite output rect reaching DrawImage is a question nobody here
+            // can answer on real hardware. This piece is the only part that ever
+            // shows.
+            ComPtr<ID2D1Effect> bound;
+            dc->CreateEffect(CLSID_D2D1Crop, bound.Put());
+            if (!bound) return lens;
+
+            bound->SetInputEffect(0, lens.Get());
+            bound->SetValue(D2D1_CROP_PROP_RECT,
+                            D2D1::Vector4F(0.0f, 0.0f, width, height));
+            return bound;
         };
 
-        ComPtr<ID2D1Effect> frosted = scale ? buildTap(kBlurSigma) : ComPtr<ID2D1Effect>{};
+        ComPtr<ID2D1Effect> frosted =
+            scale ? buildTap(kBlurSigma, false) : ComPtr<ID2D1Effect>{};
         if (frosted) {
             dc->DrawImage(frosted.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
 
@@ -1026,7 +1070,7 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
             if (map) rimMask = UploadBitmap(dc, glass::BuildRimMask(glassSurface));
 
             ComPtr<ID2D1Effect> clear, masked;
-            if (rimMask) clear = buildTap(glass::kRimTapSigma);
+            if (rimMask) clear = buildTap(glass::kRimTapSigma, true);
             if (clear)   dc->CreateEffect(CLSID_D2D1AlphaMask, masked.Put());
 
             if (masked) {

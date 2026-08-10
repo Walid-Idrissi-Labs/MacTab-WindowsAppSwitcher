@@ -1051,6 +1051,28 @@ void RunSelfChecks() {
                     static_cast<double>(peak), static_cast<double>(peakAt),
                     static_cast<double>(worst));
 
+        // The app name's capsule, which is the shape that breaks these.
+        //
+        // 28 logical pixels tall against a 14px bezel and a 6px feather, so
+        // without the clamps in OpticsFor the clear tap never fades out at all
+        // and the whole capsule is a window while the panel above it is frosted.
+        // Checked at both DPIs because the clamps are ratios and the constants
+        // are not.
+        for (float dpi : { 1.0f, 2.0f }) {
+            const glass::Surface capsule{ 268.0f * dpi, 28.0f * dpi,
+                                          14.0f * dpi, dpi };
+            const Bitmap capsuleMask = glass::BuildRimMask(capsule);
+            const int midY = capsuleMask.height / 2;
+            Check(AlphaOf(capsuleMask.At(capsuleMask.width / 2, midY)) == 0,
+                  "the app name's capsule keeps a frosted core");
+
+            const glass::Optics co = glass::OpticsFor(capsule);
+            Check(co.bezel + co.feather < capsule.height * 0.5f,
+                  "the capsule's clear band stops short of its own middle");
+            Check(glass::Displacement(co.bezel * 0.05f, co) <= co.maxDisplacement,
+                  "the capsule's lens stays under its ceiling");
+        }
+
         // The overhead lobe. Sampled four pixels in, past the filament, so this
         // measures the field alone. The reference has the top rim at +33 luma
         // against +22 at the sides.

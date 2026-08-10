@@ -17,10 +17,11 @@
 // the material nobody can look at before shipping into the one place nothing can
 // check it.
 //
-// Both are built on the CPU once per gesture. That is affordable because the
-// backdrop is a frozen frame: the panel is drawn once and then sits there. Only
-// the band within a bezel width of the edge needs the arithmetic, which on a
-// 1900x350 physical panel is about 150k pixels, and the interior is a fill.
+// Built on the CPU once per gesture, which is affordable because the backdrop is
+// a frozen frame: the panel is drawn once and then sits there. Every pixel goes
+// through the distance function, so a 1900x350 physical panel costs about two
+// million square roots, a few milliseconds, and only the band within a bezel
+// width of the edge does more work than that.
 
 namespace mactab::glass {
 
@@ -43,6 +44,7 @@ struct Surface {
 struct Optics {
     float bezel = 0.0f;
     float depth = 0.0f;
+    float feather = 0.0f;
     float rimSpan = 0.0f;
     float specInner = 0.0f;
     float specOuter = 0.0f;
@@ -54,8 +56,20 @@ inline Optics OpticsFor(const Surface& s) {
     const float full     = kBezelWidth * s.dpiScale;
 
     Optics o;
-    o.bezel = (std::min)(full, shortest * 0.35f);
-    o.depth = (full > 0.0f) ? kGlassDepth * s.dpiScale * (o.bezel / full) : 0.0f;
+
+    // 0.30 rather than 0.35, and the feather scales with the bezel, so that a
+    // short shape keeps a frosted core. The two together have to stop short of
+    // the middle: the capsule is 28 logical pixels tall, and at 0.35 with an
+    // unscaled 6px feather the clear tap still read 30% at the capsule's own
+    // midline, which put the app name on a pane of sigma-8 wallpaper while the
+    // panel above it stayed frosted. At 0.30 the fade is done 2px short of the
+    // middle.
+    o.bezel = (std::min)(full, shortest * 0.30f);
+
+    const float ratio = (full > 0.0f) ? (o.bezel / full) : 0.0f;
+    o.depth   = kGlassDepth * s.dpiScale * ratio;
+    o.feather = (std::max)(1.0f, kRimTapFeather * s.dpiScale * ratio);
+
     o.rimSpan = (std::min)(kRimSpan * s.dpiScale, shortest * 0.35f);
     o.specInner = kSpecInner * s.dpiScale;
     o.specOuter = kSpecOuter * s.dpiScale;
@@ -67,10 +81,15 @@ inline Optics OpticsFor(const Surface& s) {
 //
 // Circular corners, not the n = 2.24 superellipse the panel is actually clipped
 // to. At a 62px corner the two outlines differ by at most 1.7px, at the 45
-// degree point, which is a third of a blurred pixel once the backdrop has been
-// through a 30px sigma. An implicit superellipse SDF needs numerical
-// differentiation per pixel to get a normal out of it, for a difference nothing
-// can see.
+// degree point, and an implicit superellipse SDF needs numerical differentiation
+// per pixel to get a normal out of it.
+//
+// For the displacement that is free: the backdrop it bends has been through a
+// 30px sigma, so 1.7px is a fraction of one blurred pixel. For the lit edge it
+// is not free, because that edge is sharp. Expect the rim light to sit up to
+// 1.7px inboard of the outline at the four corner diagonals and nowhere else,
+// which should read as the corner falling off rather than as a defect. If it
+// does not, this is the function to fix, and only the corner quadrants need it.
 inline float SignedDistance(const Surface& s, float x, float y,
                             float& nx, float& ny) {
     const float px = x - s.width  * 0.5f;
@@ -199,8 +218,6 @@ inline Bitmap BuildRimMask(const Surface& s) {
     if (w <= 0 || h <= 0) return {};
 
     const Optics o = OpticsFor(s);
-    const float feather = (std::max)(1.0f, kRimTapFeather * s.dpiScale);
-
     Bitmap mask = Bitmap::Create(w, h, 0);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
@@ -209,7 +226,7 @@ inline Bitmap BuildRimMask(const Surface& s) {
 
             float a = 1.0f;
             if (inside > o.bezel)
-                a = (std::max)(0.0f, 1.0f - (inside - o.bezel) / feather);
+                a = (std::max)(0.0f, 1.0f - (inside - o.bezel) / o.feather);
             if (a <= 0.0f) continue;
 
             const int q = static_cast<int>(a * 255.0f + 0.5f);

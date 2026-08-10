@@ -130,17 +130,27 @@ ComPtr<ID2D1Effect> CheckTap(ID2D1DeviceContext* dc, ID2D1Effect* scale,
 
     blur->SetInputEffect(0, scale);
     blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, sigma * 0.25f);
+    blur->SetValue(D2D1_PROPERTY_CACHED, TRUE);
     matrix->SetInputEffect(0, blur.Get());
     place->SetInputEffect(0, matrix.Get());
     if (!map) return place;
 
-    ComPtr<ID2D1Effect> lens;
+    ComPtr<ID2D1Effect> extend, lens, bound;
+    dc->CreateEffect(CLSID_D2D1Border, extend.Put());
     dc->CreateEffect(CLSID_D2D1DisplacementMap, lens.Put());
-    if (!lens) return place;
+    dc->CreateEffect(CLSID_D2D1Crop, bound.Put());
+    if (!extend || !lens || !bound) return place;
 
-    lens->SetInputEffect(0, place.Get());
+    extend->SetInputEffect(0, place.Get());
+    extend->SetValue(D2D1_BORDER_PROP_EDGE_MODE_X, D2D1_BORDER_EDGE_MODE_CLAMP);
+    extend->SetValue(D2D1_BORDER_PROP_EDGE_MODE_Y, D2D1_BORDER_EDGE_MODE_CLAMP);
+
+    lens->SetInputEffect(0, extend.Get());
     lens->SetInput(1, map);
-    return lens;
+
+    bound->SetInputEffect(0, lens.Get());
+    bound->SetValue(D2D1_CROP_PROP_RECT, D2D1::Vector4F(0.0f, 0.0f, 100.0f, 50.0f));
+    return bound;
 }
 
 void CheckTapChoice(ID2D1DeviceContext* dc, ID2D1Effect* scale, ID2D1Bitmap1* map) {
