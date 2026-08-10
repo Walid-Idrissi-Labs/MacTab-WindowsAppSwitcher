@@ -6,7 +6,10 @@ Windows' Alt+Tab is a per-window grid. macOS' Cmd-Tab is a per-*application* row
 of large squircle icons on a floating glass panel, ordered most-recently-used.
 MacTab is the second thing, on Windows.
 
-**Status: early. Not usable yet.** See [Milestones](#milestones).
+**Status: feature-complete, unverified on hardware.** Every milestone is
+implemented, but the project is developed on macOS and has never been compiled
+or run on Windows. Treat the first build as a bring-up exercise — see
+[What to check first](#what-to-check-first).
 
 ## Goals
 
@@ -98,19 +101,57 @@ A clean run means "this will probably compile", not "this works".
 ## Milestones
 
 - [x] **M0** Skeleton — build system, tray, diagnostics logging
-- [ ] **M1** Input capture — low-level keyboard hook, Alt state machine
-- [ ] **M2** Window model — enumeration, app grouping, MRU
-- [ ] **M3** Panel — Composition setup, tiered backdrop, squircle mask
-- [ ] **M4** Icons — extraction, squircle processing, caching
-- [ ] **M5** Visual fidelity — labels, highlight, animations, DPI
-- [ ] **M6** Actions — Q/W/H, mouse, per-app window cycling
-- [ ] **M7** Config — settings, icon theme packs, autostart
-- [ ] **M8** Performance pass
-- [ ] **M9** Installer and uninstaller
+- [x] **M1** Input capture — low-level keyboard hook, Alt state machine
+- [x] **M2** Window model — enumeration, app grouping, MRU
+- [x] **M3** Panel — Composition, captured-and-blurred backdrop, squircle
+- [x] **M4** Icons — extraction, squircle processing, caching
+- [x] **M5** Visual fidelity — labels, highlight, spring animation, DPI
+- [x] **M6** Actions — Q/W/H, per-app window cycling
+- [x] **M7** Config — settings, icon theme packs, autostart
+- [x] **M8** Performance pass
+- [x] **M9** Installer and uninstaller
 
 Ordered by risk rather than by user-visible value: the two pieces most likely to
 not work at all (the keyboard hook and the backdrop) come first, so they fail
 early rather than after everything is built on top of them.
+
+## What to check first
+
+None of this has run on Windows. Build it, launch with `--diag`, and work down
+this list — the log names the code path taken at each decision point.
+
+1. **Does Alt+Tab get intercepted at all?** Windows' own switcher must never
+   appear. If it does, the hook was refused — the log says why.
+2. **Quick tap vs. hold.** A fast Alt+Tab must switch with no panel and must
+   *never* log `gesture: reveal`. Holding Alt must log it exactly once.
+3. **AltGr.** On a French or Arabic layout, typing `@ # { } [ ]` must not open
+   the switcher. This is the guard most likely to need tuning; loosen it with
+   `LeftAltOnly` in `settings.ini`.
+4. **The switcher list.** Tray → *Log current switcher list*, and compare
+   against what Windows' Alt+Tab shows. Minimised windows, a UWP app such as
+   Settings, and a second virtual desktop are the interesting cases.
+5. **Which capture path won.** The log names it: `desktop-duplication` is the
+   good one, `gdi-bitblt` is the fallback, `none` means a flat tint. Hybrid-GPU
+   laptops and HDR displays are the likely failures.
+6. **Does the panel appear within a frame?** `gesture: reveal ... shown in N ms`.
+   This is the one performance claim that could not be verified from
+   documentation, so it is measured rather than assumed.
+
+## Performance
+
+Everything below is a design property rather than a measurement, since nothing
+has been profiled on real hardware yet. The `--diag` log carries timings for
+each of these so the claims can be checked rather than trusted.
+
+| Claim | How it is achieved |
+|---|---|
+| No timers at rest | The only timer is the reveal delay, armed on the first Tab and killed on commit. |
+| No polling | MRU comes from one `EVENT_SYSTEM_FOREGROUND` hook. Dead windows are pruned lazily rather than by subscribing to `EVENT_OBJECT_DESTROY`, which fires for every menu and tooltip in the session. |
+| One-frame reveal | The window, devices and visual tree are built once at startup and never destroyed. Showing is `SetWindowPos` plus property writes. |
+| No CPU during animation | Fades, scale and the selection spring are Composition animations, which run on DWM's thread. |
+| Bounded memory | Icon tiles are an LRU capped at 96 entries (~6 MB at 128px). |
+| No blocking on the reveal path | Icon work is queued to a worker; missing tiles render as placeholders and fill in on arrival. |
+| No redistributables | `windowsapp.lib` is part of Windows; the CRT is linked statically. |
 
 ## Known limitations
 
@@ -124,7 +165,15 @@ early rather than after everything is built on top of them.
 - **Antivirus false positives.** A global low-level keyboard hook is a heuristic
   detection trigger. The binary is not packed or compressed, which helps;
   code-signing would help more.
+- **The Start menu renders above the panel.** Since Windows 8, `HWND_TOPMOST`
+  lives in a lower z-band than the Start menu and shell flyouts, and no amount
+  of `SetWindowPos` crosses that boundary from a normal process. The legitimate
+  fix is the same `uiAccess` that fixes elevated windows. Nothing renders above
+  true exclusive-fullscreen apps either; borderless-windowed is fine.
 - **Windows 10 pre-1803 is unsupported** — that is the Composition floor.
+- **HDR displays** fall back to GDI capture. Desktop duplication hands back
+  scRGB float rather than BGRA when HDR is on and does not convert, so the
+  duplication path bails rather than showing wrong colours.
 
 ## Licence
 
