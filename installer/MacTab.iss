@@ -29,7 +29,7 @@
 #define MyAppName       "MacTab"
 #define MyAppExeName    "MacTab.exe"
 #define MyAppPublisher  "Walid Idrissi Labs"
-#define MyAppURL        "https://github.com/Walid-Idrissi-Labs/WindowsAppSwitcher"
+#define MyAppURL        "https://github.com/Walid-Idrissi-Labs/MacTab-WindowsAppSwitcher"
 ; FROZEN, never regenerate:
 #define MyAppId         "{E2C26C45-D5E7-4EFD-A956-4168F7C3E0D6}"
 ; Must match kHostWindowClass in src/app.h exactly. If these drift, the graceful
