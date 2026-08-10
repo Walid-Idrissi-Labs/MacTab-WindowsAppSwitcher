@@ -101,11 +101,13 @@ add_executable(MacTab WIN32
     src/main.cpp
     src/activate.cpp
     src/app_identity.cpp
+    src/com.cpp
     src/common.cpp
     src/diag.cpp
     src/foreground_history.cpp
     src/hotkey.cpp
     src/icon_source.cpp
+    src/icons.cpp
     src/image.cpp
     src/squircle.cpp
     src/tray.cpp
