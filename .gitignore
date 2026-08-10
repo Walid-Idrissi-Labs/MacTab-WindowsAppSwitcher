@@ -10,3 +10,4 @@ out/
 *.idb
 CMakeSettings.json
 .DS_Store
+build-preview/

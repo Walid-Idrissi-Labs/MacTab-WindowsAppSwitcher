@@ -356,12 +356,22 @@ bool ClaimSingleInstance() {
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR cmdLine, _In_ int) {
     using namespace mactab;
 
-    // Deliberately no CoInitializeEx here.
+    // COM is initialised by the panel layer (M3), not here.
     //
-    // The Composition layer (M3) creates its DispatcherQueueController on this
-    // thread with DQTAT_COM_ASTA, which initialises the apartment itself and
-    // fails if the thread is already in an STA. Shell APIs that need COM run on
-    // the icon worker thread, which initialises its own apartment.
+    // Worth spelling out because the obvious reading of Microsoft's own Win32
+    // Composition sample is wrong: it passes DQTAT_COM_ASTA to
+    // CreateDispatcherQueueController, but that field is documented as relevant
+    // ONLY when threadType is DQTYPE_THREAD_DEDICATED. With
+    // DQTYPE_THREAD_CURRENT — which is what a Win32 app uses — it is ignored,
+    // so it does not initialise anything. The thread must therefore be put in
+    // an STA explicitly (winrt::init_apartment(apartment_type::single_threaded))
+    // with DQTAT_COM_NONE, because a Compositor has thread affinity and WinRT
+    // activation on an uninitialised thread silently lands in the MTA.
+    //
+    // Nothing before that point needs COM: identity resolution deliberately
+    // uses GetApplicationUserModelId rather than the shell property store, and
+    // shell APIs that do need COM run on the icon worker, which initialises its
+    // own apartment.
 
     g_app.instance      = instance;
     g_app.diagRequested = HasFlag(cmdLine, L"--diag");
