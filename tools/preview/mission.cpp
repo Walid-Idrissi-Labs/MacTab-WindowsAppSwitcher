@@ -45,8 +45,12 @@ namespace {
 // gets to arrange them in. The strip across the top is where the spaces go.
 constexpr int kScreenW    = 2560;
 constexpr int kScreenH    = 1440;
-constexpr int kSpacesBarH = 200;
+constexpr int kSpacesBarH = 176;   // the full-width glass bar
+constexpr int kChipH      = 92;    // one desktop miniature inside it
+constexpr int kChipGap    = 18;
 constexpr int kMargin     = 64;
+constexpr int kBadge      = 44;    // the app icon on a window
+constexpr int kTitleH     = 26;
 
 int g_failures = 0;
 
@@ -171,6 +175,39 @@ void StrokeRect(Bitmap& b, int x, int y, int w, int h, int thickness, uint32_t c
     FillRect(b, x + w - thickness, y, thickness, h, colour);
 }
 
+// The app icon badge and the window's name, under the tile.
+//
+// Both are drawn into one screen-sized surface in the real thing rather than
+// one surface per window, so this mirrors the composition rather than the
+// mechanism: what matters here is whether the result is readable and whether
+// two neighbouring titles collide.
+void DrawChrome(Bitmap& b, const mission::Placement& p, int index, int group,
+                const char* title) {
+    const int cx = static_cast<int>(p.x + p.w * 0.5f);
+    const int bottom = static_cast<int>(p.y + p.h);
+
+    // Centred on the bottom edge, half in and half out, which is what makes it
+    // read as belonging to the window rather than floating under it.
+    FillDisc(b, static_cast<float>(cx), static_cast<float>(bottom),
+             kBadge * 0.5f + 3.0f, MakePixel(18, 18, 22, 210));
+    FillDisc(b, static_cast<float>(cx), static_cast<float>(bottom),
+             kBadge * 0.5f, GroupColour(group));
+
+    char mark[4];
+    std::snprintf(mark, sizeof(mark), "%d", group);
+    DrawWord(b, mark, cx - WordWidth(mark, 3) / 2, bottom - 10, 3,
+             MakePixel(255, 255, 255, 255));
+
+    const int tw = WordWidth(title, 2);
+    const int tx = cx - tw / 2;
+    const int ty = bottom + kBadge / 2 + 10;
+
+    FillRect(b, tx - 10, ty - 6, tw + 20, kTitleH, MakePixel(0, 0, 0, 150));
+    DrawWord(b, title, tx, ty, 2, MakePixel(236, 236, 242, 255));
+
+    (void)index;
+}
+
 // One tile, drawn to look enough like a window that the arrangement can be
 // read: a title bar in the app's colour, a body, and the window's index.
 void DrawTile(Bitmap& b, const mission::Placement& p, int index, int group) {
@@ -198,17 +235,39 @@ Bitmap Render(const Desktop& desktop, const mission::Result& result,
               const mission::Params& params) {
     Bitmap out = Bitmap::Create(kScreenW, kScreenH, MakePixel(24, 26, 32, 255));
 
-    // The spaces strip, as a placeholder so the region the tiles get is honest
-    // about what is left over.
-    FillRect(out, 0, 0, kScreenW, kSpacesBarH, MakePixel(38, 40, 48, 255));
-    for (int i = 0; i < 3; ++i) {
-        const int tw = 260, th = 146;
-        const int tx = kScreenW / 2 - (tw + 24) * 3 / 2 + i * (tw + 24);
-        FillRect(out, tx, (kSpacesBarH - th) / 2, tw, th,
-                 MakePixel(58, 62, 74, 255));
-        if (i == 1)
-            StrokeRect(out, tx, (kSpacesBarH - th) / 2, tw, th, 3,
-                       MakePixel(230, 230, 240, 255));
+    // The spaces bar: full width, glass, with the miniatures centred and the
+    // add button round and small at the far right.
+    FillRect(out, 0, 0, kScreenW, kSpacesBarH, MakePixel(42, 44, 52, 235));
+    FillRect(out, 0, kSpacesBarH - 1, kScreenW, 1, MakePixel(255, 255, 255, 40));
+
+    {
+        const int count = 3;
+        const int chipW = kChipH * kScreenW / kScreenH;
+        const int run   = chipW * count + kChipGap * (count - 1);
+        int x = (kScreenW - run) / 2;
+        const int y = (kSpacesBarH - kTitleH - kChipH) / 2;
+
+        for (int i = 0; i < count; ++i) {
+            FillRect(out, x, y, chipW, kChipH, MakePixel(70, 74, 88, 255));
+            if (i == 1) StrokeRect(out, x, y, chipW, kChipH, 3,
+                                   MakePixel(235, 235, 245, 255));
+
+            char name[16];
+            std::snprintf(name, sizeof(name), "DESKTOP %d", i + 1);
+            DrawWord(out, name, x + chipW / 2 - WordWidth(name, 2) / 2,
+                     y + kChipH + 6, 2, MakePixel(214, 216, 226, 255));
+            x += chipW + kChipGap;
+        }
+
+        // All the way to the right, round, and smaller than a desktop.
+        const float r = kChipH * 0.28f;
+        const float ax = static_cast<float>(kScreenW - kMargin) - r;
+        const float ay = static_cast<float>(y) + kChipH * 0.5f;
+        FillDisc(out, ax, ay, r, MakePixel(255, 255, 255, 46));
+        FillRect(out, static_cast<int>(ax - r * 0.45f), static_cast<int>(ay - 2),
+                 static_cast<int>(r * 0.9f), 4, MakePixel(240, 240, 248, 255));
+        FillRect(out, static_cast<int>(ax - 2), static_cast<int>(ay - r * 0.45f),
+                 4, static_cast<int>(r * 0.9f), MakePixel(240, 240, 248, 255));
     }
 
     // The region outline, so overflow is visible and not only asserted.
@@ -218,11 +277,25 @@ Bitmap Render(const Desktop& desktop, const mission::Result& result,
     const int rh = kScreenH - kSpacesBarH - kMargin * 2;
     StrokeRect(out, rx, ry, rw, rh, 1, MakePixel(70, 74, 88, 255));
 
+    static const char* kTitles[] = {
+        "MAIL", "SAFARI", "NOTES", "TERMINAL", "MUSIC", "PAGES",
+        "XCODE", "FINDER", "MAPS", "PHOTOS", "CALENDAR", "PREVIEW",
+    };
+
     for (size_t i = 0; i < result.tiles.size(); ++i) {
         mission::Placement p = result.tiles[i];
         p.x += rx;
         p.y += ry;
         DrawTile(out, p, static_cast<int>(i), desktop.windows[i].group);
+    }
+
+    // Chrome after every tile, so a badge is never buried under a neighbour.
+    for (size_t i = 0; i < result.tiles.size(); ++i) {
+        mission::Placement p = result.tiles[i];
+        p.x += rx;
+        p.y += ry;
+        DrawChrome(out, p, static_cast<int>(i), desktop.windows[i].group,
+                   kTitles[i % (sizeof(kTitles) / sizeof(kTitles[0]))]);
     }
 
     char caption[200];
@@ -343,7 +416,8 @@ int main(int argc, char** argv) {
     const std::string outDir = (argc > 1) ? argv[1] : ".";
 
     const float regionW = static_cast<float>(kScreenW - kMargin * 2);
-    const float regionH = static_cast<float>(kScreenH - kSpacesBarH - kMargin * 2);
+    const float regionH = static_cast<float>(kScreenH - kSpacesBarH - kMargin * 2 -
+                                             kBadge / 2 - kTitleH);
 
     std::printf("\nmission control layout, region %.0fx%.0f\n\n", regionW, regionH);
     std::printf("%-10s %7s %7s %7s %7s %7s\n",
