@@ -90,6 +90,20 @@ bool IsRunning();
 // lock/unlock: the secure desktop means we may never see the Alt release.
 void AbortGesture();
 
+// End the gesture WITHOUT posting a cancellation.
+//
+// For paths that have already committed by other means — clicking a tile — so
+// the hook stops waiting for an Alt release without a second commit/cancel
+// arriving behind it and injecting a duplicate key-up.
+void EndGestureQuietly();
+
+// The Alt key that opened the current gesture, or 0 if none is in flight.
+//
+// Written on the hook thread, read on the UI thread. It is a single WORD whose
+// only readers use it to pick which key-up to synthesise, so a torn read is not
+// possible and a stale one is harmless.
+WORD GestureAltKey();
+
 // Release a modifier the hook swallowed.
 //
 // Because we consume the real Alt-up, the system still believes Alt is held.

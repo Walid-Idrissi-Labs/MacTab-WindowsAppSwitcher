@@ -55,6 +55,15 @@ constexpr int kBlurMarginPx = 48;
 // invisible under a tint.
 constexpr float kBlurDownscale = 0.25f;
 
+bool SystemUsesLightTheme() {
+    DWORD value = 0, size = sizeof(value);
+    if (::RegGetValueW(HKEY_CURRENT_USER,
+                       L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                       L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS)
+        return value != 0;
+    return false;   // Windows defaults to dark for apps when the key is absent
+}
+
 // "auto" follows the system app theme; "dark" and "light" pin it. Reading the
 // setting here rather than only at startup means a change takes effect on the
 // next gesture instead of the next launch.
@@ -63,15 +72,6 @@ bool ResolveLightTheme() {
     if (choice == L"light") return true;
     if (choice == L"dark")  return false;
     return SystemUsesLightTheme();
-}
-
-bool SystemUsesLightTheme() {
-    DWORD value = 0, size = sizeof(value);
-    if (::RegGetValueW(HKEY_CURRENT_USER,
-                       L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-                       L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS)
-        return value != 0;
-    return false;   // Windows defaults to dark for apps when the key is absent
 }
 
 struct Theme {
@@ -147,6 +147,7 @@ struct Panel::Impl {
     HMONITOR monitor = nullptr;
     float    shadowMarginPx = 0.0f;
     float    bakedShadowScale = 0.0f;
+    int      laidOutCount     = -1;   // skips a redundant second Layout per gesture
 
     bool CreateDevices();
     bool CreatePanelWindow();
@@ -213,8 +214,17 @@ static bool GuardPanel(Panel::Impl& impl, const char* what, F&& fn) {
     } catch (const winrt::hresult_error& e) {
         const HRESULT hr = e.code();
         MACTAB_FAIL("panel: %s threw 0x%08lX", what, static_cast<unsigned long>(hr));
-        if (IsDeviceLost(hr))
-            impl.RecoverDevices();
+        if (IsDeviceLost(hr)) {
+            // Recovery creates WinRT objects too, so it can throw — and a throw
+            // from inside a catch handler lands right back in std::terminate,
+            // which is the exact path this guard exists to close.
+            try {
+                impl.RecoverDevices();
+            } catch (...) {
+                MACTAB_FAIL("panel: device recovery failed; panel disabled");
+                impl.ready = false;
+            }
+        }
         return false;
     } catch (...) {
         MACTAB_FAIL("panel: %s threw a non-WinRT exception", what);
@@ -304,9 +314,9 @@ LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                                static_cast<WPARAM>(index), 0);
         } else if (index != impl->hoveredIndex) {
             impl->hoveredIndex = index;
-            if (index >= 0 && impl->notifyWindow)
+            if (impl->notifyWindow)
                 ::PostMessageW(impl->notifyWindow, impl->hoverMessage,
-                               static_cast<WPARAM>(index), 0);
+                               static_cast<WPARAM>(static_cast<INT_PTR>(index)), 0);
         }
         return 0;
     }
@@ -476,6 +486,7 @@ void Panel::Shutdown() {
         impl.selectionVisual = nullptr;
         impl.backdropVisual  = nullptr;
         impl.shadowVisual    = nullptr;
+        impl.content         = nullptr;
         impl.root            = nullptr;
 
         impl.backdropSurface = nullptr;
@@ -740,7 +751,11 @@ void Panel::Impl::BakeBackdrop() {
             std::future_status::ready) {
             lastFrame = pendingCapture.get();
         } else {
+            // Do NOT fall through to lastFrame here: after the first gesture
+            // that holds a previous desktop, and a visibly outdated blur reads
+            // worse than no blur at all.
             MACTAB_WARN("panel: capture not ready at reveal, using flat tint");
+            lastFrame = {};
         }
         pendingCapture = {};
     }
@@ -911,6 +926,7 @@ void Panel::Impl::BakeLabel() {
 // ---------------------------------------------------------------------------
 
 void Panel::Impl::Layout(int count) {
+    laidOutCount = count;
     // Follow the foreground window's monitor, which matches Alt+Tab semantics
     // better than following the cursor.
     const HWND foreground = ::GetForegroundWindow();
@@ -1063,7 +1079,10 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
     impl.items    = std::move(items);
     impl.selected = selectedIndex;
 
-    impl.Layout(static_cast<int>(impl.items.size()));
+    // PrepareLayout has usually just run for this exact count; laying out
+    // again would mean a second SetWindowPos per gesture for nothing.
+    if (impl.laidOutCount != static_cast<int>(impl.items.size()))
+        impl.Layout(static_cast<int>(impl.items.size()));
 
     // Reuse existing tile visuals; only create or trim the difference. Rebuilding
     // the whole tree per invocation would blow the one-frame budget.
@@ -1112,11 +1131,13 @@ void Panel::UpdateIcon(const std::wstring& key, const Bitmap& icon) {
     Impl& impl = *m_impl;
 
     GuardPanel(impl, "UpdateIcon", [&] {
+        // Every matching item, not just the first. In window mode all tiles
+        // share the expanded app's key, and with GroupByApp=0 every window of
+        // an app does too — returning early left all but one as placeholders.
         for (size_t i = 0; i < impl.items.size(); ++i) {
             if (impl.items[i].key != key) continue;
             impl.items[i].icon = icon;
             impl.UploadIcon(i);
-            return;
         }
     });
 }
@@ -1155,7 +1176,13 @@ void Panel::Show() {
     impl.root.StartAnimation(L"Scale", grow);
     });
 
-    if (!ok) return;
+    if (!ok) {
+        // The window was already shown before the throw, so it is sitting there
+        // topmost at zero opacity, swallowing every click over the middle of the
+        // screen — and Hide() would never run, because `visible` is still false.
+        ::ShowWindow(impl.hwnd, SW_HIDE);
+        return;
+    }
     impl.visible = true;
 }
 
@@ -1180,6 +1207,10 @@ void Panel::Hide() {
     // being used by the next gesture.
     if (impl.pendingCapture.valid())
         impl.pendingCapture = {};
+
+    // The next gesture captures its own desktop; keeping this would risk a
+    // stale blur if that capture is late.
+    impl.lastFrame = {};
 }
 
 int Panel::Impl::HitTestScreen(POINT screenPoint) const {

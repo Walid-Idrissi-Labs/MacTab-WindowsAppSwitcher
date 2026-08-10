@@ -49,14 +49,19 @@ struct AppIdentity {
 // higher-integrity process we are not allowed to open).
 //
 // The returned pointer is owned by the cache and stays valid until
-// ClearIdentityCache(); do not store it across gestures.
+// ClearIdentityCache(); do not store it across gestures. UI thread only — the
+// cache is unsynchronised by design, which is why nothing else writes to it.
 const AppIdentity* ResolveApp(HWND hwnd);
 
 // Drop cached identities. Cheap, and worth doing on session change.
 void ClearIdentityCache();
 
-// Fill in a packaged app's friendly display name. Called from the icon worker,
-// which has COM available. No-op if the key is unknown or already named.
-void SetDisplayName(const std::wstring& key, const std::wstring& displayName);
+// NOTE: there is deliberately no SetDisplayName here.
+//
+// Packaged apps' friendly names come from the shell, which only the icon worker
+// can reach — but publishing them back into this cache would mean writing the
+// map from that thread while the UI thread inserts, erases and rehashes it
+// during every BuildSwitcherList, and while callers hold raw pointers into it.
+// The worker owns those names instead; ask icons::DisplayName().
 
 } // namespace mactab

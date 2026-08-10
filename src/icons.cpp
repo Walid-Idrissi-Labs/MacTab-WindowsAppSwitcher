@@ -256,13 +256,11 @@ Bitmap ProduceTile(const Request& request) {
     }
 
     if (!displayName.empty()) {
-        {
-            std::lock_guard<std::mutex> guard(g_lock);
-            g_displayNames[request.key] = displayName;
-        }
-        // Also publish it to the identity cache, which deliberately stays
-        // COM-free and so cannot read package manifests itself.
-        SetDisplayName(request.key, displayName);
+        // Kept here, under our own lock, rather than pushed into the identity
+        // cache: that map is unsynchronised and is mutated (and rehashed) on
+        // the UI thread throughout every gesture.
+        std::lock_guard<std::mutex> guard(g_lock);
+        g_displayNames[request.key] = displayName;
     }
 
     return MakeIconTile(source, request.size);

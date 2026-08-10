@@ -21,6 +21,7 @@ constexpr ULONG_PTR kInjectionTag = 0x4D414354;   // 'MACT'
 constexpr UINT TM_STOP   = WM_USER + 1;
 constexpr UINT TM_RELOAD = WM_USER + 2;
 constexpr UINT TM_ABORT  = WM_USER + 3;
+constexpr UINT TM_END_QUIET = WM_USER + 4;
 
 enum class State {
     Idle,     // no gesture in flight
@@ -37,6 +38,9 @@ DWORD   g_threadId   = 0;
 HWND    g_uiWindow   = nullptr;
 Options g_options{};
 volatile LONG g_running = 0;
+
+// Mirrors g_gestureAltVk for UI-thread readers; see GestureAltKey().
+volatile LONG g_sharedAltVk = 0;
 
 // --- Hook-thread state ------------------------------------------------------
 HHOOK    g_hook          = nullptr;
@@ -65,6 +69,15 @@ void EndGesture(UINT message) {
     PostToUi(message, g_gestureAltVk);
     g_state        = State::Idle;
     g_gestureAltVk = 0;
+    ::InterlockedExchange(&g_sharedAltVk, 0);
+}
+
+// Same, but tells the UI thread nothing — for callers that have already acted.
+void EndGestureSilent() {
+    KillRevealTimer();
+    g_state        = State::Idle;
+    g_gestureAltVk = 0;
+    ::InterlockedExchange(&g_sharedAltVk, 0);
 }
 
 // Is the Alt that should drive the switcher currently held?
@@ -107,7 +120,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         // every Alt mnemonic in every app.
         if (down && vk == VK_TAB && SwitcherAltHeld() && !KeyDown(VK_CONTROL)) {
             g_state        = State::Armed;
-            g_gestureAltVk = KeyDown(VK_LMENU) ? VK_LMENU : VK_RMENU;
+            g_gestureAltVk = static_cast<WORD>(KeyDown(VK_LMENU) ? VK_LMENU : VK_RMENU);
+            ::InterlockedExchange(&g_sharedAltVk, g_gestureAltVk);
 
             PostToUi(WM_MACTAB_BEGIN, KeyDown(VK_SHIFT) ? 1u : 0u);
 
@@ -259,6 +273,11 @@ DWORD WINAPI HookThreadProc(LPVOID param) {
                     MACTAB_FAIL("hotkey: reload failed to reinstall the hook");
                 continue;
             }
+            if (msg.message == TM_END_QUIET) {
+                if (g_state != State::Idle)
+                    EndGestureSilent();
+                continue;
+            }
             if (msg.message == TM_ABORT) {
                 if (g_state != State::Idle) {
                     MACTAB_DIAG("hotkey: aborting in-flight gesture");
@@ -361,6 +380,15 @@ bool Reload() {
 void AbortGesture() {
     if (!g_threadId) return;
     ::PostThreadMessageW(g_threadId, TM_ABORT, 0, 0);
+}
+
+void EndGestureQuietly() {
+    if (!g_threadId) return;
+    ::PostThreadMessageW(g_threadId, TM_END_QUIET, 0, 0);
+}
+
+WORD GestureAltKey() {
+    return static_cast<WORD>(::InterlockedCompareExchange(&g_sharedAltVk, 0, 0));
 }
 
 bool IsRunning() {

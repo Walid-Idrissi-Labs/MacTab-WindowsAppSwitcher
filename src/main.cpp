@@ -462,7 +462,7 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_MACTAB_HOVER: {
         // Hovering moves the selection, exactly as arrowing does.
-        const int index = static_cast<int>(wParam);
+        const int index = static_cast<int>(static_cast<INT_PTR>(wParam));
         Gesture& g = g_app.gesture;
         if (g.active && index >= 0 && index != g.index) {
             g.index = index;
@@ -474,12 +474,17 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_MACTAB_CLICK: {
         // Clicking commits immediately. Alt is usually still physically down,
         // so the same neutralisation the keyboard path uses still applies.
-        const int index = static_cast<int>(wParam);
+        const int index = static_cast<int>(static_cast<INT_PTR>(wParam));
         Gesture& g = g_app.gesture;
         if (g.active && index >= 0) {
             g.index = index;
-            hotkey::AbortGesture();      // stop the hook waiting for an Alt release
-            CommitGesture(VK_MENU);
+            // End the hook's gesture without a cancellation coming back: that
+            // would inject a second Alt-up behind the one CommitGesture already
+            // synthesised. Use the key that actually opened the gesture rather
+            // than the generic VK_MENU, so the release is symmetric.
+            const WORD altKey = hotkey::GestureAltKey();
+            hotkey::EndGestureQuietly();
+            CommitGesture(altKey);
         }
         return 0;
     }

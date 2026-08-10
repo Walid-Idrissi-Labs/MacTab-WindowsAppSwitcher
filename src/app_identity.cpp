@@ -243,14 +243,4 @@ void ClearIdentityCache() {
     g_cache.clear();
 }
 
-void SetDisplayName(const std::wstring& key, const std::wstring& displayName) {
-    if (key.empty() || displayName.empty()) return;
-
-    for (auto& [pid, entry] : g_cache) {
-        (void)pid;
-        if (entry.identity.key == key && entry.identity.displayName.empty())
-            entry.identity.displayName = displayName;
-    }
-}
-
 } // namespace mactab
