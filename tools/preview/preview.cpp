@@ -408,7 +408,8 @@ Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCou
     const int panelH = static_cast<int>(m.panelHeight);
     const int margin = 60;
 
-    Bitmap canvas = MakeWallpaper(panelW + margin * 2, panelH + margin * 2);
+    const int band = static_cast<int>(std::ceil(m.labelGap + m.labelHeight));
+    Bitmap canvas = MakeWallpaper(panelW + margin * 2, panelH + band + margin * 2);
 
     // Backdrop: blur a copy of the wallpaper, crop the panel's own rect out of
     // it, run the material over it. Blurring the whole canvas and cropping is
@@ -551,10 +552,12 @@ Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCou
         Bitmap bar = Bitmap::Create(static_cast<int>(labelWidth),
                                     static_cast<int>(m.labelHeight * 0.5f));
         const uint8_t v = (material.tint[0] > 0.5f) ? 20 : 245;
-        for (uint32_t& px : bar.pixels) px = MakePixel(v, v, v, 90);
+        for (uint32_t& px : bar.pixels) px = MakePixel(v, v, v, 150);
 
+        // BELOW the glass, not inside it. The panel has uniform padding, so
+        // there is no bottom band to put text in.
         CompositeOver(canvas, bar, margin + static_cast<int>(x),
-                      margin + static_cast<int>(m.padding + m.tileSize + 4.0f));
+                      margin + static_cast<int>(m.panelHeight + m.labelGap));
     }
 
     return canvas;

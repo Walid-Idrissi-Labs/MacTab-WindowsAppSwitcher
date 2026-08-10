@@ -40,15 +40,25 @@ namespace mactab::layout {
 //   radius, two ways = 0.305 * 103 + 34.5   = 65.9
 //                    = 214 * (103 / 350)    = 63.0
 //
-// 62 splits those and gives 62/172 = 0.36 against the icon band's height, which
-// is what the screenshot measures (214/588 = 0.364).
+// 62 splits those and gives 62/172 = 0.36 against the panel height, which is
+// what the screenshot measures (214/588 = 0.364).
+//
+// The padding is uniform on all four sides, deliberately. The reference panel is
+// 588 tall around a 348 icon, so 120 above and 120 below: there is no taller
+// bottom band. That means the app name cannot live inside the glass, and it is
+// drawn below the panel instead, which is why kLabelHeight is not part of
+// panelHeight any more.
 
 // Logical pixels at 96 DPI.
 inline constexpr float kTileSize     = 128.0f;
 inline constexpr float kTileGap      = 6.0f;
 inline constexpr float kPanelPadding = 22.0f;
 inline constexpr float kPanelRadius  = 62.0f;   // NOT DWM's 8px; this is the point
+
+// The app name, below the panel rather than inside it. kLabelGap is the space
+// between the glass and the top of the text.
 inline constexpr float kLabelHeight  = 28.0f;
+inline constexpr float kLabelGap     = 10.0f;
 
 // Superellipse exponent for the panel outline. Measured, see above. The icon
 // tiles use 5, which is right for a shape whose corner extent is half its own
@@ -66,11 +76,15 @@ inline constexpr float kSelectionInset = 0.06f;
 struct Metrics {
     float tileSize    = kTileSize;
     float panelWidth  = 0.0f;
-    float panelHeight = 0.0f;
+    float panelHeight = 0.0f;      // the glass only; the label sits below it
     float padding     = kPanelPadding;
     float gap         = kTileGap;
     float radius      = kPanelRadius;
     float labelHeight = kLabelHeight;
+    float labelGap    = kLabelGap;
+
+    // Everything the window has to contain: the glass, the gap, the label.
+    float TotalHeight() const { return panelHeight + labelGap + labelHeight; }
 
     // Left edge of tile `index`, relative to the panel's origin.
     float TileX(int index) const {
@@ -92,11 +106,13 @@ inline Metrics Compute(int count, float availableWidth, float dpiScale,
     m.gap         = kTileGap      * dpiScale;
     m.radius      = kPanelRadius  * dpiScale;
     m.labelHeight = kLabelHeight  * dpiScale;
+    m.labelGap    = kLabelGap     * dpiScale;
     m.tileSize    = baseTileSize  * dpiScale;
 
     if (count <= 0) {
         m.panelWidth  = m.padding * 2;
-        m.panelHeight = m.padding * 2 + m.labelHeight;
+        m.panelHeight = m.padding * 2;
+        m.radius      = (std::min)(m.radius, m.panelHeight * 0.5f);
         return m;
     }
 
@@ -110,7 +126,7 @@ inline Metrics Compute(int count, float availableWidth, float dpiScale,
     }
 
     m.panelWidth  = (std::min)(widthFor(m.tileSize), availableWidth);
-    m.panelHeight = m.padding * 2 + m.tileSize + m.labelHeight;
+    m.panelHeight = m.padding * 2 + m.tileSize;   // uniform padding, no chin
 
     // A corner extent past half the shorter side is meaningless, and at
     // kMinTileSize the panel is short enough for 62 to reach it. Clamp once,
