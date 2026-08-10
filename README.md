@@ -22,7 +22,8 @@ managed and what it means for how much to trust a given part of it.
 Two, and they pull against each other:
 
 1. **Look genuinely like macOS.** Real backdrop blur, a macOS-sized corner
-   radius (62px, not DWM's 8px), squircle icons synthesised from whatever
+   radius (62px, not DWM's 8px), a material whose numbers are fitted to a
+   screenshot of the real thing, squircle icons synthesised from whatever
    Windows hands us, MRU app grouping, `Q` to quit an app from the switcher.
 2. **Cost nothing.** No polling, no timers at rest, no runtime dependencies.
 
@@ -93,14 +94,46 @@ there, and it gives `out = 0.439 * in + 0.221`, with mean luma rising from 0.467
 outside to 0.550 inside. So the material compresses the backdrop's contrast to a
 little under half and *lifts* it, rather than veiling it.
 
-That is one Direct2D colour matrix, not an alpha blend, because an alpha blend
-cannot do either half of it. Saturation is `1 / (1 - tintAlpha)`, which restores
-exactly the relative saturation that mixing with the tint took away and nothing
-more; without it the glass reads as frosted plastic rather than glass.
-`CLSID_D2D1Saturation` is no use for this at all, its property is documented over
-`[0, 1]` so it can only ever desaturate. The coefficients live in
-[`src/glass.h`](src/glass.h), free of `windows.h`, so the preview harness below
-applies the identical matrix and writes a PNG.
+Four things make that read as glass rather than as a blurred rectangle, in the
+order they matter:
+
+1. **The operating point moves.** One affine transfer cannot serve both a white
+   wallpaper and a black one: the panel either washes out or turns into a slab.
+   Apple avoids this with a stack of lighten and darken blends that have soft
+   knees at both ends, which is not something one colour matrix can do. What is
+   available here and not to Apple is that the backdrop is a *frozen frame*, so
+   its mean luma is known before a pixel is drawn. `Adapt()` bends the bias per
+   gesture to land the panel inside a per-theme band. The gain never moves: how
+   much of the desktop's contrast survives is a property of the material, where
+   that window sits is a property of what is behind it today.
+2. **Saturation, well past unity.** Measured on the reference, relative
+   saturation goes 0.737 outside the panel to 0.642 inside, a ratio of 0.87. The
+   light material's 2.80 lands on 0.877. `CLSID_D2D1Saturation` is no use for
+   this at all: its property is documented over `[0, 1]`, so it can only ever
+   desaturate, and asking for more clamps to identity without complaining.
+3. **An inner glow at the top edge.** The reference's interior luma is 161 just
+   inside the top rim, decaying to 148.8 about 45px in, with a quarter of that
+   along the bottom. That falloff is what reads as a lit curved surface.
+4. **The rim is additive and nearly symmetric.** Measured lift over the adjacent
+   interior is +33 luma at the top, +23 at the bottom, +22 at the sides, so 1.4:1
+   rather than the 4:1 that looks plausible, and the colour delta at the peak is
+   near neutral. It adds rather than covering.
+
+The coefficients live in [`src/glass.h`](src/glass.h), free of `windows.h`, so
+the preview harness below applies the identical matrix and prints the numbers
+back. There is no drop shadow, and the panel's padding is uniform on all four
+sides: the reference is 588 tall around a 348 icon, 120 above and 120 below,
+with no bottom band. The app name therefore cannot live inside the glass, and
+sits on a small capsule of the same material below it.
+
+**Checking our own output against Apple's.** The measuring script that produced
+the table above runs equally well on MacTab's own render. Fitting the preview's
+panel corner recovers a boundary that tracks the ideal 62 / 2.24 curve to within
+a pixel or two, giving a corner extent of 0.360 of the panel height against the
+reference's 0.364, and an extent ratio of 1.97 between panel and icon against the
+reference's 2.02. That is the only honest definition of "1:1" available to a
+project that cannot run its own output: the script that measured Apple returns
+the same numbers on ours.
 
 ## Building
 
@@ -161,6 +194,10 @@ Tray icon, then *Settings*. Panel display (active window's display, the display
 with the mouse, or always the main display) and appearance (follow Windows,
 light, dark). Both take effect on the next Alt+Tab.
 
+*Uninstall MacTab* is in the same menu, below Settings. It runs the installer's
+own uninstaller, and is greyed out when MacTab is running as a standalone
+executable rather than an installed copy.
+
 Everything else is in `%LOCALAPPDATA%\MacTab\settings.ini`, which is written with
 defaults and comments on first run:
 
@@ -206,10 +243,27 @@ The image, squircle, panel-layout and glass code is deliberately kept free of
 
 runs a set of regression checks over that layer, then writes PNGs to
 `build-preview/out/`: the icon pipeline case by case, and the whole panel in both
-themes over a blurred wallpaper, in `panel-dark.png` and `panel-light.png`. It
-uses the same `panel_layout.h` and `glass.h` the app does, not copies, so the
+themes over three wallpapers, a blue gradient plus solid black and solid white.
+It uses the same `panel_layout.h` and `glass.h` the app does, not copies, so the
 geometry and the colour matrix are the real ones. Only the pixel loops differ:
 Direct2D on Windows, a box blur and a per-pixel matrix here.
+
+It also prints, and asserts on, the numbers that decide whether the material is
+right:
+
+```
+theme     wallpaper backdrop    panel   target  sat in sat out    label
+dark      gradient     0.399    0.269  0.15-0.38   0.398   0.395     6.5:1
+dark      black        0.045    0.154  0.15-0.38   0.000   0.038    12.6:1
+dark      white        0.947    0.384  0.15-0.38   0.000   0.010     5.2:1
+light     gradient     0.399    0.553  0.55-0.85   0.398   0.349     7.0:1
+light     black        0.045    0.552  0.55-0.85   0.000   0.007     5.8:1
+light     white        0.947    0.766  0.55-0.85   0.000   0.003    10.7:1
+```
+
+The panel has to land inside its band and the app name has to clear 4.5:1
+against its capsule, on every wallpaper, or the build fails. Those two are the
+difference between tuning a material and guessing at one.
 
 That boundary is the point. The numbers are the judgement calls and they are
 shared; the plumbing is what CI and a real machine are for.
