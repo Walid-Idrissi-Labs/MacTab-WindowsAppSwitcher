@@ -23,5 +23,10 @@ c++ -std=c++20 -O2 -Wall -Wextra \
     -lz \
     -o "$OUT/preview"
 
+# Wipe the output first. Renders that no longer correspond to any current code
+# path sit in here looking exactly like the ones that do, and this project's
+# recurring failure is a verification artifact that has drifted from the thing it
+# is supposed to be verifying.
+rm -rf "$OUT/out"
 mkdir -p "$OUT/out"
 "$OUT/preview" "$OUT/out"
