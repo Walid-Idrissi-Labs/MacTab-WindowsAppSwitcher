@@ -25,6 +25,7 @@ struct MissionItem {
 // One entry in the bar across the top.
 struct MissionSpace {
     std::wstring name;
+    GUID         id{};
     bool         current = false;
 };
 

@@ -165,7 +165,29 @@ bool SourceSize(HWND source, SIZE& out) {
     return out.cx > 0 && out.cy > 0;
 }
 
-bool CreateSharedVisual(void* device, HWND destination, HWND source,
+bool SourceGeometry(HWND source, RECT& window, RECT& frame) {
+    window = RECT{};
+    frame  = RECT{};
+    if (!source || !::GetWindowRect(source, &window)) return false;
+
+    if (FAILED(::DwmGetWindowAttribute(source, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                       &frame, sizeof(frame))) ||
+        frame.right <= frame.left || frame.bottom <= frame.top) {
+        frame = window;
+    }
+
+    // A window can report a frame larger than itself when it is maximised on a
+    // scaled display, and a negative inset would push the thumbnail the wrong
+    // way, so the frame is held inside the window rect.
+    frame.left   = (std::max)(frame.left,   window.left);
+    frame.top    = (std::max)(frame.top,    window.top);
+    frame.right  = (std::min)(frame.right,  window.right);
+    frame.bottom = (std::min)(frame.bottom, window.bottom);
+
+    return frame.right > frame.left && frame.bottom > frame.top;
+}
+
+bool CreateSharedVisual(void* device, HWND destination, HWND source, SIZE render,
                         void** outVisual, HTHUMBNAIL* outHandle) {
     if (outVisual) *outVisual = nullptr;
     if (outHandle) *outHandle = nullptr;
@@ -175,12 +197,24 @@ bool CreateSharedVisual(void* device, HWND destination, HWND source,
     if (!ResolveExports() || !outVisual || !outHandle)
         return false;
 
+    if (render.cx <= 0 || render.cy <= 0) {
+        SIZE fallback{};
+        if (!SourceSize(source, fallback)) return false;
+        render = fallback;
+    }
+
     DWM_THUMBNAIL_PROPERTIES properties{};
     properties.dwFlags               = DWM_TNP_VISIBLE | DWM_TNP_OPACITY |
-                                       DWM_TNP_SOURCECLIENTAREAONLY;
+                                       DWM_TNP_SOURCECLIENTAREAONLY |
+                                       DWM_TNP_RECTDESTINATION;
     properties.fVisible              = TRUE;
     properties.opacity               = 255;
     properties.fSourceClientAreaOnly = FALSE;
+
+    // The destination is what DWM sizes its render to. Asked for the source's
+    // own size, so the thumbnail carries every pixel the window has and the
+    // only scaling that ever happens is downward, in the compositor.
+    properties.rcDestination = RECT{ 0, 0, render.cx, render.cy };
 
     const HRESULT hr = g_createShared(destination, source, 2, &properties,
                                       device, outVisual, outHandle);

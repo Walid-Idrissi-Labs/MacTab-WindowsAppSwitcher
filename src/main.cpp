@@ -461,7 +461,7 @@ void OpenMission() {
     std::vector<MissionSpace> spaces;
     if (state.known) {
         for (size_t i = 0; i < state.all.size(); ++i)
-            spaces.push_back(MissionSpace{ state.all[i].name,
+            spaces.push_back(MissionSpace{ state.all[i].name, state.all[i].id,
                                            static_cast<int>(i) == state.current });
     }
 

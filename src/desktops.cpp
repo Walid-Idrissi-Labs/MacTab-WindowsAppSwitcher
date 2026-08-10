@@ -204,6 +204,20 @@ State Query(HWND ownWindow) {
     return state;
 }
 
+bool MoveWindowTo(HWND hwnd, const GUID& desktop) {
+    IVirtualDesktopManager* manager = Manager();
+    if (!manager || !hwnd) return false;
+
+    const HRESULT hr = manager->MoveWindowToDesktop(hwnd, desktop);
+    if (FAILED(hr)) {
+        MACTAB_DIAG("desktops: cannot move %p (0x%08lX); the public API only "
+                    "moves this process's own windows",
+                    static_cast<void*>(hwnd), static_cast<unsigned long>(hr));
+        return false;
+    }
+    return true;
+}
+
 bool SwitchTo(const State& state, int targetIndex) {
     if (!state.known || state.current < 0) return false;
     if (targetIndex < 0 || targetIndex >= static_cast<int>(state.all.size())) return false;

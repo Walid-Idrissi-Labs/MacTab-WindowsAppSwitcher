@@ -69,6 +69,18 @@ void Force(Tier tier);
 // its window rect. Falls back to the extended frame bounds.
 bool SourceSize(HWND source, SIZE& out);
 
+// What a thumbnail's pixels actually cover, and what part of that is the window
+// you can see.
+//
+// These are not the same rect and the difference is why an outline drawn around
+// a tile does not line up with the window inside it. A thumbnail contains the
+// WHOLE window, including the invisible resize border Windows has put around
+// every resizable window since Vista, which is around seven pixels a side at
+// 100% scaling and draws nothing. The arrangement is built from the visible
+// frame, so fitting the thumbnail to the tile by its own size leaves the
+// visible window smaller than the tile and pushed up and left inside it.
+bool SourceGeometry(HWND source, RECT& window, RECT& frame);
+
 // Create a shared thumbnail visual for `source`, parented to `destination`.
 //
 // `device` is an IDCompositionDevice obtained by QueryInterface on the
@@ -79,7 +91,13 @@ bool SourceSize(HWND source, SIZE& out);
 //
 // Returns false if the tier is unavailable or DWM refused this particular
 // window, which happens for windows that are cloaked onto another desktop.
-bool CreateSharedVisual(void* device, HWND destination, HWND source,
+// `render` is the size DWM is asked to produce the thumbnail at.
+//
+// It is not optional in practice. Without a destination rectangle DWM picks the
+// resolution itself, and what it picks is not the window's own, so every
+// preview comes back soft. Ask for the source's full size and scale the visual
+// down from there: downscaling is always sharp, and upscaling never is.
+bool CreateSharedVisual(void* device, HWND destination, HWND source, SIZE render,
                         void** outVisual, HTHUMBNAIL* outHandle);
 
 void ReleaseSharedVisual(HTHUMBNAIL handle);

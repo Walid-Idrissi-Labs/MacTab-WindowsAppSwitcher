@@ -25,6 +25,7 @@
 
 #include "mission.h"
 #include "com.h"
+#include "desktops.h"
 #include "common.h"
 #include "config.h"
 #include "diag.h"
@@ -255,6 +256,17 @@ struct Mission::Impl {
     // The desktop being looked at, which is not necessarily the one being used.
     int browsed = -1;
 
+    // A window being dragged. Dragging is how a window is moved to another
+    // display, and the one gesture where the tile leaves its arrangement.
+    struct Drag {
+        HWND  screen  = nullptr;   // the overlay the press happened on
+        int   tile    = -1;
+        POINT grab{};              // where the press was, in that overlay
+        POINT origin{};            // the tile's offset when the press happened
+        bool  moving  = false;     // past the threshold, so it is a drag
+    };
+    Drag drag;
+
     // The app icons, uploaded once each rather than once per window.
     std::map<std::wstring, ComPtr<ID2D1Bitmap1>> iconBitmaps;
 
@@ -280,6 +292,11 @@ struct Mission::Impl {
     int  Neighbour(const Screen& screen, int from, int dx, int dy) const;
 
     ComPtr<ID2D1Bitmap1> IconFor(ID2D1DeviceContext* dc, const MissionItem& item);
+
+    void BeginDrag(Screen& screen, POINT client);
+    void UpdateDrag(Screen& screen, POINT client);
+    bool FinishDrag(Screen& screen, POINT client);   // true if it was a drag
+    void Rearrange();
 };
 
 namespace {
@@ -403,14 +420,27 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     if (!screen) return ::DefWindowProcW(hwnd, msg, wParam, lParam);
 
     switch (msg) {
-    case WM_MOUSEMOVE:
-        impl->SetHovered(*screen, impl->HitTestTile(*screen,
-            POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) }));
+    case WM_LBUTTONDOWN:
+        impl->BeginDrag(*screen, POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
         return 0;
+
+    case WM_MOUSEMOVE: {
+        const POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (impl->drag.tile >= 0) {
+            impl->UpdateDrag(*screen, point);
+            return 0;
+        }
+        impl->SetHovered(*screen, impl->HitTestTile(*screen, point));
+        return 0;
+    }
 
     case WM_LBUTTONUP: {
         const POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         if (!impl->notifyWindow) return 0;
+
+        // A drag consumes the click. Releasing after moving a window across is
+        // not a request to switch to it.
+        if (impl->FinishDrag(*screen, point)) return 0;
 
         const int chip = impl->HitTestChip(*screen, point);
         if (chip >= 0) {
@@ -451,6 +481,15 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                        static_cast<WPARAM>(hit.item), 0);
         return 0;
     }
+
+    // Capture can be taken away, by a system dialog or an alt-tab out. Leaving
+    // the drag armed would make the next click somewhere else finish a move.
+    case WM_CAPTURECHANGED:
+        if (impl->drag.tile >= 0) {
+            impl->drag = Mission::Impl::Drag{};
+            impl->Rearrange();
+        }
+        return 0;
 
     case WM_KEYDOWN: {
         if (!impl->notifyWindow) return 0;
@@ -1211,30 +1250,76 @@ void Mission::Impl::BakeBar(Screen& screen) {
             continue;
         }
 
-        const bool current = chip.index >= 0 &&
-                             chip.index < static_cast<int>(spaces.size()) &&
-                             spaces[static_cast<size_t>(chip.index)].current;
+        // Highlighted by what is being LOOKED AT, not by what the machine is
+        // running. Every display shows the same strip, and marking the running
+        // desktop meant that walking to another one from one screen left every
+        // other screen pointing at a desktop whose windows were no longer being
+        // shown anywhere.
+        const bool current = (chip.index == browsed);
 
         // Every desktop shows the wallpaper, which is what an empty one looks
-        // like. Not a picture of what is on it: windows on another desktop are
-        // shell-cloaked and DWM will not compose a cloaked window through any
-        // path a normal process has.
+        // like, and then its own windows on top of it.
         if (paperBrush) {
             paperBrush->SetTransform(D2D1::Matrix3x2F::Translation(chip.x, chip.y));
             FillSquircleWith(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h,
                              radius, paperBrush.Get());
-            if (!current)
-                FillSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h, radius,
-                             themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.45f)
-                                          : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.45f));
         } else {
             FillSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h, radius,
                          theme.chip);
         }
 
+        // The windows on that desktop, at the position and size they really
+        // have, scaled into the miniature.
+        //
+        // Not a picture of them: a window on another desktop is shell-cloaked
+        // and DWM will not compose a cloaked window through any path a normal
+        // process has, so there are no pixels to be had. Their shapes and their
+        // icons are what there is, and a miniature that shows where things are
+        // is worth a great deal more than an empty rectangle.
+        {
+            const float sx = chip.w / (std::max)(1.0f, screen.Width());
+            const float sy = chip.h / (std::max)(1.0f, screen.Height());
+
+            for (const MissionItem& item : items) {
+                if (item.desktop >= 0 && item.desktop != chip.index) continue;
+
+                const POINT centre{ (item.bounds.left + item.bounds.right) / 2,
+                                    (item.bounds.top + item.bounds.bottom) / 2 };
+                if (::MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST) != screen.monitor)
+                    continue;
+
+                const float x = chip.x + (item.bounds.left - screen.rect.left) * sx;
+                const float y = chip.y + (item.bounds.top  - screen.rect.top)  * sy;
+                const float w = (item.bounds.right - item.bounds.left) * sx;
+                const float h = (item.bounds.bottom - item.bounds.top) * sy;
+                if (w < 2.0f || h < 2.0f) continue;
+
+                FillSquircle(dc, d2dFactory.Get(), x, y, w, h, screen.Scaled(2.0f),
+                             themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.86f)
+                                          : D2D1::ColorF(0.12f, 0.12f, 0.15f, 0.88f));
+                StrokeSquircle(dc, d2dFactory.Get(), x, y, w, h, screen.Scaled(2.0f),
+                               1.0f,
+                               themeIsLight ? D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.30f)
+                                            : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.30f));
+
+                if (ComPtr<ID2D1Bitmap1> icon = IconFor(dc, item)) {
+                    const float side = (std::min)(w, h) * 0.55f;
+                    if (side >= 5.0f)
+                        dc->DrawBitmap(icon.Get(),
+                                       D2D1::RectF(x + (w - side) * 0.5f, y + (h - side) * 0.5f,
+                                                   x + (w + side) * 0.5f, y + (h + side) * 0.5f));
+                }
+            }
+        }
+
+        if (!current)
+            FillSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h, radius,
+                         themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.42f)
+                                      : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.42f));
+
         StrokeSquircle(dc, d2dFactory.Get(), chip.x, chip.y, chip.w, chip.h, radius,
                        screen.Scaled(current ? 2.5f : 1.0f),
-                       current ? theme.chipBorder
+                       current ? accent
                                : D2D1::ColorF(theme.chipBorder.r, theme.chipBorder.g,
                                               theme.chipBorder.b, theme.chipBorder.a * 0.3f));
 
@@ -1497,25 +1582,51 @@ void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
         bool haveThumbnail = false;
 
         if (dcompDevice) {
+            // What the thumbnail's pixels cover, and what part of that is the
+            // window you can see. They differ by the invisible resize border,
+            // around seven pixels a side at 100%, and the arrangement is built
+            // from the visible frame.
+            RECT sourceWindow{}, sourceFrame{};
+            const bool haveGeometry =
+                thumbnail::SourceGeometry(item.hwnd, sourceWindow, sourceFrame);
+
+            const SIZE render{
+                haveGeometry ? sourceWindow.right - sourceWindow.left
+                             : tile.sourceRect.right - tile.sourceRect.left,
+                haveGeometry ? sourceWindow.bottom - sourceWindow.top
+                             : tile.sourceRect.bottom - tile.sourceRect.top };
+
             void* raw = nullptr;
             if (thumbnail::CreateSharedVisual(dcompDevice.get(), screen.hwnd, item.hwnd,
-                                              &raw, &tile.thumbnail) && raw) {
+                                              render, &raw, &tile.thumbnail) && raw) {
                 winrt::com_ptr<IUnknown> unknown;
                 unknown.attach(reinterpret_cast<IUnknown*>(raw));
 
                 if (auto visual = unknown.try_as<WUC::Visual>()) {
-                    SIZE source{};
-                    if (!thumbnail::SourceSize(item.hwnd, source) ||
-                        source.cx <= 0 || source.cy <= 0) {
-                        source.cx = tile.sourceRect.right - tile.sourceRect.left;
-                        source.cy = tile.sourceRect.bottom - tile.sourceRect.top;
-                    }
+                    // Fit the VISIBLE frame to the tile, not the whole
+                    // thumbnail. Scaling by the thumbnail's own size leaves the
+                    // window smaller than its tile and pushed up and left
+                    // inside it, which is what made the hover outline look like
+                    // it was drawn around the wrong rectangle.
+                    const float frameW = haveGeometry
+                        ? static_cast<float>(sourceFrame.right - sourceFrame.left)
+                        : static_cast<float>(render.cx);
+                    const float frameH = haveGeometry
+                        ? static_cast<float>(sourceFrame.bottom - sourceFrame.top)
+                        : static_cast<float>(render.cy);
 
-                    // The visual draws at the source window's own size, so it is
-                    // scaled into the slot rather than resized.
-                    visual.Scale({ place.w / (std::max)(1.0f, static_cast<float>(source.cx)),
-                                   place.h / (std::max)(1.0f, static_cast<float>(source.cy)),
-                                   1.0f });
+                    const float scaleX = place.w / (std::max)(1.0f, frameW);
+                    const float scaleY = place.h / (std::max)(1.0f, frameH);
+
+                    visual.Scale({ scaleX, scaleY, 1.0f });
+
+                    // Slide the invisible border back off the top and the left,
+                    // so what lands on the tile's origin is the frame's origin.
+                    if (haveGeometry)
+                        visual.Offset({ (sourceWindow.left - sourceFrame.left) * scaleX,
+                                        (sourceWindow.top  - sourceFrame.top)  * scaleY,
+                                        0.0f });
+
                     tile.holder.Children().InsertAtTop(visual);
                     haveThumbnail = true;
                 }
@@ -1928,6 +2039,172 @@ void Mission::Impl::CollapsePile(Screen& screen) {
     }
 
     MACTAB_DIAG("mission: pile of app %d collapsed", group);
+}
+
+// --- dragging ---------------------------------------------------------------
+//
+// A window can be picked up and put on another display, or on another desktop
+// in the strip. It is the one gesture where a tile leaves the arrangement, so
+// the tile itself is moved and everything else is left alone until the drop.
+
+void Mission::Impl::BeginDrag(Screen& screen, POINT client) {
+    drag = Drag{};
+
+    const int tile = HitTestTile(screen, client);
+    if (tile < 0) return;
+
+    drag.screen = screen.hwnd;
+    drag.tile   = tile;
+    drag.grab   = client;
+    drag.origin = POINT{ screen.tiles[static_cast<size_t>(tile)].liveRect.left,
+                         screen.tiles[static_cast<size_t>(tile)].liveRect.top };
+
+    // Capture, so the pointer can leave this overlay and land on another
+    // display's without the moves stopping.
+    ::SetCapture(screen.hwnd);
+}
+
+void Mission::Impl::UpdateDrag(Screen& screen, POINT client) {
+    if (drag.tile < 0 || drag.tile >= static_cast<int>(screen.tiles.size())) return;
+
+    const int dx = client.x - drag.grab.x;
+    const int dy = client.y - drag.grab.y;
+
+    // A threshold, so a click with a shaky hand is still a click.
+    if (!drag.moving) {
+        const int slack = static_cast<int>(screen.Scaled(6.0f));
+        if (dx * dx + dy * dy < slack * slack) return;
+        drag.moving = true;
+        screen.outline.Opacity(0.0f);
+    }
+
+    Tile& tile = screen.tiles[static_cast<size_t>(drag.tile)];
+    tile.holder.Offset({ static_cast<float>(drag.origin.x + dx),
+                         static_cast<float>(drag.origin.y + dy), 0.0f });
+    if (tile.chrome) tile.chrome.Opacity(0.0f);
+}
+
+bool Mission::Impl::FinishDrag(Screen& screen, POINT client) {
+    const Drag held = drag;
+    drag = Drag{};
+
+    if (held.screen) ::ReleaseCapture();
+    if (!held.moving || held.tile < 0 ||
+        held.tile >= static_cast<int>(screen.tiles.size()))
+        return false;
+
+    Tile& tile = screen.tiles[static_cast<size_t>(held.tile)];
+    if (tile.item < 0 || tile.item >= static_cast<int>(items.size())) return true;
+
+    MissionItem& item = items[static_cast<size_t>(tile.item)];
+
+    // Where the drop landed, in virtual-screen coordinates. The pointer is
+    // captured, so it can be well outside this overlay by now.
+    const POINT dropped{ client.x + screen.rect.left, client.y + screen.rect.top };
+
+    // Dropped on a desktop in the strip.
+    for (const mission::SpaceChip& chip : screen.chips) {
+        if (chip.add || chip.index < 0 || chip.index >= static_cast<int>(spaces.size()))
+            continue;
+        if (client.x < chip.x || client.x >= chip.x + chip.w ||
+            client.y < chip.y || client.y >= chip.y + chip.h)
+            continue;
+
+        if (desktops::MoveWindowTo(item.hwnd, spaces[static_cast<size_t>(chip.index)].id)) {
+            item.desktop = chip.index;
+            MACTAB_DIAG("mission: moved %p to desktop %d",
+                        static_cast<void*>(item.hwnd), chip.index);
+        } else {
+            // Not allowed for another process's window, and there is no public
+            // way round it. The arrangement snapping back is the honest answer:
+            // nothing happened, and nothing pretends it did.
+            MACTAB_WARN("mission: Windows does not allow moving another "
+                        "application's window between desktops");
+        }
+        Rearrange();
+        return true;
+    }
+
+    // Dropped on another display.
+    const HMONITOR target = ::MonitorFromPoint(dropped, MONITOR_DEFAULTTONEAREST);
+    if (target && target != screen.monitor) {
+        MONITORINFO from{}, to{};
+        from.cbSize = sizeof(from);
+        to.cbSize   = sizeof(to);
+
+        if (::GetMonitorInfoW(screen.monitor, &from) && ::GetMonitorInfoW(target, &to)) {
+            // Kept where it was on its old screen in proportion, rather than at
+            // the same pixel offset: two displays are rarely the same size, and
+            // a window three quarters of the way across a wide screen belongs
+            // three quarters of the way across the narrow one.
+            const float fw = static_cast<float>(from.rcWork.right - from.rcWork.left);
+            const float fh = static_cast<float>(from.rcWork.bottom - from.rcWork.top);
+            const float tw = static_cast<float>(to.rcWork.right - to.rcWork.left);
+            const float th = static_cast<float>(to.rcWork.bottom - to.rcWork.top);
+
+            const float u = (item.bounds.left - from.rcWork.left) / (std::max)(1.0f, fw);
+            const float v = (item.bounds.top  - from.rcWork.top)  / (std::max)(1.0f, fh);
+
+            LONG w = item.bounds.right - item.bounds.left;
+            LONG h = item.bounds.bottom - item.bounds.top;
+            w = (std::min)(w, static_cast<LONG>(tw));
+            h = (std::min)(h, static_cast<LONG>(th));
+
+            LONG x = to.rcWork.left + static_cast<LONG>(u * tw);
+            LONG y = to.rcWork.top  + static_cast<LONG>(v * th);
+            x = (std::min)(x, static_cast<LONG>(to.rcWork.right)  - w);
+            y = (std::min)(y, static_cast<LONG>(to.rcWork.bottom) - h);
+            x = (std::max)(x, static_cast<LONG>(to.rcWork.left));
+            y = (std::max)(y, static_cast<LONG>(to.rcWork.top));
+
+            // A maximised window has to be restored first or it snaps straight
+            // back to the display it was maximised on.
+            WINDOWPLACEMENT placement{};
+            placement.length = sizeof(placement);
+            const bool maximised = ::GetWindowPlacement(item.hwnd, &placement) &&
+                                   placement.showCmd == SW_SHOWMAXIMIZED;
+            if (maximised) ::ShowWindow(item.hwnd, SW_RESTORE);
+
+            ::SetWindowPos(item.hwnd, nullptr, x, y, w, h,
+                           SWP_NOACTIVATE | SWP_NOZORDER);
+            if (maximised) ::ShowWindow(item.hwnd, SW_SHOWMAXIMIZED);
+
+            RECT moved{};
+            if (SUCCEEDED(::DwmGetWindowAttribute(item.hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                                  &moved, sizeof(moved))) ||
+                ::GetWindowRect(item.hwnd, &moved))
+                item.bounds = moved;
+
+            MACTAB_DIAG("mission: moved %p to another display",
+                        static_cast<void*>(item.hwnd));
+        }
+    }
+
+    Rearrange();
+    return true;
+}
+
+// Lay everything out again where it now is, and let it travel there from where
+// it currently sits rather than from the desktop.
+void Mission::Impl::Rearrange() {
+    std::map<int, RECT> current;
+    for (const Screen& other : screens)
+        for (const Tile& tile : other.tiles)
+            current.emplace(tile.item, tile.liveRect);
+
+    BuildForDesktop(browsed, 0);
+
+    for (Screen& other : screens) {
+        for (Tile& tile : other.tiles) {
+            tile.holder.Opacity(1.0f);
+            if (tile.chrome) tile.chrome.Opacity(1.0f);
+
+            const auto was = current.find(tile.item);
+            if (was != current.end()) tile.sourceRect = was->second;
+        }
+        StartReveal(compositor, other,
+                    std::chrono::milliseconds(config::Current().missionRevealMs), false);
+    }
 }
 
 void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spaces,

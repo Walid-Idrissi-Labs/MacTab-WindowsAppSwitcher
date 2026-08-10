@@ -74,6 +74,15 @@ int IndexOf(const State& state, const GUID& id);
 // overlay still on screen while the desktop slides underneath it looks broken.
 bool SwitchTo(const State& state, int targetIndex);
 
+// Move a window to another desktop.
+//
+// The public API only permits this for windows this process owns, and returns
+// E_ACCESSDENIED for anything else, which is almost everything a user would
+// want to drag. The alternative is the private interface, whose vtable was
+// restructured in 24H2 without its identifier changing, so callers crashed
+// rather than failed. False here means "not allowed", not "went wrong".
+bool MoveWindowTo(HWND hwnd, const GUID& desktop);
+
 // Ctrl+Win+D. The new desktop is created after the current one and becomes
 // current, which is what Windows does and what the strip has to assume.
 bool Create();
