@@ -98,6 +98,15 @@ struct Bounds {
 // real app icon.
 Bounds OpaqueBounds(const Bitmap& bitmap, uint8_t threshold = 8);
 
+// Mean colour over a rectangle, clipped to the bitmap, alpha ignored.
+//
+// Used to decide the app name's colour: the label sits below the glass, on
+// whatever the desktop happens to be, so a fixed per-theme colour is wrong over
+// half of all wallpapers. Sampled from the captured frame that the backdrop was
+// built from, so it costs nothing extra and needs no readback. Returns opaque
+// mid-grey for an empty rectangle, which is the least-wrong default.
+uint32_t MeanColourIn(const Bitmap& bitmap, int left, int top, int right, int bottom);
+
 Bitmap Crop(const Bitmap& source, const Bounds& bounds);
 
 // Scale to fit inside boxWidth x boxHeight PRESERVING ASPECT RATIO, then centre

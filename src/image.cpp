@@ -196,6 +196,33 @@ Bounds OpaqueBounds(const Bitmap& bitmap, uint8_t threshold) {
     return bounds;
 }
 
+uint32_t MeanColourIn(const Bitmap& bitmap, int left, int top, int right, int bottom) {
+    if (bitmap.Empty()) return MakePixel(128, 128, 128, 255);
+
+    left   = (std::max)(0, left);
+    top    = (std::max)(0, top);
+    right  = (std::min)(bitmap.width,  right);
+    bottom = (std::min)(bitmap.height, bottom);
+    if (right <= left || bottom <= top) return MakePixel(128, 128, 128, 255);
+
+    // Step rather than visit every pixel. This is a strip a few hundred pixels
+    // wide sampled to pick one of two text colours; a sixteenth of it decides
+    // the same way, and this runs on the gesture path.
+    const int step = (std::max)(1, (right - left) / 64);
+
+    uint64_t r = 0, g = 0, b = 0, n = 0;
+    for (int y = top; y < bottom; y += step) {
+        for (int x = left; x < right; x += step) {
+            const uint32_t px = bitmap.At(x, y);
+            r += RedOf(px); g += GreenOf(px); b += BlueOf(px); ++n;
+        }
+    }
+    if (n == 0) return MakePixel(128, 128, 128, 255);
+
+    return MakePixel(static_cast<uint8_t>(r / n), static_cast<uint8_t>(g / n),
+                     static_cast<uint8_t>(b / n), 255);
+}
+
 Bitmap Crop(const Bitmap& source, const Bounds& bounds) {
     if (source.Empty() || bounds.Empty()) return {};
 

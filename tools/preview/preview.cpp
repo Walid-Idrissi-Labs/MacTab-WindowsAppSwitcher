@@ -281,42 +281,20 @@ void Blur(Bitmap& image, float sigma) {
     }
 }
 
-// The colour matrix from glass.h, then the tint over the top. Exactly the two
-// operations panel.cpp performs, in the same order, with the same coefficients.
+// The whole material for one pixel now lives in glass.h, because panel.cpp and
+// this file both need exactly it. All that is left here is the loop.
 void ApplyMaterial(Bitmap& image, const glass::Params& p) {
-    const glass::Matrix5x4 m = glass::BuildMatrix(p);
-
     auto to255 = [](float v) {
         const float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
         return static_cast<uint8_t>(c * 255.0f + 0.5f);
     };
 
     for (uint32_t& px : image.pixels) {
-        const float r = RedOf(px)   / 255.0f;
-        const float g = GreenOf(px) / 255.0f;
-        const float b = BlueOf(px)  / 255.0f;
-
-        // D2D1_COLORMATRIX_PROP_CLAMP_OUTPUT is on in panel.cpp, so the clamp
-        // happens HERE, on the matrix result, before the tint is composited over
-        // it. Clamping only the final pixel instead is not the same operation:
-        // a saturation of 1.37 pushes a pure red past 1.0 and drives the
-        // opposing channels below 0, and mixing those out-of-range values with
-        // the tint carries a fraction (1 - a) of the overshoot into the result.
-        // On the deliberately saturated test wallpaper below, that is exactly
-        // the pixels the numbers were chosen by looking at.
-        auto unit = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
-
-        const float r2 = unit(r * m.m[0][0] + g * m.m[1][0] + b * m.m[2][0] + m.m[4][0]);
-        const float g2 = unit(r * m.m[0][1] + g * m.m[1][1] + b * m.m[2][1] + m.m[4][1]);
-        const float b2 = unit(r * m.m[0][2] + g * m.m[1][2] + b * m.m[2][2] + m.m[4][2]);
-
-        // Straight "over" with the tint, which is what FillRectangle does on top
-        // of the treated backdrop.
-        const float a = p.tint[3];
-        px = MakePixel(to255(r2 * (1.0f - a) + p.tint[0] * a),
-                       to255(g2 * (1.0f - a) + p.tint[1] * a),
-                       to255(b2 * (1.0f - a) + p.tint[2] * a),
-                       255);
+        const float in[3] = { RedOf(px) / 255.0f, GreenOf(px) / 255.0f,
+                              BlueOf(px) / 255.0f };
+        float out[3];
+        glass::Apply(p, in, out);
+        px = MakePixel(to255(out[0]), to255(out[1]), to255(out[2]), 255);
     }
 }
 
@@ -332,20 +310,111 @@ void ApplyFallback(Bitmap& image, const glass::Params& p) {
     for (uint32_t& px : image.pixels) {
         float c[3] = { RedOf(px) / 255.0f, GreenOf(px) / 255.0f, BlueOf(px) / 255.0f };
         for (int i = 0; i < 3; ++i) {
-            c[i] = over(c[i],  p.tint[i], p.fallbackAlpha);
-            c[i] = over(c[i],  p.tint[i], p.tint[3]);
+            c[i] = over(c[i], p.tint[i], p.fallbackAlpha);
+            c[i] = over(c[i], p.tint[i], p.tint[3]);
         }
         px = MakePixel(to255(c[0]), to255(c[1]), to255(c[2]), 255);
     }
 }
 
-// A wallpaper deliberately built to break the material if the numbers are
-// wrong: a saturated colour field so the saturation boost is visible, a
-// near-white block and a near-black block so the luma compression can be judged
-// at both ends, and fine detail so an under-strength blur shows up as legible
-// structure through the glass.
-Bitmap MakeWallpaper(int width, int height) {
+// Mean sRGB luma of a bitmap, which is what Adapt() steers on.
+float MeanLuma(const Bitmap& image) {
+    if (image.Empty()) return 0.5;
+    double total = 0.0;
+    for (uint32_t px : image.pixels)
+        total += glass::Luma(RedOf(px) / 255.0f, GreenOf(px) / 255.0f, BlueOf(px) / 255.0f);
+    return static_cast<float>(total / image.pixels.size());
+}
+
+// Mean relative saturation, (max - min) / max. Used to check the material is
+// boosting chroma by about what the reference does, rather than by eye.
+float MeanSaturation(const Bitmap& image) {
+    if (image.Empty()) return 0.0f;
+    double total = 0.0;
+    for (uint32_t px : image.pixels) {
+        const int mx = (std::max)({ RedOf(px), GreenOf(px), BlueOf(px) });
+        const int mn = (std::min)({ RedOf(px), GreenOf(px), BlueOf(px) });
+        if (mx > 0) total += static_cast<double>(mx - mn) / mx;
+    }
+    return static_cast<float>(total / image.pixels.size());
+}
+
+// The inner glow: white at glowTop alpha on the top edge falling to zero over
+// glowTopSpan logical pixels, and the same at the bottom. One gradient fill in
+// panel.cpp, one loop here.
+void ApplyInnerGlow(Bitmap& body, const glass::Params& p) {
+    auto blend = [](uint8_t dst, float alpha) {
+        const float v = dst / 255.0f * (1.0f - alpha) + 1.0f * alpha;
+        return static_cast<uint8_t>((v > 1.0f ? 1.0f : v) * 255.0f + 0.5f);
+    };
+
+    for (int y = 0; y < body.height; ++y) {
+        const float fromTop    = static_cast<float>(y);
+        const float fromBottom = static_cast<float>(body.height - 1 - y);
+
+        float a = 0.0f;
+        if (p.glowTopSpan > 0.0f && fromTop < p.glowTopSpan)
+            a += p.glowTop * (1.0f - fromTop / p.glowTopSpan);
+        if (p.glowBottomSpan > 0.0f && fromBottom < p.glowBottomSpan)
+            a += p.glowBottom * (1.0f - fromBottom / p.glowBottomSpan);
+        if (a <= 0.0f) continue;
+
+        for (int x = 0; x < body.width; ++x) {
+            uint32_t& px = body.At(x, y);
+            px = MakePixel(blend(RedOf(px), a), blend(GreenOf(px), a),
+                           blend(BlueOf(px), a), AlphaOf(px));
+        }
+    }
+}
+
+// --- self-checks -----------------------------------------------------------
+//
+// The pure layer is the only part of MacTab that can be executed off Windows,
+// so it is the only part that can have real regression cover. These assert the
+// properties that are easy to break silently while tuning constants.
+
+int g_checkFailures = 0;
+
+void Check(bool condition, const char* what) {
+    if (!condition) {
+        std::fprintf(stderr, "CHECK FAILED: %s\n", what);
+        ++g_checkFailures;
+    }
+}
+
+// Wallpapers chosen to break the material if the numbers are wrong.
+//
+// Gradient is a stand-in for a real desktop and is where the saturation and the
+// transfer slope get judged. Black and white are the two ends the adaptive bias
+// exists for: with a fixed transfer the panel washes out over one and goes to a
+// slab over the other, and the app name stops being readable over at least one.
+enum class Wallpaper { Gradient, Black, White };
+
+const char* WallpaperName(Wallpaper kind) {
+    switch (kind) {
+        case Wallpaper::Black: return "black";
+        case Wallpaper::White: return "white";
+        default:               return "gradient";
+    }
+}
+
+Bitmap MakeWallpaper(int width, int height, Wallpaper kind) {
     Bitmap out = Bitmap::Create(width, height);
+
+    if (kind != Wallpaper::Gradient) {
+        // Not perfectly flat. A dead-flat field would hide a blur that is too
+        // weak, and the point of these two is the ENDS of the range, not the
+        // texture, so a few percent of structure is enough.
+        const uint8_t base = (kind == Wallpaper::White) ? 250 : 6;
+        const uint8_t alt  = (kind == Wallpaper::White) ? 236 : 20;
+        for (int y = 0; y < height; ++y)
+            for (int x = 0; x < width; ++x) {
+                const uint8_t v = ((x / 40) + (y / 40)) % 2 ? alt : base;
+                out.At(x, y) = MakePixel(v, v, v, 255);
+            }
+        return out;
+    }
+
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             const float u = static_cast<float>(x) / width;
@@ -366,60 +435,52 @@ Bitmap MakeWallpaper(int width, int height) {
         }
     }
 
+    // A blown-out block and a near-black one, so the adaptive step has real
+    // extremes inside a single frame rather than only across frames.
     auto block = [&](int x0, int y0, int w, int h, uint8_t v) {
         for (int y = y0; y < y0 + h && y < height; ++y)
             for (int x = x0; x < x0 + w && x < width; ++x)
                 out.At(x, y) = MakePixel(v, v, v, 255);
     };
-    block(width / 8,     height / 5, width / 5, height / 2, 250);   // blown-out white
-    block(width * 5 / 8, height / 5, width / 5, height / 2, 6);     // near black
+    block(width / 8,     height / 5, width / 5, height / 2, 250);
+    block(width * 5 / 8, height / 5, width / 5, height / 2, 6);
 
     return out;
 }
 
-// --- self-checks -----------------------------------------------------------
-//
-// The pure layer is the only part of MacTab that can be executed off Windows,
-// so it is the only part that can have real regression cover. These assert the
-// properties that are easy to break silently while tuning constants.
-
-int g_checkFailures = 0;
-
-void Check(bool condition, const char* what) {
-    if (!condition) {
-        std::fprintf(stderr, "CHECK FAILED: %s\n", what);
-        ++g_checkFailures;
-    }
-}
+// What the render measured, so the numbers can be diffed against the reference
+// table instead of squinted at.
+struct PanelStats {
+    float backdropLuma = 0.0f;   // mean of the blurred wallpaper under the panel
+    float panelLuma    = 0.0f;   // mean of the finished glass
+    float satBefore    = 0.0f;
+    float satAfter     = 0.0f;
+    float adaptedBias  = 0.0f;
+    float labelContrast = 0.0f;
+};
 
 // The whole panel at the real layout metrics, over a real blurred wallpaper,
 // with the real material applied.
 //
-// The tile size, gap, padding, corner radius and every glass coefficient were
-// chosen without being able to see them. This runs the actual shared layout and
-// glass code, not a copy of it, so the proportions and the material can be
-// judged rather than assumed.
-Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCount,
-                   int selected, bool haveCapture) {
+// Every constant in here comes from panel_layout.h or glass.h, not from a copy,
+// so the proportions and the material are the ones that ship.
+Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
+                   int selected, bool haveCapture, Wallpaper wallpaper,
+                   PanelStats* stats) {
     const int count = 6;
     const layout::Metrics m = layout::Compute(count, 2400.0f, 1.0f);
 
     const int panelW = static_cast<int>(m.panelWidth);
     const int panelH = static_cast<int>(m.panelHeight);
     const int margin = 60;
+    const int band   = static_cast<int>(std::ceil(m.labelGap + m.labelHeight));
 
-    const int band = static_cast<int>(std::ceil(m.labelGap + m.labelHeight));
-    Bitmap canvas = MakeWallpaper(panelW + margin * 2, panelH + band + margin * 2);
+    Bitmap canvas = MakeWallpaper(panelW + margin * 2, panelH + band + margin * 2, wallpaper);
 
-    // Backdrop: blur a copy of the wallpaper, crop the panel's own rect out of
-    // it, run the material over it. Blurring the whole canvas and cropping is
-    // equivalent to capturing panel-plus-margin and blurring that, which is
-    // what StartCapture does, and avoids reimplementing the margin logic.
-    // Crop from the BLURRED wallpaper only when there is a capture to blur.
-    // The fallback path has no captured frame at all, so its coat goes over the
+    // Crop from the BLURRED wallpaper only when there is a capture to blur. The
+    // fallback path has no captured frame at all, so its coat goes over the
     // sharp live desktop, and that sharpness is the entire reason the coat has
-    // to be as opaque as it is. Blurring it here would make the PNG look better
-    // than the thing it is standing in for, which is worse than not having it.
+    // to be as opaque as it is.
     Bitmap source = canvas;
     if (haveCapture) Blur(source, glass::kBlurSigma);
 
@@ -428,15 +489,29 @@ Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCou
         for (int x = 0; x < panelW; ++x)
             body.At(x, y) = source.At(x + margin, y + margin);
 
+    glass::Params material = base;
+
     if (haveCapture) {
+        // Adapt on the mean luma of what is actually behind the panel, which is
+        // the whole point of holding a frozen frame.
+        const float backdrop = MeanLuma(body);
+        material = glass::Adapt(base, backdrop);
+
+        if (stats) {
+            stats->backdropLuma = backdrop;
+            stats->satBefore    = MeanSaturation(body);
+            stats->adaptedBias  = material.bias;
+        }
+
         ApplyMaterial(body, material);
+        ApplyInnerGlow(body, material);
     } else {
-        // No captured frame: a wedged GPU, a remote session, a grab that missed
-        // its deadline. BakeBackdrop lays an opaque base coat down first and
-        // then the normal tint, because at 0.27 the tint alone leaves the tiles
-        // floating over a sharp live desktop. This is the one panel state that
-        // only shows up on machines nobody is testing on, so it gets a PNG.
         ApplyFallback(body, material);
+    }
+
+    if (stats) {
+        stats->panelLuma = MeanLuma(body);
+        stats->satAfter  = MeanSaturation(body);
     }
 
     // Corners.
@@ -459,37 +534,57 @@ Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCou
         }
     }
 
-    // Rim. The real one is a stroked geometry inset by half its width; this
-    // approximates it by lightening the outermost opaque pixel of each column
-    // and row, which is enough to judge the two alphas against each other.
+    // Rim. Dark stroke on the outermost opaque pixel, additive bright rim one
+    // pixel inside it, matching the inset scheme panel.cpp strokes with.
     {
-        auto lighten = [&](int x, int y, float alpha, bool dark) {
+        auto darken = [&](int x, int y, float alpha) {
             if (x < 0 || y < 0 || x >= panelW || y >= panelH) return;
             uint32_t& px = body.At(x, y);
-            if (AlphaOf(px) < 200) return;
-            const float target = dark ? 0.0f : 255.0f;
-            px = MakePixel(static_cast<uint8_t>(RedOf(px)   * (1 - alpha) + target * alpha),
-                           static_cast<uint8_t>(GreenOf(px) * (1 - alpha) + target * alpha),
-                           static_cast<uint8_t>(BlueOf(px)  * (1 - alpha) + target * alpha),
+            px = MakePixel(static_cast<uint8_t>(RedOf(px)   * (1.0f - alpha)),
+                           static_cast<uint8_t>(GreenOf(px) * (1.0f - alpha)),
+                           static_cast<uint8_t>(BlueOf(px)  * (1.0f - alpha)),
                            AlphaOf(px));
+        };
+        auto add = [&](int x, int y, float amount) {
+            if (x < 0 || y < 0 || x >= panelW || y >= panelH) return;
+            uint32_t& px = body.At(x, y);
+            auto plus = [&](uint8_t c) {
+                const int v = static_cast<int>(c + amount * 255.0f);
+                return static_cast<uint8_t>(v > 255 ? 255 : v);
+            };
+            px = MakePixel(plus(RedOf(px)), plus(GreenOf(px)), plus(BlueOf(px)), AlphaOf(px));
+        };
+
+        auto rimAt = [&](int y) {
+            const float t = (panelH > 1) ? static_cast<float>(y) / (panelH - 1) : 0.0f;
+            return material.rimTop + (material.rimBottom - material.rimTop) * t;
         };
 
         for (int y = 0; y < panelH; ++y) {
-            const float t = static_cast<float>(y) / (panelH - 1);
-            const float a = material.rimTop + (material.rimBottom - material.rimTop) * t;
-
-            // Walk in from each side to the first opaque pixel, which follows
-            // the curve through the corners.
+            int first = -1, last = -1;
             for (int x = 0; x < panelW; ++x)
-                if (AlphaOf(body.At(x, y)) >= 200) { lighten(x, y, a, false); break; }
+                if (AlphaOf(body.At(x, y)) >= 200) { first = x; break; }
             for (int x = panelW - 1; x >= 0; --x)
-                if (AlphaOf(body.At(x, y)) >= 200) { lighten(x, y, a, false); break; }
+                if (AlphaOf(body.At(x, y)) >= 200) { last = x; break; }
+            if (first < 0) continue;
+
+            darken(first, y, material.rimOuterDark);
+            darken(last,  y, material.rimOuterDark);
+            add(first + 1, y, rimAt(y));
+            add(last  - 1, y, rimAt(y));
         }
         for (int x = 0; x < panelW; ++x) {
+            int first = -1, last = -1;
             for (int y = 0; y < panelH; ++y)
-                if (AlphaOf(body.At(x, y)) >= 200) { lighten(x, y, material.rimTop, false); break; }
+                if (AlphaOf(body.At(x, y)) >= 200) { first = y; break; }
             for (int y = panelH - 1; y >= 0; --y)
-                if (AlphaOf(body.At(x, y)) >= 200) { lighten(x, y, material.rimBottom, false); break; }
+                if (AlphaOf(body.At(x, y)) >= 200) { last = y; break; }
+            if (first < 0) continue;
+
+            darken(x, first, material.rimOuterDark);
+            darken(x, last,  material.rimOuterDark);
+            add(x, first + 1, material.rimTop);
+            add(x, last  - 1, material.rimBottom);
         }
     }
 
@@ -500,7 +595,7 @@ Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCou
     const int hlSize = static_cast<int>(m.tileSize) + inset * 2;
 
     Bitmap highlight = Bitmap::Create(hlSize, hlSize);
-    const uint8_t hlAlpha = (material.tint[0] > 0.5f) ? 26 : 46;   // light vs dark theme
+    const uint8_t hlAlpha = (material.tint[0] > 0.5f) ? 26 : 46;
     const uint8_t hlValue = (material.tint[0] > 0.5f) ? 0 : 255;
     for (uint32_t& px : highlight.pixels) px = MakePixel(hlValue, hlValue, hlValue, hlAlpha);
     // Rounded, matching BakeSelection in panel.cpp. A hard-edged rectangle next
@@ -536,28 +631,67 @@ Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCou
                       margin + static_cast<int>(m.padding));
     }
 
-    // Stand-in for the label. There is no DirectWrite here, so this is a bar of
-    // the width a name like "Visual Studio Code" occupies, placed by the same
-    // rule BakeLabel uses: centred on the selected tile, clamped inside the
-    // panel's padding. It is the placement that needs looking at, not the text.
+    // The app name's capsule, below the glass. There is no DirectWrite here, so
+    // the text itself is a bar of the width a name like "Visual Studio Code"
+    // occupies; the capsule and its placement are what need looking at.
     {
         const float labelWidth =
             std::min(2.0f * (m.tileSize + m.gap),
-                     std::min(m.panelWidth - m.padding * 2.0f, 150.0f));
+                     std::min(m.panelWidth - m.padding * 2.0f, 170.0f));
         const float centre = m.TileCentreX(selected);
         const float x = std::max(m.padding,
                                  std::min(centre - labelWidth * 0.5f,
                                           m.panelWidth - m.padding - labelWidth));
 
-        Bitmap bar = Bitmap::Create(static_cast<int>(labelWidth),
-                                    static_cast<int>(m.labelHeight * 0.5f));
-        const uint8_t v = (material.tint[0] > 0.5f) ? 20 : 245;
-        for (uint32_t& px : bar.pixels) px = MakePixel(v, v, v, 150);
+        const int pillW = static_cast<int>(labelWidth);
+        const int pillH = static_cast<int>(m.labelHeight);
+        const int pillX = margin + static_cast<int>(x);
+        const int pillY = margin + static_cast<int>(m.panelHeight + m.labelGap);
 
-        // BELOW the glass, not inside it. The panel has uniform padding, so
-        // there is no bottom band to put text in.
-        CompositeOver(canvas, bar, margin + static_cast<int>(x),
-                      margin + static_cast<int>(m.panelHeight + m.labelGap));
+        Bitmap pill = Bitmap::Create(pillW, pillH);
+        for (int y = 0; y < pillH; ++y)
+            for (int xx = 0; xx < pillW; ++xx)
+                pill.At(xx, y) = source.At(pillX + xx, pillY + y);
+
+        if (haveCapture) {
+            ApplyMaterial(pill, material);
+            ApplyInnerGlow(pill, material);
+        } else {
+            ApplyFallback(pill, material);
+        }
+
+        // A capsule: corner extent is half the height.
+        {
+            const int r = pillH / 2;
+            const std::vector<uint8_t> corner = CornerMask(r, layout::kPanelCornerExponent);
+            for (int cy = 0; cy < r; ++cy)
+                for (int cx = 0; cx < r; ++cx) {
+                    const uint8_t a = corner[static_cast<size_t>(cy) * r + cx];
+                    auto apply = [&](int xx, int yy) {
+                        uint32_t& px = pill.At(xx, yy);
+                        px = (px & 0x00FFFFFFu) |
+                             (static_cast<uint32_t>(AlphaOf(px) * a / 255) << 24);
+                    };
+                    apply(cx, cy);
+                    apply(pillW - 1 - cx, cy);
+                    apply(cx, pillH - 1 - cy);
+                    apply(pillW - 1 - cx, pillH - 1 - cy);
+                }
+        }
+
+        if (stats) {
+            const float pillLuma = MeanLuma(pill);
+            const float text = (material.tint[0] > 0.5f) ? (20.0f / 255.0f)
+                                                         : (245.0f / 255.0f);
+            stats->labelContrast = glass::ContrastRatio(pillLuma, text);
+        }
+
+        Bitmap bar = Bitmap::Create(pillW - pillH, pillH / 3);
+        const uint8_t v = (material.tint[0] > 0.5f) ? 20 : 245;
+        for (uint32_t& px : bar.pixels) px = MakePixel(v, v, v, 235);
+
+        CompositeOver(canvas, pill, pillX, pillY);
+        CompositeOver(canvas, bar, pillX + pillH / 2, pillY + pillH / 3);
     }
 
     return canvas;
@@ -750,36 +884,76 @@ int main(int argc, char** argv) {
         ++failures;
     }
 
-    // The panel, dark and light, over a blurred wallpaper with the real glass
-    // material applied. This is the only place the material's numbers can
-    // actually be looked at before they reach a Windows machine.
+    // The panel over three wallpapers in both themes, plus the no-capture
+    // fallback, with the real material applied.
+    //
+    // Black and white are not decoration: the adaptive bias exists precisely so
+    // one material serves both ends, and the numbers printed underneath are the
+    // acceptance test for it. The reference measured 0.44 * L + 0.22 for the
+    // light material, and this table is the only place that claim gets checked
+    // before it reaches a Windows machine.
     {
         const layout::Metrics m = layout::Compute(6, 2400.0f, 1.0f);
-        std::printf("\npanel: 6 tiles, tile %.0f, panel %.0fx%.0f, radius %.0f, n %.2f\n",
+        std::printf("\npanel: 6 tiles, tile %.0f, glass %.0fx%.0f, radius %.0f, n %.2f\n",
                     m.tileSize, m.panelWidth, m.panelHeight, m.radius,
                     static_cast<double>(layout::kPanelCornerExponent));
+        std::printf("       transfer  dark %.2f*L + %.2f   light %.2f*L + %.2f\n",
+                    static_cast<double>(glass::EndGain(glass::kDark)),
+                    static_cast<double>(glass::EndBias(glass::kDark)),
+                    static_cast<double>(glass::EndGain(glass::kLight)),
+                    static_cast<double>(glass::EndBias(glass::kLight)));
 
-        // The last one puts the selection on the final tile, which is the case
-        // that exercises BakeLabel's clamp: the name is anchored on the tile's
-        // centre, so at the end of the row it has to slide inward instead of
-        // overhanging the panel.
-        struct {
-            const char* file; const glass::Params& material; int selected; bool capture;
-        } shots[] = {
-            { "/panel-dark.png",        glass::kDark,  1, true  },
-            { "/panel-light.png",       glass::kLight, 1, true  },
-            { "/panel-label-end.png",   glass::kDark,  5, true  },
-            { "/panel-no-capture.png",  glass::kDark,  1, false },
+        struct Shot {
+            const char* file;
+            const glass::Params& material;
+            const char* theme;
+            Wallpaper wallpaper;
+            int selected;
+            bool capture;
+        };
+        const Shot shots[] = {
+            { "/panel-dark-gradient.png",  glass::kDark,  "dark",  Wallpaper::Gradient, 1, true  },
+            { "/panel-dark-black.png",     glass::kDark,  "dark",  Wallpaper::Black,    1, true  },
+            { "/panel-dark-white.png",     glass::kDark,  "dark",  Wallpaper::White,    1, true  },
+            { "/panel-light-gradient.png", glass::kLight, "light", Wallpaper::Gradient, 1, true  },
+            { "/panel-light-black.png",    glass::kLight, "light", Wallpaper::Black,    1, true  },
+            { "/panel-light-white.png",    glass::kLight, "light", Wallpaper::White,    1, true  },
+            { "/panel-label-end.png",      glass::kDark,  "dark",  Wallpaper::Gradient, 5, true  },
+            { "/panel-no-capture.png",     glass::kDark,  "dark",  Wallpaper::Gradient, 1, false },
         };
 
-        for (const auto& shot : shots) {
+        std::printf("\n%-9s %-9s %8s %8s %8s %7s %7s %8s\n",
+                    "theme", "wallpaper", "backdrop", "panel", "target",
+                    "sat in", "sat out", "label");
+        for (const Shot& shot : shots) {
+            PanelStats stats;
             const Bitmap panel = RenderPanel(shot.material, cases,
                                              static_cast<int>(std::size(cases)),
-                                             shot.selected, shot.capture);
+                                             shot.selected, shot.capture,
+                                             shot.wallpaper, &stats);
             if (!WritePng(outDir + shot.file, panel)) {
                 std::fprintf(stderr, "failed to write %s\n", shot.file);
                 ++failures;
             }
+            if (!shot.capture) continue;
+
+            std::printf("%-9s %-9s %8.3f %8.3f  %.2f-%.2f %7.3f %7.3f %7.1f:1\n",
+                        shot.theme, WallpaperName(shot.wallpaper),
+                        static_cast<double>(stats.backdropLuma),
+                        static_cast<double>(stats.panelLuma),
+                        static_cast<double>(shot.material.targetMin),
+                        static_cast<double>(shot.material.targetMax),
+                        static_cast<double>(stats.satBefore),
+                        static_cast<double>(stats.satAfter),
+                        static_cast<double>(stats.labelContrast));
+
+            // The acceptance test. A material that leaves the band, or leaves
+            // the app name under 4.5:1, is not shippable no matter how it looks.
+            Check(stats.panelLuma >= shot.material.targetMin - 0.03f &&
+                  stats.panelLuma <= shot.material.targetMax + 0.03f,
+                  "panel luma lands inside the adaptive band");
+            Check(stats.labelContrast >= glass::kMinTextContrast,
+                  "app name clears 4.5:1 against its capsule");
         }
     }
 
