@@ -70,6 +70,10 @@ if [[ $# -gt 0 ]]; then
 else
     FILES=()
     while IFS= read -r f; do FILES+=("$f"); done < <(find "$ROOT/src" -name '*.cpp' | sort)
+    # Not a product source. It mirrors the Direct2D and DirectWrite calls
+    # src/panel.cpp makes, which is the only way any of them get type-checked at
+    # all, since panel.cpp itself needs the Windows SDK. See the file's header.
+    FILES+=("$ROOT/tools/d2d-check.cpp")
 fi
 
 fail=0
