@@ -99,6 +99,8 @@ message(STATUS "C++/WinRT headers: ${CPPWINRT_INCLUDE_DIR}")
 # ---------------------------------------------------------------------------
 add_executable(MacTab WIN32
     src/main.cpp
+    src/panel.cpp
+    src/actions.cpp
     src/activate.cpp
     src/app_identity.cpp
     src/capture.cpp
@@ -160,6 +162,7 @@ target_link_libraries(MacTab PRIVATE
     d3d11
     dxgi
     dwrite
+    shcore         # GetDpiForMonitor
     version        # FileDescription from executables' version resources
 )
 

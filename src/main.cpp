@@ -1,6 +1,7 @@
 #include "pch.h"
 #include <wtsapi32.h>
 
+#include "actions.h"
 #include "activate.h"
 #include "app.h"
 #include "app_identity.h"
@@ -8,6 +9,8 @@
 #include "diag.h"
 #include "foreground_history.h"
 #include "hotkey.h"
+#include "icons.h"
+#include "panel.h"
 #include "tray.h"
 #include "window_model.h"
 #include "resource.h"
@@ -17,6 +20,9 @@ namespace {
 
 // Tray interactions arrive here.
 constexpr UINT WM_MACTAB_TRAY = WM_APP + 1;
+
+// Posted by the icon worker when one or more tiles finish.
+constexpr UINT WM_MACTAB_ICON_READY = WM_APP + 2;
 
 UINT g_msgRequestQuit    = 0;   // RegisterWindowMessage(kQuitMessageName)
 UINT g_msgTaskbarCreated = 0;   // RegisterWindowMessage(L"TaskbarCreated")
@@ -36,6 +42,7 @@ struct AppState {
     HINSTANCE instance      = nullptr;
     HWND      host          = nullptr;
     Tray      tray;
+    Panel     panel;
     Gesture   gesture;
     bool      diagRequested = false;
     bool      wtsRegistered = false;
@@ -49,6 +56,8 @@ bool HasFlag(const wchar_t* cmdLine, const wchar_t* flag) {
 }
 
 // --- Gesture handling ------------------------------------------------------
+
+void PopulatePanel();
 
 void BeginGesture(bool reverse) {
     Gesture& g = g_app.gesture;
@@ -71,6 +80,44 @@ void BeginGesture(bool reverse) {
 
     MACTAB_DIAG("gesture: begin, %zu apps, start index %d (reverse %d)",
                 g.apps.size(), g.index, reverse ? 1 : 0);
+
+    PopulatePanel();
+}
+
+// Build the panel's item list, pulling whatever icons are already cached and
+// queueing the rest. Tiles that are not ready yet render as placeholders and
+// are filled in when WM_MACTAB_ICON_READY arrives, so this never blocks.
+void PopulatePanel() {
+    Gesture& g = g_app.gesture;
+    if (!g_app.panel.Ready()) return;
+
+    const int tileSize = g_app.panel.TileSizePx();
+
+    std::vector<PanelItem> items;
+    items.reserve(g.apps.size());
+
+    for (const SwitcherApp& app : g.apps) {
+        PanelItem item;
+        item.key = app.key;
+
+        // A packaged app's friendly name only becomes available once the icon
+        // worker has read its manifest; until then the window title stands in.
+        const std::wstring resolved = icons::DisplayName(app.key);
+        item.label = resolved.empty() ? app.displayName : resolved;
+
+        icons::Request request;
+        request.key            = app.key;
+        request.exePath        = app.exePath;
+        request.aumid          = app.aumid;
+        request.packaged       = app.packaged;
+        request.fallbackWindow = app.PrimaryWindow();
+        request.size           = tileSize;
+
+        icons::Acquire(request, item.icon);   // false just means "not yet"
+        items.push_back(std::move(item));
+    }
+
+    g_app.panel.SetItems(std::move(items), g.index);
 }
 
 void AdvanceSelection(int direction) {
@@ -82,6 +129,8 @@ void AdvanceSelection(int direction) {
 
     MACTAB_DIAG("gesture: select -> index %d (%s)", g.index,
                 ToUtf8(g.apps[static_cast<size_t>(g.index)].displayName).c_str());
+
+    g_app.panel.SetSelection(g.index);
 }
 
 void CommitGesture(WORD altVirtualKey) {
@@ -104,6 +153,7 @@ void CommitGesture(WORD altVirtualKey) {
 
     g.active     = false;
     g.panelShown = false;
+    g_app.panel.Hide();
 
     if (!target) {
         hotkey::NeutralizeAlt(altVirtualKey);
@@ -124,19 +174,74 @@ void CancelGesture(WORD altVirtualKey) {
     g.active     = false;
     g.panelShown = false;
     g.apps.clear();
+    g_app.panel.Hide();
 
     hotkey::NeutralizeAlt(altVirtualKey);
     MACTAB_DIAG("gesture: cancelled");
 }
 
 void RevealPanel() {
-    g_app.gesture.panelShown = true;
+    Gesture& g = g_app.gesture;
+    if (!g.active || g.apps.empty()) return;
 
-    // M3 shows the real panel here. Until then the log is how we verify that
-    // the hold-versus-tap split is working: a quick Alt+Tab must never reach
-    // this point, and holding Alt must always reach it exactly once.
-    MACTAB_DIAG("gesture: reveal (panel would appear now, index %d of %zu)",
-                g_app.gesture.index, g_app.gesture.apps.size());
+    g.panelShown = true;
+
+    // A quick Alt+Tab must never reach this point, and holding Alt must reach
+    // it exactly once — that split is the macOS behaviour, and this log line is
+    // how it gets verified without being able to watch the screen.
+    const double started = NowMs();
+    g_app.panel.Show();
+    MACTAB_DIAG("gesture: reveal, index %d of %zu, shown in %.2f ms",
+                g.index, g.apps.size(), NowMs() - started);
+}
+
+// Q / W / H / backtick, dispatched once the panel is up.
+void HandleActionKey(WORD virtualKey) {
+    Gesture& g = g_app.gesture;
+    if (!g.active || g.apps.empty()) return;
+    if (g.index < 0 || g.index >= static_cast<int>(g.apps.size())) return;
+
+    SwitcherApp& app = g.apps[static_cast<size_t>(g.index)];
+
+    switch (virtualKey) {
+    case 'Q':
+        QuitApp(app);
+        // The app is going away, so drop its tile and keep the gesture alive —
+        // macOS lets you quit several apps in one Cmd-Tab hold.
+        g.apps.erase(g.apps.begin() + g.index);
+        if (g.apps.empty()) {
+            g_app.panel.Hide();
+            return;
+        }
+        g.index = (std::min)(g.index, static_cast<int>(g.apps.size()) - 1);
+        PopulatePanel();
+        return;
+
+    case 'W':
+        CloseFrontWindow(app);
+        return;
+
+    case 'H':
+        HideApp(app);
+        return;
+
+    case VK_OEM_3:      // backquote: cycle windows within the highlighted app
+        if (app.windows.size() > 1) {
+            std::rotate(app.windows.begin(), app.windows.begin() + 1, app.windows.end());
+            MACTAB_DIAG("gesture: cycled to window %p of %s",
+                        static_cast<void*>(app.PrimaryWindow()),
+                        ToUtf8(app.displayName).c_str());
+        }
+        return;
+
+    case VK_DOWN:
+        // M6 leaves expansion to a later pass; cycling covers the common case.
+        MACTAB_DIAG("gesture: expand requested (%zu windows)", app.windows.size());
+        return;
+
+    default:
+        return;
+    }
 }
 
 // --- Tray ------------------------------------------------------------------
@@ -183,6 +288,8 @@ void ShutdownSubsystems() {
 
     hotkey::Stop();
     foreground::Stop();
+    icons::Stop();
+    g_app.panel.Shutdown();
 
     if (g_app.wtsRegistered && g_app.host) {
         ::WTSUnRegisterSessionNotification(g_app.host);
@@ -229,10 +336,13 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case hotkey::WM_MACTAB_ACTION:
-        // M6 implements these. Logged now so the key routing can be verified
-        // independently of the actions themselves.
-        MACTAB_DIAG("gesture: action key 0x%02X (not implemented yet)",
-                    static_cast<unsigned>(wParam));
+        HandleActionKey(static_cast<WORD>(wParam));
+        return 0;
+
+    case WM_MACTAB_ICON_READY:
+        // A tile finished on the worker. Only matters while the panel is up.
+        if (g_app.gesture.active && g_app.gesture.panelShown)
+            PopulatePanel();
         return 0;
 
     // --- Tray ---------------------------------------------------------------
@@ -419,6 +529,23 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
     if (!g_app.tray.Create(instance, g_app.host, WM_MACTAB_TRAY, IDI_APPICON,
                            L"MacTab " MACTAB_VERSION_W))
         MACTAB_WARN("boot: tray icon unavailable; continuing headless");
+
+    // The panel is created and fully pre-warmed at startup, then shown and
+    // hidden for the rest of the session. Building the visual tree on demand
+    // would make the one-frame reveal budget unreachable.
+    if (!g_app.panel.Initialize(instance)) {
+        ::MessageBoxW(nullptr,
+                      L"MacTab could not initialise its rendering layer.\n\n"
+                      L"This needs Windows 10 version 1803 or later. Run with --diag "
+                      L"for details.",
+                      L"MacTab", MB_OK | MB_ICONERROR);
+        MACTAB_FAIL("boot: panel initialisation failed, exiting");
+        ::DestroyWindow(g_app.host);
+        diag::Shutdown();
+        return 1;
+    }
+
+    icons::Start(g_app.host, WM_MACTAB_ICON_READY);
 
     // Lock/unlock notifications, so a gesture interrupted by the secure desktop
     // does not leave the state machine stuck.

@@ -1,0 +1,50 @@
+#include "pch.h"
+#include "actions.h"
+#include "common.h"
+#include "diag.h"
+
+namespace mactab {
+namespace {
+
+// PostMessage, never SendMessage: an app showing a modal save prompt would
+// block us for as long as the prompt is up, and we are on the UI thread.
+void RequestClose(HWND window) {
+    if (!window || !::IsWindow(window)) return;
+
+    if (!::PostMessageW(window, WM_CLOSE, 0, 0)) {
+        // Almost always UIPI: an unelevated process cannot post to a
+        // higher-integrity window.
+        MACTAB_WARN("actions: PostMessage(WM_CLOSE) to %p refused (err %lu)",
+                    static_cast<void*>(window), ::GetLastError());
+    }
+}
+
+} // namespace
+
+void QuitApp(const SwitcherApp& app) {
+    MACTAB_DIAG("actions: quit %s (%zu window(s))",
+                ToUtf8(app.displayName).c_str(), app.windows.size());
+
+    for (const SwitcherWindow& window : app.windows)
+        RequestClose(window.hwnd);
+}
+
+void CloseFrontWindow(const SwitcherApp& app) {
+    if (app.windows.empty()) return;
+
+    MACTAB_DIAG("actions: close front window of %s", ToUtf8(app.displayName).c_str());
+    RequestClose(app.windows.front().hwnd);
+}
+
+void HideApp(const SwitcherApp& app) {
+    MACTAB_DIAG("actions: minimise all windows of %s", ToUtf8(app.displayName).c_str());
+
+    for (const SwitcherWindow& window : app.windows) {
+        if (!window.hwnd || !::IsWindow(window.hwnd)) continue;
+        // SW_MINIMIZE rather than SW_FORCEMINIMIZE: the latter is for hung
+        // windows and skips the animation, which looks broken on a healthy app.
+        ::ShowWindow(window.hwnd, SW_MINIMIZE);
+    }
+}
+
+} // namespace mactab
