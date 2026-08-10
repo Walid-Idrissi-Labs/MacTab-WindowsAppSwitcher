@@ -1018,6 +1018,18 @@ void Panel::Impl::BakeBackdrop() {
 // as it moves, and text that slides while its own content changes looks wrong.
 // macOS snaps it, so this snaps it.
 void Panel::Impl::BakeLabel() {
+    // Clear first, restore on success.
+    //
+    // Everything below can bail: an empty name, a font that will not create, a
+    // surface that will not open. Every one of those paths used to leave the
+    // PREVIOUS app's name on screen, under the newly selected tile, at the
+    // previous tile's position. Showing the wrong app's name is worse than
+    // showing none, and this is the only guard that covers all of them.
+    //
+    // Brush(nullptr) rather than IsVisible(false): Visual.IsVisible arrived in
+    // 10.0.17763 and MacTab supports 17134.
+    labelVisual.Brush(nullptr);
+
     if (items.empty()) return;
 
     const int index = (std::max)(0, (std::min)(selected, static_cast<int>(items.size()) - 1));
