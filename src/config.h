@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pch.h"
+#include "glass.h"
 #include "image.h"
 
 // Settings, icon theme packs and autostart.
@@ -52,12 +53,41 @@ struct Settings {
     // real hardware. If it comes out doubled or smeared on some driver, turning
     // this off in settings.ini gets a working panel back without a new build.
     bool glassRefraction = true;
+
+    // The rim's second, sharper tap. Off means the bezel bends the same soft
+    // backdrop the interior uses, which is what 0.4.1 shipped.
+    //
+    // Here for the same reason glassRefraction is: it is a Direct2D path nobody
+    // off Windows can execute, and if CLSID_D2D1AlphaMask lines its inputs up
+    // differently on some driver this gets a working panel back without waiting
+    // for a build.
+    bool glassRimTap = true;
+
+    // The material, as the ini has it. Shipped defaults unless a key overrides
+    // one. See glass_tune.h for the names and why they exist at all.
+    //
+    // Plain values rather than pointers: Params is trivially copyable, and the
+    // panel takes a copy per gesture anyway.
+    glass::Params glassDark  = glass::kDark;
+    glass::Params glassLight = glass::kLight;
 };
 
 const Settings& Current();
 
 // Reads settings.ini, writing it with defaults if absent.
 void Load();
+
+// Re-read ONLY the glass keys, from the tray.
+//
+// Deliberately not Load(), for the reason documented on SetPanelDisplay below:
+// Load() reassigns the themes directory string, which the icon worker reads on
+// its own thread. This touches the two Params and glass::g_tuning, and nothing
+// off the UI thread reads either, so there is no race to guard.
+//
+// The point of it is the loop. Changing a number in the material used to mean a
+// push, a CI build, an install and a restart, on a project whose author cannot
+// see the result at all. Now it means saving the file and picking a menu item.
+void ReloadGlass();
 
 // Change the display setting and persist it.
 //

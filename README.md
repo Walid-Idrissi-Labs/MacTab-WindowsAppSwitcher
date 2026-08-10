@@ -147,12 +147,20 @@ order they matter:
    2.7:1 of compression across the bezel. Built as an 8-bit map on the CPU and
    handed to `D2D1DisplacementMap`.
 
-   0.4.0 shipped this with a second, lighter blur just for the bezel, because at
-   the sigma of 30 it ran then the backdrop had no edges left to bend and the
-   lens did nothing at all: the panel rendered pixel for pixel identically with
-   it on and off. At sigma 8 that problem is gone and so is the second tap.
-   `bars-top-4x.png` and `bars-top-flat-4x.png` in the preview output are the
-   comparison that catches it if it ever comes back.
+   The bezel bends a much sharper copy of the desktop than the middle does,
+   sigma 2 against sigma 8, faded into the interior over the bezel width. Blur
+   and refraction are different effects, and a lens bending an image that has
+   already been softened to nothing produces a smear rather than a bend. That is
+   what separates a pane of glass from a frosted panel, and it is the thing this
+   material was missing for four releases.
+
+   0.4.0 tried a second tap and deleted it as redundant, because both taps went
+   through the same quarter-resolution downsample: the "sharp" one was a sigma of
+   0.5 followed by a 4x bilinear upscale, and the upscale alone softens more than
+   that, so the two came out indistinguishable. It was not redundant, it was
+   being thrown away one stage before it was used. The rim tap runs at full
+   resolution now. `rimtap-on-4x.png` and `rimtap-off-4x.png` in the preview
+   output are the comparison, and the build fails if the two agree.
 2. **You can see through it**, and this is the number the project kept getting
    wrong. It is now measured rather than argued about, by
    [`tools/measure`](tools/measure/measure.py): the reference puts the panel as a
@@ -167,18 +175,45 @@ order they matter:
    | end gain | 0.71 | 0.42 | 0.53 | 0.71 |
    | end bias | 0.068 | 0.064 | 0.064 | 0.068 |
 
+   That is the transfer. What a person actually sees is coarser than that, so
+   the preview also measures it directly: a bar target of decreasing period sits
+   under the panel and the amplitude of each period inside the glass is divided
+   by the same bars outside it.
+
+   | bar period | 96px | 64px | 48px | 32px | 16px |
+   |---|---|---|---|---|---|
+   | amplitude that survives | 74% | 70% | 59% | 30% | 19% |
+
+   The build fails if the coarsest drops under half. Structure at the scale of a
+   window on a building comes through at about three quarters, which is what
+   "you can count the floors" means as a number.
+
    Three releases blurred at 34, 52 and 30 on the reasoning that the macOS
    backdrop is unrecognisable mush. It is not: in the reference you can count the
    floors of the building behind the panel. The preview now fails the build if
    the end gain drops under 0.65.
-3. **The operating point moves.** One affine transfer cannot serve both a white
-   wallpaper and a black one: the panel either washes out or turns into a slab.
-   Apple does not use one either, it flips treatment on backdrop luminance. What
-   is available here and not to Apple is that the backdrop is a *frozen frame*,
-   so its mean luma is known before a pixel is drawn. `Adapt()` bends the bias
-   per gesture to land the panel inside a per-theme band. The gain never moves:
+3. **The operating point moves, and it moves with the desktop.** One affine
+   transfer cannot serve both a white wallpaper and a black one: the panel either
+   washes out or turns into a slab. Apple does not use one either, it flips
+   treatment on backdrop luminance. What is available here and not to Apple is
+   that the backdrop is a *frozen frame*, so its mean luma is known before a
+   pixel is drawn. `Adapt()` bends the bias per gesture. The gain never moves:
    how much of the desktop's contrast survives is a property of the material,
    where that window sits is a property of what is behind it today.
+
+   Up to 0.4.1 that landing point was a hard clamp into a per-theme band, and
+   that was the single biggest reason the panel read as a card. Past either end
+   of the band it was a constant plus texture, so a bright desktop and a very
+   bright desktop gave exactly the same panel. A constant that ignores what is
+   behind it is a UI colour, not a material. The band is a soft knee now: about a
+   third of any excursion past it survives, so brighter reads brighter and darker
+   reads darker. The light theme keeps its ceiling nearly hard, because the one
+   thing it must not do is go white.
+
+   Each piece of glass adapts on its own backdrop rather than the panel's. The
+   app name's capsule sits somewhere else on the desktop and can be over
+   completely different content; giving it the panel's operating point put it at
+   1.7:1 over a half-white wallpaper, which the new test surfaces caught.
 4. **Saturation, well past unity, and a lit edge that follows the surface.**
    Relative saturation goes 0.737 outside the panel to 0.642 inside on the
    reference, a ratio of 0.87, and the light material lands on 0.863.
@@ -190,6 +225,13 @@ order they matter:
    ambient plus an upward-facing lobe plus a thin filament, all evaluated from
    the surface normal, so the corners sweep between the top and side values on
    their own. It adds rather than covering.
+
+   All three are then scaled by the luma of the backdrop behind that piece of
+   rim, sampled from the sharp capture at 16px and interpolated. A highlight is a
+   reflection, and a rim that is the same brightness over a black wallpaper and a
+   white one is a painted-on border rather than a lit surface. Over a wallpaper
+   that is black on one side and white on the other, the two ends of the same
+   edge come out a factor of five apart, which the build asserts.
 
 The coefficients live in [`src/glass.h`](src/glass.h), free of `windows.h`, so
 the preview harness below applies the identical matrix and prints the numbers
@@ -264,7 +306,8 @@ past `RevealDelayMs`.
 
 Tray icon, then *Settings*. Panel display (active window's display, the display
 with the mouse, or always the main display) and appearance (follow Windows,
-light, dark). Both take effect on the next Alt+Tab.
+light, dark). Both take effect on the next Alt+Tab. *Reload glass from
+settings.ini* is on the main menu and re-reads the material without a restart.
 
 *Uninstall MacTab* is in the same menu, below Settings. It runs the installer's
 own uninstaller, and is greyed out when MacTab is running as a standalone
@@ -282,6 +325,50 @@ defaults and comments on first run:
 | `GroupByApp` | 1 | 0 gives one tile per window instead of one per application |
 | `PanelDisplay` | active | `active`, `mouse` or `main` |
 | `GlassRefraction` | 1 | Bend the desktop at the panel's rim. Set to 0 if the edge looks doubled or smeared on your machine |
+| `GlassRimTap` | 1 | Bend a sharper copy at the rim than in the middle, which is what makes the edge read as a lens. Set to 0 if the bezel looks doubled or banded |
+
+### Tuning the glass yourself
+
+Every number in the material is a key in the same file, and *Reload glass from
+settings.ini* in the tray menu re-reads them without a restart. Nothing is
+written there by default: leave a key out and the shipped value stands.
+
+Shared by both appearances, in logical pixels at 100% scaling:
+
+| Key | Default | |
+|---|---|---|
+| `GlassBlurSigma` | 8 | How soft the backdrop goes. The most decisive number in the material |
+| `GlassRimBlurSigma` | 2 | The bezel's own, sharper blur |
+| `GlassBezelWidth` | 14 | How far in from the edge the surface curves |
+| `GlassDepth` | 24 | How thick the pane is. Drives how hard the rim bends |
+| `GlassMaxDisplacement` | 16 | Ceiling on that bending |
+| `GlassRimSpan` | 13 | How far in the lit edge reaches |
+
+Per appearance, prefixed `GlassDark` or `GlassLight`: `Saturation`, `Gain`,
+`Bias`, `TintR` `TintG` `TintB` `TintA`, `RimAmbient`, `RimLobe`, `SpecLine`,
+`RimEnvFloor`, `RimEnvGain`, `RimOuterDark`, `TargetMin`, `TargetMax`,
+`KneeBelow`, `KneeAbove`, `FallbackAlpha`. So `GlassDarkTintA=0.06` thins the
+dark tint. Values are clamped to ranges the rest of the material was designed
+inside, and out-of-range or unparseable ones are logged rather than ignored
+silently.
+
+This exists because of the constraint at the top of this file: MacTab is written
+on a Mac and cannot be run there, so the only person who can see the glass is
+whoever is running it. Four releases went round the loop of change a number,
+push, wait for CI, install, look, report, and that loop being twenty minutes long
+did more damage than any single number in it. Now it is seconds.
+
+The same names work in the preview harness, minus the `Glass` prefix:
+
+```
+./build-preview/preview out/ --set dark.gain=0.74 --set blursigma=5
+```
+
+so a value that looked right on Windows can be replayed here, measured against
+the reference, and shipped as a default if it holds up. One table of names in
+[`src/glass_tune.h`](src/glass_tune.h) drives both sides, so they cannot drift.
+`--diag` logs the material every run, which means a screenshot arrives with the
+numbers that produced it.
 
 Drop a PNG into `%LOCALAPPDATA%\MacTab\themes\` named after an executable
 (`chrome.png`, `code.png`) to override that app's generated tile. Some icons will
@@ -316,27 +403,45 @@ The image, squircle, panel-layout and glass code is deliberately kept free of
 
 runs a set of regression checks over that layer, then writes PNGs to
 `build-preview/out/`: the icon pipeline case by case, and the whole panel in both
-themes over three wallpapers, a blue gradient plus solid black and solid white.
-It uses the same `panel_layout.h` and `glass.h` the app does, not copies, so the
-geometry and the colour matrix are the real ones. Only the pixel loops differ:
-Direct2D on Windows, a box blur and a per-pixel matrix here.
+themes over eleven surfaces. It uses the same `panel_layout.h` and `glass.h` the
+app does, not copies, so the geometry and the colour matrix are the real ones.
+Only the pixel loops differ: Direct2D on Windows, a box blur and a per-pixel
+matrix here.
 
-It also prints, and asserts on, the numbers that decide whether the material is
-right:
+The surfaces are chosen to break the material rather than to flatter it:
+
+| Surface | What it is there to catch |
+|---|---|
+| gradient | the everyday case, and where the saturation ratio is judged |
+| black, white | the two ends of the range the adaptation exists for |
+| bars | diagonal high-contrast structure, the only honest test of the lens |
+| red | whether the environment's hue reaches the panel at all |
+| split | black one side, white the other: whether the rim reflects or is painted on |
+| solids | five saturated bands under one panel, including a hard colour boundary |
+| shapes | large circles and rectangles, the brief's own visibility test |
+| text | letterforms through the bezel, both polarities |
+| detail | a bar target of decreasing period, measured rather than looked at |
+| ramp | strong colour gradients |
+| photo | sky, sun and a building whose windows should stay countable |
+
+It prints, and asserts on, the numbers that decide whether the material is right:
 
 ```
 theme     wallpaper backdrop    panel   target  sat in sat out    label
-dark      gradient     0.399    0.269  0.15-0.38   0.398   0.395     6.5:1
-dark      black        0.045    0.154  0.15-0.38   0.000   0.038    12.6:1
-dark      white        0.947    0.384  0.15-0.38   0.000   0.010     5.2:1
-light     gradient     0.399    0.553  0.55-0.85   0.398   0.349     7.0:1
-light     black        0.045    0.552  0.55-0.85   0.000   0.007     5.8:1
-light     white        0.947    0.766  0.55-0.85   0.000   0.003    10.7:1
+dark      gradient     0.419    0.365  0.16-0.44   0.324   0.388     5.6:1
+dark      black        0.010    0.130  0.16-0.44   0.000   0.019    14.4:1
+dark      white        0.975    0.552  0.16-0.44   0.000   0.003     2.7:1
+                      label needs its shadow: 2.7:1 bare, 5.0:1 shadowed
+dark      split        0.498    0.420  0.16-0.44   0.125   0.064    14.2:1
+                      rim reflects: 0.016 dark end, 0.079 bright end, 5.0x
 ```
 
-The panel has to land inside its band and the app name has to clear 4.5:1
-against its capsule, on every wallpaper, or the build fails. Those two are the
-difference between tuning a material and guessing at one.
+The build fails if the panel does not land where `Adapt` predicts, if a brighter
+desktop does not give a brighter panel, if the rim stops reacting to what is
+behind it, if a red desktop leaves the panel grey, if the coarsest bars lose more
+than half their contrast, if the rim's sharper tap changes nothing, or if the app
+name drops under 4.5:1 with the shadow it gets. Those are the difference between
+tuning a material and guessing at one.
 
 That boundary is the point. The numbers are the judgement calls and they are
 shared; the plumbing is what CI and a real machine are for.

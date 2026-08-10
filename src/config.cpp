@@ -2,6 +2,7 @@
 #include <wincodec.h>
 
 #include "config.h"
+#include "glass_tune.h"
 #include "com.h"
 #include "common.h"
 #include "diag.h"
@@ -47,7 +48,46 @@ const wchar_t* kDefaultIni =
     L"; Bend the desktop at the panel's rim, the way a real pane of glass would.\r\n"
     L"; Set to 0 if the edge of the panel looks doubled or smeared on your\r\n"
     L"; machine; everything else about the glass stays as it is.\r\n"
-    L"GlassRefraction=1\r\n";
+    L"GlassRefraction=1\r\n"
+    L"\r\n"
+    L"; The rim bends a much sharper copy of the desktop than the middle\r\n"
+    L"; does, which is what makes the edge read as a lens rather than as\r\n"
+    L"; frost. Set to 0 if the bezel looks doubled or banded.\r\n"
+    L"GlassRimTap=1\r\n"
+    L"\r\n"
+    L"; --- The glass material ---------------------------------------------\r\n"
+    L";\r\n"
+    L"; Every number in the material can be set here, and the tray menu has a\r\n"
+    L"; Reload glass item that re-reads them without restarting. Nothing below\r\n"
+    L"; is written by default: leave a key out and the shipped value stands.\r\n"
+    L";\r\n"
+    L"; This exists because MacTab is written on a Mac and cannot be run there,\r\n"
+    L"; so the only person who can see the glass is you. Change a number, hit\r\n"
+    L"; Reload glass, look. If something looks right, the same names work in\r\n"
+    L"; tools/preview, so the values can be checked and then shipped.\r\n"
+    L";\r\n"
+    L"; Shared by both appearances, in logical pixels:\r\n"
+    L";   GlassBlurSigma=8          how soft the backdrop goes. The big one.\r\n"
+    L";   GlassBezelWidth=14        how far in from the edge the surface curves\r\n"
+    L";   GlassDepth=24             how thick the pane is; drives the bending\r\n"
+    L";   GlassMaxDisplacement=16   ceiling on how far the rim bends anything\r\n"
+    L";   GlassRimSpan=13           how far in the lit edge reaches\r\n"
+    L";\r\n"
+    L"; Per appearance, prefixed GlassDark or GlassLight:\r\n"
+    L";   Saturation    colour push, above 1 boosts\r\n"
+    L";   Gain          how much of the desktop's contrast survives\r\n"
+    L";   Bias          black point lift\r\n"
+    L";   TintR TintG TintB TintA   the tint over the treated backdrop, 0..1\r\n"
+    L";   RimAmbient RimLobe SpecLine   the lit edge, as amounts to add\r\n"
+    L";   RimEnvFloor RimEnvGain    how much the lit edge reflects its backdrop\r\n"
+    L";   RimOuterDark  the dark line on the outermost pixel\r\n"
+    L";   TargetMin TargetMax       where the panel is steered to land\r\n"
+    L";   KneeBelow KneeAbove       how much of an excursion past that survives\r\n"
+    L";   FallbackAlpha the base coat used when the desktop grab fails\r\n"
+    L";\r\n"
+    L"; For example, to see through it more:\r\n"
+    L";   GlassBlurSigma=5\r\n"
+    L";   GlassDarkTintA=0.06\r\n";
 
 std::wstring ReadString(const wchar_t* key, const wchar_t* fallback) {
     wchar_t buffer[128] = L"";
@@ -66,6 +106,97 @@ const wchar_t* PanelDisplayKeyword(PanelDisplay display) {
         case PanelDisplay::Mouse:   return L"mouse";
         case PanelDisplay::Primary: return L"main";
         default:                    return L"active";
+    }
+}
+
+// The field names in glass_tune.h are ASCII, so widening them is a copy. Local
+// rather than in common.h because nothing else needs it.
+std::wstring Widen(const char* ascii) {
+    std::wstring out;
+    for (const char* c = ascii; *c; ++c) out.push_back(static_cast<wchar_t>(*c));
+    return out;
+}
+
+// A float from the ini, or the fallback if the key is absent or unparseable.
+//
+// GetPrivateProfileInt cannot do this, so the value comes back as a string and
+// goes through wcstod. A key present but garbage keeps the fallback and says so,
+// because a value silently ignored is the worst outcome for someone tuning by
+// hand who cannot see why nothing changed.
+bool ReadFloat(const wchar_t* key, float& out) {
+    wchar_t buffer[64] = L"";
+    ::GetPrivateProfileStringW(kSection, key, L"", buffer, ARRAYSIZE(buffer),
+                               g_settingsPath.c_str());
+    if (buffer[0] == L'\0') return false;
+
+    wchar_t* end = nullptr;
+    const double v = ::wcstod(buffer, &end);
+    if (end == buffer) {
+        MACTAB_WARN("config: %s is not a number, ignoring", ToUtf8(key).c_str());
+        return false;
+    }
+    out = static_cast<float>(v);
+    return true;
+}
+
+// Read the whole material out of the ini, over the shipped defaults.
+//
+// Names come from glass_tune.h and nowhere else. A second list here would drift
+// from the one tools/preview uses, and the entire value of these keys is that a
+// number that looked right on Windows can be replayed and measured on the Mac
+// under the same name.
+void ReadGlass() {
+    g_settings.glassDark  = glass::kDark;
+    g_settings.glassLight = glass::kLight;
+    glass::g_tuning = glass::Tuning{};
+
+    int overrides = 0;
+
+    for (const glass::OpticsField& f : glass::kOpticsFields) {
+        const std::wstring key = L"Glass" + Widen(f.name);
+        float v = 0.0f;
+        if (ReadFloat(key.c_str(), v) && glass::SetOptic(glass::g_tuning, f.name, v))
+            ++overrides;
+    }
+
+    struct ThemeKeys { const wchar_t* prefix; glass::Params* params; };
+    const ThemeKeys themes[] = {
+        { L"GlassDark",  &g_settings.glassDark  },
+        { L"GlassLight", &g_settings.glassLight },
+    };
+
+    auto apply = [&](const ThemeKeys& t, const char* name) {
+        const std::wstring key = t.prefix + Widen(name);
+        float v = 0.0f;
+        if (ReadFloat(key.c_str(), v) && glass::SetField(*t.params, name, v))
+            ++overrides;
+    };
+
+    for (const ThemeKeys& t : themes) {
+        for (const glass::Field& f : glass::kFields) apply(t, f.name);
+        for (const char* n : { "tintr", "tintg", "tintb", "tinta" }) apply(t, n);
+    }
+
+    if (overrides > 0) {
+        MACTAB_DIAG("config: %d glass override%s from settings.ini", overrides,
+                    overrides == 1 ? "" : "s");
+    }
+
+    // Always logged, overridden or not, so a screenshot arrives with the numbers
+    // that produced it rather than with the numbers the release shipped.
+    MACTAB_DIAG("glass: sigma %.1f bezel %.1f depth %.1f maxDisp %.1f rimSpan %.1f",
+                glass::g_tuning.blurSigma, glass::g_tuning.bezelWidth,
+                glass::g_tuning.glassDepth, glass::g_tuning.maxDisplacement,
+                glass::g_tuning.rimSpan);
+    for (const ThemeKeys& t : themes) {
+        const glass::Params& p = *t.params;
+        MACTAB_DIAG("glass: %s sat %.2f gain %.3f bias %.3f tint %.2f/%.2f/%.2f a %.2f "
+                    "rim %.3f/%.3f/%.3f env %.2f+%.2f band %.2f-%.2f knee %.2f/%.2f",
+                    ToUtf8(t.prefix).c_str(), p.saturation, p.gain, p.bias,
+                    p.tint[0], p.tint[1], p.tint[2], p.tint[3],
+                    p.rimAmbient, p.rimLobe, p.specLine,
+                    p.rimEnvFloor, p.rimEnvGain,
+                    p.targetMin, p.targetMax, p.kneeBelow, p.kneeAbove);
     }
 }
 
@@ -151,6 +282,11 @@ Bitmap DecodeImageFile(const std::wstring& path) {
 
 const Settings& Current() { return g_settings; }
 
+void ReloadGlass() {
+    if (g_settingsPath.empty()) return;
+    ReadGlass();
+}
+
 void Load() {
     const std::wstring& dir = AppDataDir();
     if (dir.empty()) {
@@ -188,6 +324,8 @@ void Load() {
     g_settings.groupByApp  = ReadInt(L"GroupByApp", 1) != 0;
     g_settings.panelDisplay = ParsePanelDisplay(ReadString(L"PanelDisplay", L"active"));
     g_settings.glassRefraction = ReadInt(L"GlassRefraction", 1) != 0;
+    g_settings.glassRimTap     = ReadInt(L"GlassRimTap", 1) != 0;
+    ReadGlass();
 
     MACTAB_DIAG("config: revealDelay %u ms, leftAltOnly %d, tile %d, theme %s, "
                 "groupByApp %d, panelDisplay %s, glassRefraction %d",
@@ -196,6 +334,7 @@ void Load() {
                 g_settings.groupByApp ? 1 : 0,
                 ToUtf8(PanelDisplayKeyword(g_settings.panelDisplay)).c_str(),
                 g_settings.glassRefraction ? 1 : 0);
+    MACTAB_DIAG("config: glassRimTap %d", g_settings.glassRimTap ? 1 : 0);
 }
 
 bool SetPanelDisplay(PanelDisplay display) {

@@ -443,6 +443,7 @@ void ShowTrayMenu(HWND hwnd, POINT screenPt) {
     ::AppendMenuW(menu, MF_STRING | (hotkey::IsRunning() ? 0u : MF_DISABLED),
                   IDM_TRAY_RELOAD_HOOK, L"Reload keyboard hook");
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    ::AppendMenuW(menu, MF_STRING, IDM_TRAY_RELOAD_GLASS, L"Reload glass from settings.ini");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_LIST, L"Log current switcher list");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_LOG, L"Open diagnostics log");
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -627,6 +628,22 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         case IDM_TRAY_THEME_AUTO:  config::SetTheme(L"auto");  return 0;
         case IDM_TRAY_THEME_LIGHT: config::SetTheme(L"light"); return 0;
         case IDM_TRAY_THEME_DARK:  config::SetTheme(L"dark");  return 0;
+
+        case IDM_TRAY_RELOAD_GLASS:
+            // The whole material, re-read, without a restart.
+            //
+            // Not config::Load(), which reassigns the themes directory string
+            // the icon worker reads on its own thread. This touches only the two
+            // Params and the shared optics, and nothing off this thread reads
+            // either.
+            //
+            // The panel picks them up at the next gesture, because it copies the
+            // theme's material when it lays out rather than caching one at
+            // startup.
+            config::ReloadGlass();
+            g_app.tray.ShowBalloon(L"MacTab",
+                                   L"Glass reloaded. Alt+Tab to see it.");
+            return 0;
 
         case IDM_TRAY_DUMP_LIST:
             // M2 verification: what this prints should match what Windows'

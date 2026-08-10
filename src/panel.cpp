@@ -48,7 +48,7 @@ constexpr wchar_t kPanelClass[] = L"MacTabPanelWindow";
 // kBlurSigma and kBlurDownscale live in glass.h with the rest of the material,
 // so tools/preview reads the same numbers instead of a comment claiming it does.
 using glass::kBlurDownscale;
-using glass::kBlurSigma;
+using glass::kBlurSigma;   // the shipped default; g_tuning.blurSigma is what runs
 
 // Extra desktop captured around the panel so the blur has real pixels to pull
 // from instead of clamping at the edge under D2D1_BORDER_MODE_HARD.
@@ -61,8 +61,8 @@ using glass::kBlurSigma;
 // against a displacement ceiling of 16, and taking the blur's number alone would
 // have left the rim sampling four pixels of nothing all the way round.
 inline float BlurMarginPx(float dpiScale) {
-    const float forBlur = kBlurSigma * 1.5f;
-    const float forLens = glass::kMaxDisplacement + 4.0f;
+    const float forBlur = glass::g_tuning.blurSigma * 1.5f;
+    const float forLens = glass::g_tuning.maxDisplacement + 4.0f;
     return std::ceil((std::max)(forBlur, forLens) * dpiScale);
 }
 
@@ -93,7 +93,11 @@ struct Theme {
 
 Theme MakeTheme(bool light) {
     Theme theme{};
-    theme.material  = light ? glass::kLight : glass::kDark;
+    // From config, not from the constants: settings.ini can override any of it
+    // and the tray can reload it mid-session, and reading the constant here
+    // would make both of those silently do nothing until a restart.
+    theme.material  = light ? config::Current().glassLight
+                            : config::Current().glassDark;
     theme.selection = light ? D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.10f)
                             : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.18f);
     theme.label     = light ? WUI::Color{ 255, 20, 20, 22 }
@@ -201,9 +205,20 @@ struct Panel::Impl {
                    const RECT& screenRect, float radius);
     void BakeBackdrop();
     void DrawOuterStroke(ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& toSurface,
-                         float width, float height, float radius);
-    void DrawEdgeLight(ID2D1DeviceContext* dc, const glass::Surface& surface);
+                         float width, float height, float radius,
+                         const glass::Params& p);
+    void DrawEdgeLight(ID2D1DeviceContext* dc, const glass::Surface& surface,
+                       const glass::Params& p, const glass::LumaField* env);
     void BakeLabel();
+
+    // The mean luma of the captured frame under a rect, and the material
+    // adapted for it. Every piece of glass gets its own: the panel and the app
+    // name's capsule are the same material but they are not in the same place,
+    // and over a desktop that is bright on one side and dark on the other,
+    // giving the capsule the panel's operating point put the app name at 1.7:1.
+    float BackdropLumaIn(const RECT& screenRect) const;
+    glass::Params MaterialFor(const RECT& screenRect) const;
+
     float CapsuleLuma(const RECT& screenRect) const;
     void PositionTiles(bool animate);
     void UploadIcon(size_t index);
@@ -741,8 +756,9 @@ ComPtr<ID2D1Bitmap1> UploadBitmap(ID2D1DeviceContext* dc, Bitmap image) {
 // concentric with the outer one. Reusing the outer radius pinches the corners.
 void Panel::Impl::DrawOuterStroke(ID2D1DeviceContext* dc,
                                   const D2D1_MATRIX_3X2_F& toSurface,
-                                  float width, float height, float radius) {
-    if (material.rimOuterDark <= 0.0f) return;
+                                  float width, float height, float radius,
+                                  const glass::Params& p) {
+    if (p.rimOuterDark <= 0.0f) return;
 
     const float sw    = Scaled(1.0f);
     const float inset = sw * 0.5f;
@@ -756,7 +772,7 @@ void Panel::Impl::DrawOuterStroke(ID2D1DeviceContext* dc,
 
     ComPtr<ID2D1SolidColorBrush> dark;
     if (FAILED(dc->CreateSolidColorBrush(
-            D2D1::ColorF(0.0f, 0.0f, 0.0f, material.rimOuterDark), dark.Put()))) {
+            D2D1::ColorF(0.0f, 0.0f, 0.0f, p.rimOuterDark), dark.Put()))) {
         return;
     }
 
@@ -777,9 +793,10 @@ void Panel::Impl::DrawOuterStroke(ID2D1DeviceContext* dc,
 // alpha, so adding it adds exactly that amount. It carries the shape's own
 // antialiased coverage, which is why this can be drawn after the clip layer is
 // popped and does not need a second one.
-void Panel::Impl::DrawEdgeLight(ID2D1DeviceContext* dc, const glass::Surface& surface) {
+void Panel::Impl::DrawEdgeLight(ID2D1DeviceContext* dc, const glass::Surface& surface,
+                                const glass::Params& p, const glass::LumaField* env) {
     ComPtr<ID2D1Bitmap1> light =
-        UploadBitmap(dc, glass::BuildEdgeLight(surface, material));
+        UploadBitmap(dc, glass::BuildEdgeLight(surface, p, env));
     if (!light) return;
 
     dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD);
@@ -886,6 +903,26 @@ void Panel::Impl::CollectFrame() {
                 config::Current().glassRefraction ? "on" : "off");
 }
 
+// The mean luma of the captured frame under a rect, in the same 0..1
+// sRGB-encoded space the material arithmetic uses. Half when there is no frame,
+// which is the neutral answer and the one that leaves the base parameters alone.
+float Panel::Impl::BackdropLumaIn(const RECT& screenRect) const {
+    if (lastFrame.pixels.Empty()) return 0.5f;
+
+    const uint32_t mean = MeanColourIn(lastFrame.pixels,
+                                       screenRect.left   - lastFrame.bounds.left,
+                                       screenRect.top    - lastFrame.bounds.top,
+                                       screenRect.right  - lastFrame.bounds.left,
+                                       screenRect.bottom - lastFrame.bounds.top);
+    return glass::Luma(RedOf(mean) / 255.0f, GreenOf(mean) / 255.0f,
+                       BlueOf(mean) / 255.0f);
+}
+
+glass::Params Panel::Impl::MaterialFor(const RECT& screenRect) const {
+    if (lastFrame.pixels.Empty()) return theme.material;
+    return glass::Adapt(theme.material, BackdropLumaIn(screenRect));
+}
+
 // One piece of glass, cut from the captured frame at `screenRect` and drawn into
 // the current surface with its top-left at the origin.
 //
@@ -916,6 +953,9 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
     const capture::Frame& frame = lastFrame;
     const glass::Surface  glassSurface{ width, height, radius, dpiScale };
 
+    // This piece's own operating point, not the panel's.
+    const glass::Params piece = MaterialFor(screenRect);
+
     if (!frame.pixels.Empty()) {
         ComPtr<ID2D1Bitmap1> captured = UploadBitmap(dc, frame.pixels);
 
@@ -945,16 +985,27 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
         // A lambda only so the early returns can each hand back the last stage
         // that did get built: every step past the blur is optional, and a panel
         // with no refraction is worth far more than no panel.
-        auto buildTap = [&](float sigma) -> ComPtr<ID2D1Effect> {
+        // `srcScale` is the resolution `src` is already at: a quarter for the
+        // interior, which is blurred cheaply and upscaled, and full for the rim,
+        // which must not be.
+        //
+        // That distinction is the whole reason the rim tap works this time. In
+        // 0.4.0 both taps shared the quarter-resolution downsample, so the
+        // "sharp" one was a sigma of 0.5 followed by a 4x bilinear upscale, and
+        // the upscale on its own softens more than that. The two taps came out
+        // indistinguishable and the second one was deleted as redundant. It was
+        // not redundant, it was being thrown away one stage before it was used.
+        auto buildTap = [&](ID2D1Image* src, float sigma,
+                            float srcScale) -> ComPtr<ID2D1Effect> {
             ComPtr<ID2D1Effect> blur, matrix, place;
             dc->CreateEffect(CLSID_D2D1GaussianBlur, blur.Put());
             dc->CreateEffect(CLSID_D2D1ColorMatrix, matrix.Put());
             dc->CreateEffect(CLSID_D2D12DAffineTransform, place.Put());
-            if (!blur || !matrix || !place) return {};
+            if (!blur || !matrix || !place || !src) return {};
 
-            blur->SetInputEffect(0, scale.Get());
+            blur->SetInput(0, src);
             blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
-                           Scaled(sigma) * kBlurDownscale);
+                           Scaled(sigma) * srcScale);
             // HARD border mode: SOFT would fade the blur toward transparent at
             // the capture edges and halo the panel.
             blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
@@ -962,7 +1013,7 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
 
             matrix->SetInputEffect(0, blur.Get());
             matrix->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX,
-                             ToD2D(glass::BuildMatrix(material)));
+                             ToD2D(glass::BuildMatrix(piece)));
             // The desktop grab is opaque everywhere, so premultiplied and
             // straight are numerically the same here and the bias needs no
             // division. Left at the default rather than set, so that stays true
@@ -982,8 +1033,8 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
             // has to happen inside the graph.
             place->SetInputEffect(0, matrix.Get());
             place->SetValue(D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX,
-                            D2D1::Matrix3x2F::Scale(1.0f / kBlurDownscale,
-                                                    1.0f / kBlurDownscale) *
+                            D2D1::Matrix3x2F::Scale(1.0f / srcScale,
+                                                    1.0f / srcScale) *
                             D2D1::Matrix3x2F::Translation(dx, dy));
             place->SetValue(D2D1_2DAFFINETRANSFORM_PROP_INTERPOLATION_MODE,
                             D2D1_2DAFFINETRANSFORM_INTERPOLATION_MODE_LINEAR);
@@ -1023,7 +1074,7 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
             lens->SetInputEffect(0, extend.Get());
             lens->SetInput(1, map.Get());
             lens->SetValue(D2D1_DISPLACEMENTMAP_PROP_SCALE,
-                           2.0f * Scaled(glass::kMaxDisplacement));
+                           2.0f * Scaled(glass::g_tuning.maxDisplacement));
             lens->SetValue(D2D1_DISPLACEMENTMAP_PROP_X_CHANNEL_SELECT,
                            D2D1_CHANNEL_SELECTOR_R);
             lens->SetValue(D2D1_DISPLACEMENTMAP_PROP_Y_CHANNEL_SELECT,
@@ -1043,14 +1094,48 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
             return bound;
         };
 
-        // One tap, and one draw.
+        // Two taps. The interior is the soft one; the bezel is a much sharper
+        // one masked to the curved band and drawn over it.
         //
-        // There used to be two: a second, clearer tap masked to the bezel, added
-        // because at a 30px sigma the lens had no edges left to bend and did
-        // literally nothing. At 8 it has plenty, so that tap became a blur of 8
-        // composited over a blur of 8, and it is gone.
-        ComPtr<ID2D1Effect> glass = scale ? buildTap(kBlurSigma) : ComPtr<ID2D1Effect>{};
+        // Blur and refraction are different effects, and a lens bending an image
+        // that has already been through a sigma of 8 produces a smear rather
+        // than a bend. This is what makes the edge read as glass instead of as
+        // frost, so it is the part of this file most worth looking at on a real
+        // screen. GlassRimTap=0 in settings.ini turns it off if it goes wrong on
+        // some driver, and everything else about the material stays.
+        //
+        // Read the tuning first: naming a local `glass` makes the namespace
+        // unreachable from that point in the declaration onward.
+        const float sigma    = glass::g_tuning.blurSigma;
+        const float rimSigma = glass::g_tuning.rimBlurSigma;
+
+        // An effect is not an image, so the downscale's result has to be asked
+        // for as one. The returned image holds a reference back to the effect
+        // that produces it, so the chain stays alive on its own.
+        ComPtr<ID2D1Image> scaled;
+        if (scale) scale->GetOutput(scaled.Put());
+
+        ComPtr<ID2D1Effect> glass =
+            scaled ? buildTap(scaled.Get(), sigma, kBlurDownscale)
+                   : ComPtr<ID2D1Effect>{};
         if (glass) dc->DrawImage(glass.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
+
+        if (glass && map && config::Current().glassRimTap) {
+            // Full resolution, straight off the captured bitmap: no Scale on
+            // this path, which is the point of it.
+            ComPtr<ID2D1Effect> rim = buildTap(captured.Get(), rimSigma, 1.0f);
+            ComPtr<ID2D1Bitmap1> band =
+                UploadBitmap(dc, glass::BuildBezelMask(glassSurface));
+
+            ComPtr<ID2D1Effect> masked;
+            if (rim && band) dc->CreateEffect(CLSID_D2D1AlphaMask, masked.Put());
+
+            if (masked) {
+                masked->SetInputEffect(0, rim.Get());
+                masked->SetInput(1, band.Get());
+                dc->DrawImage(masked.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
+            }
+        }
     }
 
     const D2D1_RECT_F area = D2D1::RectF(0.0f, 0.0f, width, height);
@@ -1063,16 +1148,16 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
     // this path (a wedged GPU, a remote session, a capture that missed its
     // deadline) are exactly the ones nobody tests on.
     if (frame.pixels.Empty()) {
-        const D2D1_COLOR_F tint = TintColour(material);
+        const D2D1_COLOR_F tint = TintColour(piece);
         ComPtr<ID2D1SolidColorBrush> base;
         if (SUCCEEDED(dc->CreateSolidColorBrush(
-                D2D1::ColorF(tint.r, tint.g, tint.b, material.fallbackAlpha), base.Put()))) {
+                D2D1::ColorF(tint.r, tint.g, tint.b, piece.fallbackAlpha), base.Put()))) {
             dc->FillRectangle(area, base.Get());
         }
     }
 
     ComPtr<ID2D1SolidColorBrush> tintBrush;
-    if (SUCCEEDED(dc->CreateSolidColorBrush(TintColour(material), tintBrush.Put())))
+    if (SUCCEEDED(dc->CreateSolidColorBrush(TintColour(piece), tintBrush.Put())))
         dc->FillRectangle(area, tintBrush.Get());
 
     dc->PopLayer();
@@ -1080,8 +1165,21 @@ void Panel::Impl::DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
     // Both outside the clip layer. The stroke is drawn on the antialiased
     // boundary itself, and the lit edge carries the shape's coverage in its own
     // alpha, so neither needs one.
-    DrawOuterStroke(dc, toSurface, width, height, radius);
-    DrawEdgeLight(dc, glassSurface);
+    DrawOuterStroke(dc, toSurface, width, height, radius, piece);
+
+    // What the rim reflects: the sharp captured frame under this shape, not the
+    // treated backdrop. A highlight is a reflection of the scene, and the scene
+    // is what was grabbed, before this material took 29% of its contrast off.
+    glass::LumaField env;
+    if (!frame.pixels.Empty()) {
+        env = glass::BuildLumaField(frame.pixels,
+                                    screenRect.left - frame.bounds.left,
+                                    screenRect.top  - frame.bounds.top,
+                                    static_cast<int>(width),
+                                    static_cast<int>(height),
+                                    static_cast<int>(Scaled(16.0f)));
+    }
+    DrawEdgeLight(dc, glassSurface, piece, env.Empty() ? nullptr : &env);
 
     dc->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -1323,7 +1421,7 @@ float Panel::Impl::CapsuleLuma(const RECT& screenRect) const {
     // boundary just above the capsule. A dark strip under a bright neighbourhood
     // measures 0.12 and skips the shadow, while what renders is nearer 0.50 and
     // needs it.
-    const int reach = static_cast<int>(Scaled(kBlurSigma));
+    const int reach = static_cast<int>(Scaled(glass::g_tuning.blurSigma));
 
     const uint32_t mean = MeanColourIn(lastFrame.pixels,
                                        screenRect.left   - lastFrame.bounds.left - reach,
@@ -1334,7 +1432,12 @@ float Panel::Impl::CapsuleLuma(const RECT& screenRect) const {
     const float in[3]  = { RedOf(mean) / 255.0f, GreenOf(mean) / 255.0f,
                            BlueOf(mean) / 255.0f };
     float out[3];
-    glass::Apply(material, in, out);
+
+    // The capsule's own material, for the same reason DrawGlass uses one: this
+    // estimate decides whether the app name gets a shadow, so it has to be made
+    // against the material the capsule is actually drawn with.
+    const glass::Params piece = MaterialFor(screenRect);
+    glass::Apply(piece, in, out);
 
     // Include the lit edge. The capsule is short enough that the rim covers most
     // of it, so leaving it out makes this estimate systematically too dark and
@@ -1347,7 +1450,8 @@ float Panel::Impl::CapsuleLuma(const RECT& screenRect) const {
     // from just outside, which the inflated sampling region above already covers.
     const float height = static_cast<float>(screenRect.bottom - screenRect.top);
     return glass::LitBy(glass::Luma(out[0], out[1], out[2]),
-                        glass::MeanRimAlpha(material, height, dpiScale));
+                        glass::MeanRimAlpha(piece, height, dpiScale,
+                                            BackdropLumaIn(screenRect)));
 }
 
 // ---------------------------------------------------------------------------

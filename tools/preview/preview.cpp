@@ -29,11 +29,24 @@
 #include "squircle.h"
 #include "glass.h"
 #include "glass_map.h"
+#include "glass_tune.h"
 #include "panel_layout.h"
 
 using namespace mactab;
 
 namespace {
+
+// The material this run is using. The shipped values unless --set says
+// otherwise, which is how a number that looked right on Windows gets replayed
+// and measured here: settings.ini and this share one table of names, so
+//
+//     GlassDarkGain=0.74      in settings.ini
+//     --set dark.gain=0.74    here
+//
+// mean the same thing by construction rather than by anybody remembering to
+// keep two lists in step.
+glass::Params g_dark  = glass::kDark;
+glass::Params g_light = glass::kLight;
 
 // --- minimal PNG writer ----------------------------------------------------
 
@@ -343,7 +356,12 @@ float MeanSaturation(const Bitmap& image) {
 // How far outside the panel the refraction can reach, plus slack. The crop that
 // feeds ApplyRefraction has to carry at least this much margin or the rim pulls
 // in pixels that are not there.
-const int kRefractPad = static_cast<int>(glass::kMaxDisplacement) + 2;
+// Margin the refraction needs around a shape, in physical pixels. A function
+// rather than a constant because --set can raise the displacement ceiling, and a
+// pad frozen at the shipped value would then let the lens sample past the crop.
+int RefractPad() {
+    return static_cast<int>(glass::g_tuning.maxDisplacement) + 2;
+}
 
 // Zero the decoded displacement, so the same shot can be rendered with and
 // without the lens. That comparison is the whole reason the bars wallpaper
@@ -358,7 +376,7 @@ bool g_noRefract = false;
 // what is measured, and the encoding is the piece most likely to be wrong in a
 // way that only shows on a machine nobody here has.
 //
-// `source` is the treated backdrop with kRefractPad pixels of margin on every
+// `source` is the treated backdrop with RefractPad() pixels of margin on every
 // side, because the whole point is that the rim pulls in content from outside
 // the panel.
 Bitmap ApplyRefraction(const Bitmap& source, const glass::Surface& surface,
@@ -402,8 +420,8 @@ Bitmap ApplyRefraction(const Bitmap& source, const glass::Surface& surface,
             if (g_noRefract) { dx = 0.0f; dy = 0.0f; }
 
             peak = std::max(peak, std::sqrt(dx * dx + dy * dy));
-            out.At(x, y) = sample(static_cast<float>(kRefractPad + x) + dx,
-                                  static_cast<float>(kRefractPad + y) + dy);
+            out.At(x, y) = sample(static_cast<float>(RefractPad() + x) + dx,
+                                  static_cast<float>(RefractPad() + y) + dy);
         }
     }
 
@@ -418,28 +436,68 @@ Bitmap ApplyRefraction(const Bitmap& source, const glass::Surface& surface,
 // glass.
 //
 // `originX/originY` locate the shape inside the canvas, which has to carry at
-// least kRefractPad of margin around it on every side.
+// least RefractPad() of margin around it on every side.
 Bitmap RefractTap(const Bitmap& frostedCanvas, const glass::Surface& surface,
                   const glass::Params& material, int originX, int originY,
                   float* peakOut = nullptr) {
     const int w = static_cast<int>(surface.width);
     const int h = static_cast<int>(surface.height);
 
-    Bitmap wide = Bitmap::Create(w + kRefractPad * 2, h + kRefractPad * 2);
+    Bitmap wide = Bitmap::Create(w + RefractPad() * 2, h + RefractPad() * 2);
     for (int y = 0; y < wide.height; ++y)
         for (int x = 0; x < wide.width; ++x)
-            wide.At(x, y) = frostedCanvas.At(originX + x - kRefractPad,
-                                             originY + y - kRefractPad);
+            wide.At(x, y) = frostedCanvas.At(originX + x - RefractPad(),
+                                             originY + y - RefractPad());
 
     ApplyMaterial(wide, material);
     return ApplyRefraction(wide, surface, peakOut);
 }
 
+bool g_noRimTap = false;
+
+// The two taps, blended by the bezel mask.
+//
+// The interior comes off the frosted canvas and the bezel off a much sharper
+// one, because blur and refraction are different effects and bending an image
+// that has already been softened to nothing is not refraction, it is a smear.
+// The mask fades one into the other over the bezel width.
+//
+// This is the CPU model of what panel.cpp builds out of D2D effects. Having it
+// here is the whole reason the second tap can ship at all: the D2D graph is the
+// one part of the material nothing off Windows can execute, so the material
+// itself gets settled here and only the plumbing is left to be wrong.
+Bitmap RefractTwoTap(const Bitmap& frosted, const Bitmap& clear,
+                     const glass::Surface& surface, const glass::Params& material,
+                     int originX, int originY, float* peakOut = nullptr) {
+    Bitmap body = RefractTap(frosted, surface, material, originX, originY, peakOut);
+    if (g_noRimTap) return body;
+
+    const Bitmap mask = glass::BuildBezelMask(surface);
+    if (mask.Empty()) return body;
+
+    const Bitmap rim = RefractTap(clear, surface, material, originX, originY);
+
+    for (int y = 0; y < body.height; ++y)
+        for (int x = 0; x < body.width; ++x) {
+            const float a = AlphaOf(mask.At(x, y)) / 255.0f;
+            if (a <= 0.0f) continue;
+            const uint32_t lo = body.At(x, y), hi = rim.At(x, y);
+            auto mix = [&](uint8_t p, uint8_t q) {
+                return static_cast<uint8_t>(p * (1.0f - a) + q * a + 0.5f);
+            };
+            body.At(x, y) = MakePixel(mix(RedOf(lo),   RedOf(hi)),
+                                      mix(GreenOf(lo), GreenOf(hi)),
+                                      mix(BlueOf(lo),  BlueOf(hi)),
+                                      AlphaOf(lo));
+        }
+    return body;
+}
+
 // The lit edge, from the generator panel.cpp uses. The alpha carries the amount
 // to add, so applying it is one loop.
 void ApplyEdgeLight(Bitmap& body, const glass::Surface& surface,
-                    const glass::Params& p) {
-    const Bitmap light = glass::BuildEdgeLight(surface, p);
+                    const glass::Params& p, const glass::LumaField* env) {
+    const Bitmap light = glass::BuildEdgeLight(surface, p, env);
     if (light.Empty()) return;
 
     auto plus = [](uint8_t c, float amount) {
@@ -482,18 +540,276 @@ void Check(bool condition, const char* what) {
 // transfer slope get judged. Black and white are the two ends the adaptive bias
 // exists for: with a fixed transfer the panel washes out over one and goes to a
 // slab over the other, and the app name stops being readable over at least one.
-enum class Wallpaper { Gradient, Black, White, Bars };
+// The six surfaces the brief asks the material to survive, plus the three that
+// were already here for the numeric assertions.
+enum class Wallpaper {
+    Gradient,   // stand-in desktop: where saturation and the transfer are judged
+    Black,      // bottom of the range
+    White,      // top of the range
+    Bars,       // diagonal high-contrast, for the lens
+    Red,        // saturated red everywhere: does the panel pick up the hue
+    Split,      // black left, white right: does the rim reflect what is behind it
+    Solids,     // red / blue / green / black / white bands
+    Shapes,     // large saturated circles and rectangles
+    Text,       // black and white lettering
+    Detail,     // bar target, decreasing width, for measuring what survives
+    Ramp,       // strong colour gradients
+    Photo,      // synthetic photograph, structured like the reference shot
+};
 
 const char* WallpaperName(Wallpaper kind) {
     switch (kind) {
-        case Wallpaper::Black: return "black";
-        case Wallpaper::White: return "white";
-        default:               return "gradient";
+        case Wallpaper::Black:  return "black";
+        case Wallpaper::White:  return "white";
+        case Wallpaper::Bars:   return "bars";
+        case Wallpaper::Red:    return "red";
+        case Wallpaper::Split:  return "split";
+        case Wallpaper::Solids: return "solids";
+        case Wallpaper::Shapes: return "shapes";
+        case Wallpaper::Text:   return "text";
+        case Wallpaper::Detail: return "detail";
+        case Wallpaper::Ramp:   return "ramp";
+        case Wallpaper::Photo:  return "photo";
+        default:                return "gradient";
+    }
+}
+
+// The bar target's layout, shared by the wallpaper that draws it and the code
+// that measures it, because a copy of these numbers in the measurement would
+// silently read the wrong columns.
+inline constexpr int kBarGroups     = 5;
+inline constexpr int kBarPeriods[kBarGroups] = { 96, 64, 48, 32, 16 };
+
+int BarGroupStart(int width, int group) {
+    const int left = width * 12 / 100;
+    const int span = width * 76 / 100;
+    return left + span * group / kBarGroups;
+}
+
+// --- drawing primitives for the test surfaces -------------------------------
+
+void FillRect(Bitmap& b, int x0, int y0, int w, int h, uint32_t colour) {
+    for (int y = (std::max)(0, y0); y < (std::min)(b.height, y0 + h); ++y)
+        for (int x = (std::max)(0, x0); x < (std::min)(b.width, x0 + w); ++x)
+            b.At(x, y) = colour;
+}
+
+void FillDisc(Bitmap& b, float cx, float cy, float r, uint32_t colour) {
+    const int x0 = (std::max)(0, static_cast<int>(cx - r) - 1);
+    const int x1 = (std::min)(b.width,  static_cast<int>(cx + r) + 2);
+    const int y0 = (std::max)(0, static_cast<int>(cy - r) - 1);
+    const int y1 = (std::min)(b.height, static_cast<int>(cy + r) + 2);
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x) {
+            const float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+            if (dx * dx + dy * dy <= r * r) b.At(x, y) = colour;
+        }
+}
+
+// 5x7 uppercase, digits and a few marks. Enough to put readable words behind
+// the glass without pulling in a font library, and blocky letterforms are the
+// harder case anyway: they have no antialiasing to hide behind.
+const char* GlyphRows(char c) {
+    switch (c) {
+        case 'A': return "01110""10001""10001""11111""10001""10001""10001";
+        case 'B': return "11110""10001""11110""10001""10001""10001""11110";
+        case 'C': return "01111""10000""10000""10000""10000""10000""01111";
+        case 'D': return "11110""10001""10001""10001""10001""10001""11110";
+        case 'E': return "11111""10000""11110""10000""10000""10000""11111";
+        case 'F': return "11111""10000""11110""10000""10000""10000""10000";
+        case 'G': return "01111""10000""10000""10011""10001""10001""01111";
+        case 'H': return "10001""10001""11111""10001""10001""10001""10001";
+        case 'I': return "11111""00100""00100""00100""00100""00100""11111";
+        case 'K': return "10001""10010""11100""10010""10001""10001""10001";
+        case 'L': return "10000""10000""10000""10000""10000""10000""11111";
+        case 'M': return "10001""11011""10101""10001""10001""10001""10001";
+        case 'N': return "10001""11001""10101""10011""10001""10001""10001";
+        case 'O': return "01110""10001""10001""10001""10001""10001""01110";
+        case 'P': return "11110""10001""11110""10000""10000""10000""10000";
+        case 'R': return "11110""10001""11110""10100""10010""10001""10001";
+        case 'S': return "01111""10000""01110""00001""00001""10001""01110";
+        case 'T': return "11111""00100""00100""00100""00100""00100""00100";
+        case 'U': return "10001""10001""10001""10001""10001""10001""01110";
+        case 'V': return "10001""10001""10001""10001""01010""01010""00100";
+        case 'W': return "10001""10001""10001""10101""10101""11011""10001";
+        case 'X': return "10001""01010""00100""00100""00100""01010""10001";
+        case 'Y': return "10001""01010""00100""00100""00100""00100""00100";
+        case '0': return "01110""10011""10101""10101""10101""11001""01110";
+        case '1': return "00100""01100""00100""00100""00100""00100""01110";
+        case '2': return "01110""10001""00001""00110""01000""10000""11111";
+        case '5': return "11111""10000""11110""00001""00001""10001""01110";
+        case '.': return "00000""00000""00000""00000""00000""01100""01100";
+        default:  return "00000""00000""00000""00000""00000""00000""00000";
+    }
+}
+
+// `scale` is the size of one font pixel, so a scale of 8 gives 56px capitals.
+void DrawWord(Bitmap& b, const char* text, int x0, int y0, int scale,
+              uint32_t colour) {
+    int pen = x0;
+    for (const char* c = text; *c; ++c) {
+        if (*c != ' ') {
+            const char* rows = GlyphRows(*c);
+            for (int r = 0; r < 7; ++r)
+                for (int k = 0; k < 5; ++k)
+                    if (rows[r * 5 + k] == '1')
+                        FillRect(b, pen + k * scale, y0 + r * scale,
+                                 scale, scale, colour);
+        }
+        pen += 6 * scale;
     }
 }
 
 Bitmap MakeWallpaper(int width, int height, Wallpaper kind) {
     Bitmap out = Bitmap::Create(width, height);
+
+    if (kind == Wallpaper::Red) {
+        // Not quite pure red. A dead 255/0/0 field has no structure at all, and
+        // the point is to watch the hue survive the material, which needs the
+        // material to have something to work on.
+        for (int y = 0; y < height; ++y)
+            for (int x = 0; x < width; ++x) {
+                const bool dim = ((x / 60) + (y / 60)) % 2 == 0;
+                out.At(x, y) = dim ? MakePixel(214, 16, 20, 255)
+                                   : MakePixel(238, 34, 30, 255);
+            }
+        return out;
+    }
+
+    if (kind == Wallpaper::Split) {
+        // The rim's own test surface. One edge of the panel runs across both
+        // halves, so a rim that reflects its environment comes out visibly
+        // brighter on the right, and a rim that is a painted-on border comes out
+        // the same on both. Nothing else here can tell those apart.
+        FillRect(out, 0, 0, width / 2, height, MakePixel(6, 6, 8, 255));
+        FillRect(out, width / 2, 0, width - width / 2, height,
+                 MakePixel(248, 248, 246, 255));
+        return out;
+    }
+
+    if (kind == Wallpaper::Solids) {
+        // Five vertical bands, so one render covers every solid the brief lists
+        // and the panel spans all of them at once. That is the harder case than
+        // five separate renders: the material has to hold together across a hard
+        // colour boundary sitting under its middle.
+        const uint32_t bands[5] = {
+            MakePixel(220,  30,  30, 255), MakePixel( 30,  70, 220, 255),
+            MakePixel( 20, 170,  70, 255), MakePixel(  0,   0,   0, 255),
+            MakePixel(255, 255, 255, 255),
+        };
+        for (int x = 0; x < width; ++x) {
+            const int band = (std::min)(4, x * 5 / (std::max)(1, width));
+            for (int y = 0; y < height; ++y) out.At(x, y) = bands[band];
+        }
+        return out;
+    }
+
+    if (kind == Wallpaper::Shapes) {
+        FillRect(out, 0, 0, width, height, MakePixel(28, 28, 34, 255));
+        FillDisc(out, width * 0.22f, height * 0.42f, height * 0.30f,
+                 MakePixel(228, 40, 48, 255));
+        FillDisc(out, width * 0.74f, height * 0.34f, height * 0.26f,
+                 MakePixel(36, 96, 235, 255));
+        FillRect(out, static_cast<int>(width * 0.38f),
+                 static_cast<int>(height * 0.52f),
+                 static_cast<int>(width * 0.30f),
+                 static_cast<int>(height * 0.40f),
+                 MakePixel(24, 190, 96, 255));
+        return out;
+    }
+
+    if (kind == Wallpaper::Text) {
+        // Black lettering on the left half, white on the right, so both
+        // polarities sit under the panel in one render.
+        const int scale = (std::max)(3, height / 46);
+        FillRect(out, 0, 0, width / 2, height, MakePixel(238, 238, 238, 255));
+        FillRect(out, width / 2, 0, width - width / 2, height,
+                 MakePixel(18, 18, 18, 255));
+        DrawWord(out, "GLASS",  width / 24, height / 6, scale,
+                 MakePixel(0, 0, 0, 255));
+        DrawWord(out, "NOT",    width / 24, height / 2, scale,
+                 MakePixel(0, 0, 0, 255));
+        DrawWord(out, "FROSTED", width / 2 + width / 24, height / 6, scale,
+                 MakePixel(255, 255, 255, 255));
+        DrawWord(out, "PLASTIC", width / 2 + width / 24, height / 2, scale,
+                 MakePixel(255, 255, 255, 255));
+        return out;
+    }
+
+    if (kind == Wallpaper::Detail) {
+        // A bar target: groups of vertical bars of decreasing period. Amplitude
+        // measured through the glass at each period is the objective form of
+        // "the background stays recognisable", and it is the one surface here
+        // whose purpose is a number rather than a look.
+        //
+        // The groups are inset to the middle 76% so that all five sit inside the
+        // panel with room to spare, and the widest is sized to fit one and a
+        // half cycles in its group, which is all max-minus-min needs.
+        FillRect(out, 0, 0, width, height, MakePixel(128, 128, 128, 255));
+        for (int g = 0; g < kBarGroups; ++g) {
+            const int p  = kBarPeriods[g];
+            const int x0 = BarGroupStart(width, g);
+            const int x1 = BarGroupStart(width, g + 1);
+            for (int x = (std::max)(0, x0); x < (std::min)(width, x1); ++x) {
+                const bool on = ((x - x0) / (p / 2)) % 2 == 0;
+                const uint8_t v = on ? 245 : 12;
+                for (int y = 0; y < height; ++y)
+                    out.At(x, y) = MakePixel(v, v, v, 255);
+            }
+        }
+        return out;
+    }
+
+    if (kind == Wallpaper::Ramp) {
+        for (int y = 0; y < height; ++y) {
+            const float v = static_cast<float>(y) / (std::max)(1, height - 1);
+            for (int x = 0; x < width; ++x) {
+                const float u = static_cast<float>(x) / (std::max)(1, width - 1);
+                const float r = 255.0f * u;
+                const float g = 255.0f * (1.0f - u) * (1.0f - v);
+                const float b = 255.0f * v;
+                out.At(x, y) = MakePixel(static_cast<uint8_t>(r),
+                                         static_cast<uint8_t>(g),
+                                         static_cast<uint8_t>(b), 255);
+            }
+        }
+        return out;
+    }
+
+    if (kind == Wallpaper::Photo) {
+        // Built to the same shape as the reference screenshot: sky, sun, and a
+        // building whose windows give structure at exactly the scale the
+        // measurement says has to survive the blur. In the reference you can
+        // count the floors through the panel, so this is the surface where that
+        // claim can be checked rather than asserted.
+        for (int y = 0; y < height; ++y) {
+            const float v = static_cast<float>(y) / (std::max)(1, height - 1);
+            for (int x = 0; x < width; ++x) {
+                out.At(x, y) = MakePixel(
+                    static_cast<uint8_t>( 60.0f + 150.0f * v),
+                    static_cast<uint8_t>(110.0f + 110.0f * v),
+                    static_cast<uint8_t>(190.0f -  40.0f * v), 255);
+            }
+        }
+        FillDisc(out, width * 0.80f, height * 0.18f, height * 0.09f,
+                 MakePixel(255, 244, 214, 255));
+
+        const int bx = static_cast<int>(width * 0.08f);
+        const int bw = static_cast<int>(width * 0.56f);
+        const int by = static_cast<int>(height * 0.22f);
+        FillRect(out, bx, by, bw, height - by, MakePixel(86, 78, 72, 255));
+
+        // Floors and columns, 9px windows on a 16px pitch. Under a sigma of 8
+        // these stay countable; under the 30 we shipped in 0.4.0 they did not.
+        for (int wy = by + 10; wy + 9 < height; wy += 16)
+            for (int wx = bx + 10; wx + 9 < bx + bw; wx += 16) {
+                const bool lit = ((wx / 16) * 7 + (wy / 16) * 3) % 5 != 0;
+                FillRect(out, wx, wy, 9, 9,
+                         lit ? MakePixel(238, 226, 186, 255)
+                             : MakePixel(44, 40, 38, 255));
+            }
+        return out;
+    }
 
     if (kind == Wallpaper::Bars) {
         // High-contrast diagonal bars, wide enough to survive the 30px blur, so
@@ -620,6 +936,32 @@ Bitmap Zoom(const Bitmap& source, int x0, int y0, int w, int h, int factor) {
 
 // What the render measured, so the numbers can be diffed against the reference
 // table instead of squinted at.
+// Mean lit-edge amount along the TOP run, over a horizontal slice of the shape
+// given as fractions of its width.
+//
+// The point of it is the split wallpaper: with the rim reflecting its
+// environment the two ends of the same edge have to come out different, and by
+// roughly the ratio Params::rimEnvFloor and rimEnvGain say they should. Nothing
+// else here can tell a reflection from a painted line.
+float MeanRimAlphaOver(const glass::Surface& s, const glass::Params& p,
+                       const glass::LumaField& env, float u0, float u1) {
+    const Bitmap light = glass::BuildEdgeLight(s, p, &env);
+    if (light.Empty()) return 0.0f;
+
+    const int x0 = static_cast<int>(u0 * light.width);
+    const int x1 = static_cast<int>(u1 * light.width);
+    const int rows = std::min(light.height, static_cast<int>(glass::kRimSpan));
+
+    double sum = 0.0;
+    int    n   = 0;
+    for (int y = 0; y < rows; ++y)
+        for (int x = x0; x < x1 && x < light.width; ++x) {
+            sum += AlphaOf(light.At(x, y)) / 255.0;
+            ++n;
+        }
+    return (n > 0) ? static_cast<float>(sum / n) : 0.0f;
+}
+
 struct PanelStats {
     float backdropLuma = 0.0f;   // mean of the blurred wallpaper under the panel
     float panelLuma    = 0.0f;   // mean of the finished glass
@@ -630,7 +972,24 @@ struct PanelStats {
     float peakDisplacement = 0.0f;   // largest rim displacement, physical px
     float labelShadowContrast = 0.0f;
     bool  labelShadowed = false;
+    float rimLeft = 0.0f, rimRight = 0.0f;   // mean top-rim amount at each end
+    float panelChroma = 0.0f;                // mean (max - min) channel spread
 };
+
+// How much colour is left in the finished glass, as the mean spread between the
+// brightest and dimmest channel. Zero is grey.
+float MeanChroma(const Bitmap& image) {
+    if (image.Empty()) return 0.0f;
+    double sum = 0.0;
+    for (int y = 0; y < image.height; ++y)
+        for (int x = 0; x < image.width; ++x) {
+            const uint32_t px = image.At(x, y);
+            const int hi = std::max({ RedOf(px), GreenOf(px), BlueOf(px) });
+            const int lo = std::min({ RedOf(px), GreenOf(px), BlueOf(px) });
+            sum += (hi - lo) / 255.0;
+        }
+    return static_cast<float>(sum / (static_cast<double>(image.width) * image.height));
+}
 
 // The whole panel at the real layout metrics, over a real blurred wallpaper,
 // with the real material applied.
@@ -654,7 +1013,11 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
     // sharp live desktop, and that sharpness is the entire reason the coat has
     // to be as opaque as it is.
     Bitmap source = canvas;
-    if (haveCapture) Blur(source, glass::kBlurSigma);
+    Bitmap clear  = canvas;
+    if (haveCapture) {
+        Blur(source, glass::g_tuning.blurSigma);
+        Blur(clear,  glass::g_tuning.rimBlurSigma);
+    }
 
     const glass::Surface surface{ static_cast<float>(panelW),
                                   static_cast<float>(panelH),
@@ -679,15 +1042,16 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
             stats->adaptedBias  = material.bias;
         }
 
-        body = RefractTap(source, surface, material, margin, margin,
-                          stats ? &stats->peakDisplacement : nullptr);
+        body = RefractTwoTap(source, clear, surface, material, margin, margin,
+                             stats ? &stats->peakDisplacement : nullptr);
     } else {
         ApplyFallback(body, material);
     }
 
     if (stats) {
-        stats->panelLuma = MeanLuma(body);
-        stats->satAfter  = MeanSaturation(body);
+        stats->panelLuma   = MeanLuma(body);
+        stats->satAfter    = MeanSaturation(body);
+        stats->panelChroma = MeanChroma(body);
     }
 
     // Corners.
@@ -711,7 +1075,17 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
     }
 
     ApplyOuterStroke(body, material);
-    ApplyEdgeLight(body, surface, material);
+    {
+        // The rim reflects the sharp desktop, not the treated backdrop. Same
+        // input panel.cpp hands it.
+        const glass::LumaField env =
+            glass::BuildLumaField(canvas, margin, margin, panelW, panelH);
+        ApplyEdgeLight(body, surface, material, &env);
+        if (stats) {
+            stats->rimLeft  = MeanRimAlphaOver(surface, material, env, 0.0f, 0.25f);
+            stats->rimRight = MeanRimAlphaOver(surface, material, env, 0.75f, 1.0f);
+        }
+    }
 
     CompositeOver(canvas, body, margin, margin);
 
@@ -784,10 +1158,23 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
             for (int xx = 0; xx < pillW; ++xx)
                 pill.At(xx, y) = source.At(pillX + xx, pillY + y);
 
+        // The capsule adapts on ITS OWN backdrop, not the panel's.
+        //
+        // It used to inherit the panel's, which is wrong whenever the two sit
+        // over different content, and the text surface is what caught it: half
+        // the wallpaper white and half black puts the panel's mean at 0.53 while
+        // the capsule sits entirely over the white half, so the capsule landed
+        // far outside its band and the app name came out at 1.7:1.
+        //
+        // They are still the same material. They are just two pieces of it in
+        // two different places, which is what a material means.
+        glass::Params pillMaterial = material;
         if (haveCapture) {
-            pill = RefractTap(source, pillSurface, material, pillX, pillY);
+            pillMaterial = glass::Adapt(base, MeanLuma(pill));
+            pill = RefractTwoTap(source, clear, pillSurface, pillMaterial,
+                                 pillX, pillY);
         } else {
-            ApplyFallback(pill, material);
+            ApplyFallback(pill, pillMaterial);
         }
 
         {
@@ -808,12 +1195,16 @@ Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
                 }
         }
 
-        ApplyOuterStroke(pill, material);
-        ApplyEdgeLight(pill, pillSurface, material);
+        ApplyOuterStroke(pill, pillMaterial);
+        {
+            const glass::LumaField env =
+                glass::BuildLumaField(canvas, pillX, pillY, pillW, pillH, 8);
+            ApplyEdgeLight(pill, pillSurface, pillMaterial, &env);
+        }
 
         if (stats) {
             const float pillLuma = MeanLuma(pill);
-            const bool  lightText = material.tint[0] <= 0.5f;
+            const bool  lightText = pillMaterial.tint[0] <= 0.5f;
             const float text = lightText ? (245.0f / 255.0f) : (20.0f / 255.0f);
 
             stats->labelContrast = glass::ContrastRatio(pillLuma, text);
@@ -899,7 +1290,7 @@ void RunSelfChecks() {
     // Two invariants, and they are the only things that can rot silently: a
     // transposition, or a slip in one of the six coefficients. Both survive
     // compilation and both are invisible without a screenshot.
-    for (const glass::Params* p : { &glass::kDark, &glass::kLight }) {
+    for (const glass::Params* p : { &g_dark, &g_light }) {
         const glass::Matrix5x4 m = glass::BuildMatrix(*p);
 
         // Grey in, grey out at the gain: every colour column sums to g.
@@ -934,6 +1325,24 @@ void RunSelfChecks() {
               "the rim amplitudes keep their order");
         Check(p->gain > 0.0f && p->gain < 1.0f, "gain compresses rather than expands");
         Check(p->bias >= 0.0f && p->bias < 0.5f, "bias lifts the black point, not the whole image");
+        Check(p->rimEnvGain > p->rimEnvFloor && p->rimEnvFloor > 0.0f,
+              "the rim's reflection has a floor below its gain");
+        Check(p->targetMin < p->targetMax, "the adaptive band is the right way round");
+        Check(p->kneeBelow > 0.0f && p->kneeBelow <= 1.0f &&
+              p->kneeAbove >= 0.0f && p->kneeAbove <= 1.0f,
+              "the knees are fractions");
+
+        // A mid backdrop has to leave the rim amounts meaning what they were
+        // measured to mean, or every number above drifts with the reflection.
+        Check(std::fabs(glass::RimReflection(*p, 0.5f) - 1.0f) < 0.01f,
+              "a mid backdrop reflects at unity");
+
+        // The knee has to keep the direction of an excursion, in both
+        // directions, or the panel is back to being a fixed colour.
+        Check(glass::LandingPoint(*p, p->targetMin - 0.2f) < p->targetMin,
+              "a dark desktop lands the panel below its floor");
+        Check(glass::LandingPoint(*p, p->targetMin - 0.2f) > p->targetMin - 0.2f,
+              "the floor still pulls, it just no longer clamps");
 
         // The user's verdict on 0.3 was that the glass reads opaque. This is
         // the number that was wrong, so this is the assertion that stops it
@@ -961,7 +1370,7 @@ void RunSelfChecks() {
         const glass::Optics  optics = glass::OpticsFor(surface);
 
         const Bitmap map   = glass::BuildDisplacementMap(surface);
-        const Bitmap light = glass::BuildEdgeLight(surface, glass::kDark);
+        const Bitmap light = glass::BuildEdgeLight(surface, g_dark);
         const float  scale = 2.0f * optics.maxDisplacement;
 
         // The interior is flat glass. Anything else there means the bezel is
@@ -1044,7 +1453,7 @@ void RunSelfChecks() {
         // The overhead lobe. Sampled four pixels in, past the filament, so this
         // measures the field alone. The reference has the top rim at +33 luma
         // against +22 at the sides.
-        for (const glass::Params* p : { &glass::kDark, &glass::kLight }) {
+        for (const glass::Params* p : { &g_dark, &g_light }) {
             const Bitmap lit = glass::BuildEdgeLight(surface, *p);
             const float top  = AlphaOf(lit.At(lit.width / 2, 4));
             const float side = AlphaOf(lit.At(4, lit.height / 2));
@@ -1079,10 +1488,53 @@ void RunSelfChecks() {
     }
 }
 
+// --set dark.gain=0.74, --set light.tinta=0.06, --set blursigma=5
+//
+// The same names settings.ini uses, minus the Glass prefix, so a value that
+// looked right on the Windows side can be pasted in here and measured. Anything
+// unrecognised is an error rather than a shrug: a silently ignored knob is how
+// somebody spends an afternoon tuning a number that was never being read.
+bool ApplySetting(const std::string& arg) {
+    const size_t eq = arg.find('=');
+    if (eq == std::string::npos) return false;
+
+    std::string name  = arg.substr(0, eq);
+    const float value = std::strtof(arg.c_str() + eq + 1, nullptr);
+
+    glass::Params* target = nullptr;
+    const size_t dot = name.find('.');
+    if (dot != std::string::npos) {
+        const std::string which = name.substr(0, dot);
+        if      (which == "dark")  target = &g_dark;
+        else if (which == "light") target = &g_light;
+        else return false;
+        name = name.substr(dot + 1);
+    }
+
+    if (target) return glass::SetField(*target, name.c_str(), value);
+    return glass::SetOptic(glass::g_tuning, name.c_str(), value);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    const std::string outDir = (argc > 1) ? argv[1] : "preview-out";
+    std::string outDir = "preview-out";
+    bool haveOutDir = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--set") {
+            if (i + 1 >= argc || !ApplySetting(argv[i + 1])) {
+                std::fprintf(stderr, "--set wants name=value, for example "
+                                     "dark.gain=0.74 or blursigma=5\n");
+                return 2;
+            }
+            ++i;
+        } else if (!haveOutDir) {
+            outDir = arg;
+            haveOutDir = true;
+        }
+    }
 
     const Case cases[] = {
         { "full-bleed-square", MakeFullBleedSquare },
@@ -1152,10 +1604,10 @@ int main(int argc, char** argv) {
                     m.tileSize, m.panelWidth, m.panelHeight, m.radius,
                     static_cast<double>(layout::kPanelCornerExponent));
         std::printf("       transfer  dark %.2f*L + %.2f   light %.2f*L + %.2f\n",
-                    static_cast<double>(glass::EndGain(glass::kDark)),
-                    static_cast<double>(glass::EndBias(glass::kDark)),
-                    static_cast<double>(glass::EndGain(glass::kLight)),
-                    static_cast<double>(glass::EndBias(glass::kLight)));
+                    static_cast<double>(glass::EndGain(g_dark)),
+                    static_cast<double>(glass::EndBias(g_dark)),
+                    static_cast<double>(glass::EndGain(g_light)),
+                    static_cast<double>(glass::EndBias(g_light)));
 
         struct Shot {
             const char* file;
@@ -1167,18 +1619,39 @@ int main(int argc, char** argv) {
             int count;
         };
         const Shot shots[] = {
-            { "/panel-dark-gradient.png",  glass::kDark,  "dark",  Wallpaper::Gradient, 1, true,  6 },
-            { "/panel-dark-black.png",     glass::kDark,  "dark",  Wallpaper::Black,    1, true,  6 },
-            { "/panel-dark-white.png",     glass::kDark,  "dark",  Wallpaper::White,    1, true,  6 },
-            { "/panel-light-gradient.png", glass::kLight, "light", Wallpaper::Gradient, 1, true,  6 },
-            { "/panel-light-black.png",    glass::kLight, "light", Wallpaper::Black,    1, true,  6 },
-            { "/panel-light-white.png",    glass::kLight, "light", Wallpaper::White,    1, true,  6 },
-            { "/panel-label-end.png",      glass::kDark,  "dark",  Wallpaper::Gradient, 5, true,  6 },
-            { "/panel-no-capture.png",     glass::kDark,  "dark",  Wallpaper::Gradient, 1, false, 6 },
+            { "/panel-dark-gradient.png",  g_dark,  "dark",  Wallpaper::Gradient, 1, true,  6 },
+            { "/panel-dark-black.png",     g_dark,  "dark",  Wallpaper::Black,    1, true,  6 },
+            { "/panel-dark-white.png",     g_dark,  "dark",  Wallpaper::White,    1, true,  6 },
+            { "/panel-light-gradient.png", g_light, "light", Wallpaper::Gradient, 1, true,  6 },
+            { "/panel-light-black.png",    g_light, "light", Wallpaper::Black,    1, true,  6 },
+            { "/panel-light-white.png",    g_light, "light", Wallpaper::White,    1, true,  6 },
+            { "/panel-label-end.png",      g_dark,  "dark",  Wallpaper::Gradient, 5, true,  6 },
+            { "/panel-no-capture.png",     g_dark,  "dark",  Wallpaper::Gradient, 1, false, 6 },
             // One app is a real case now: the switcher shows a panel for it
             // rather than suppressing itself. The panel goes square, which is
             // the geometry least likely to have been thought about.
-            { "/panel-single-app.png",     glass::kDark,  "dark",  Wallpaper::Gradient, 0, true,  1 },
+            { "/panel-single-app.png",     g_dark,  "dark",  Wallpaper::Gradient, 0, true,  1 },
+
+            // The surfaces from the brief. These exist to be looked at rather
+            // than to be measured, with one exception: `detail` is measured
+            // below, because "you can still see what is behind it" is only an
+            // opinion until somebody puts a number on it.
+            { "/surface-dark-red.png",     g_dark,  "dark",  Wallpaper::Red,    1, true, 6 },
+            { "/surface-dark-split.png",   g_dark,  "dark",  Wallpaper::Split,  1, true, 6 },
+            { "/surface-dark-solids.png",  g_dark,  "dark",  Wallpaper::Solids, 1, true, 6 },
+            { "/surface-dark-shapes.png",  g_dark,  "dark",  Wallpaper::Shapes, 1, true, 6 },
+            { "/surface-dark-text.png",    g_dark,  "dark",  Wallpaper::Text,   1, true, 6 },
+            { "/surface-dark-detail.png",  g_dark,  "dark",  Wallpaper::Detail, 1, true, 6 },
+            { "/surface-dark-ramp.png",    g_dark,  "dark",  Wallpaper::Ramp,   1, true, 6 },
+            { "/surface-dark-photo.png",   g_dark,  "dark",  Wallpaper::Photo,  1, true, 6 },
+            { "/surface-light-red.png",    g_light, "light", Wallpaper::Red,    1, true, 6 },
+            { "/surface-light-split.png",  g_light, "light", Wallpaper::Split,  1, true, 6 },
+            { "/surface-light-solids.png", g_light, "light", Wallpaper::Solids, 1, true, 6 },
+            { "/surface-light-shapes.png", g_light, "light", Wallpaper::Shapes, 1, true, 6 },
+            { "/surface-light-text.png",   g_light, "light", Wallpaper::Text,   1, true, 6 },
+            { "/surface-light-detail.png", g_light, "light", Wallpaper::Detail, 1, true, 6 },
+            { "/surface-light-ramp.png",   g_light, "light", Wallpaper::Ramp,   1, true, 6 },
+            { "/surface-light-photo.png",  g_light, "light", Wallpaper::Photo,  1, true, 6 },
         };
 
         std::printf("\n%-9s %-9s %8s %8s %8s %7s %7s %8s\n",
@@ -1211,11 +1684,39 @@ int main(int argc, char** argv) {
                             static_cast<double>(stats.labelContrast),
                             static_cast<double>(stats.labelShadowContrast));
 
-            // The acceptance test. A material that leaves the band, or leaves
-            // the app name under 4.5:1, is not shippable no matter how it looks.
-            Check(stats.panelLuma >= shot.material.targetMin - 0.03f &&
-                  stats.panelLuma <= shot.material.targetMax + 0.03f,
-                  "panel luma lands inside the adaptive band");
+            // The acceptance test.
+            //
+            // This used to be "the panel lands inside the band", which stopped
+            // being the right assertion the moment the band stopped being a hard
+            // clamp. Adapt() is shared code, so the stronger form is available:
+            // predict the exact landing point and check the render hit it. That
+            // catches a drifting material the band never could, and it survives
+            // any future retune of the knee without being rewritten.
+            //
+            // PanelLuma is a grey-world model: it puts the mean luma through an
+            // affine transfer. On strongly coloured content that is not the
+            // whole story, because a saturation of 1.7 drives the dominant
+            // channel past 1 and the clamp takes the overshoot off, which lowers
+            // the finished luma. That is a real effect and not an error, so on
+            // chromatic surfaces the check becomes directional: clipping can
+            // only pull the panel down, never lift it.
+            const float predicted =
+                glass::PanelLuma(glass::Adapt(shot.material, stats.backdropLuma),
+                                 stats.backdropLuma);
+            const float drift = predicted - stats.panelLuma;
+            Check(stats.satBefore > 0.70f ? (drift >= -0.045f && drift <= 0.09f)
+                                          : (std::fabs(drift) < 0.045f),
+                  "the panel lands where Adapt says it will");
+
+            // And the material still has to react. A knee of zero would pass the
+            // check above and would be the fixed-colour panel all over again, so
+            // the direction is asserted separately at the two ends.
+            if (shot.wallpaper == Wallpaper::White || shot.wallpaper == Wallpaper::Black) {
+                const float flat = glass::PanelLuma(shot.material, 0.5f);
+                const bool brighter = stats.backdropLuma > 0.5f;
+                Check(brighter ? (stats.panelLuma > flat) : (stats.panelLuma < flat),
+                      "a brighter desktop gives a brighter panel and a darker one a darker panel");
+            }
             // The app name has to read, with the shadow BakeLabel adds when the
             // bare capsule is not enough.
             //
@@ -1233,12 +1734,109 @@ int main(int argc, char** argv) {
             // panel and 0.642 inside, a ratio of 0.87. Only the light material
             // has a reference, and only a wallpaper with real chroma can measure
             // it, so this is the one shot that can check it.
-            if (&shot.material == &glass::kLight &&
+            if (&shot.material == &g_light &&
                 shot.wallpaper == Wallpaper::Gradient && stats.satBefore > 0.0f) {
                 const float ratio = stats.satAfter / stats.satBefore;
                 Check(ratio >= 0.84f && ratio <= 0.90f,
                       "the light material lands on the reference saturation ratio");
             }
+
+            // The rim is a reflection, so the two ends of one edge over a
+            // black/white split must not match. The amounts come from
+            // rimEnvFloor 0.30 and rimEnvGain 1.40, which put a white backdrop
+            // at 1.70 against black at 0.30, so the ratio should be near six.
+            // Anything under three is a rim that has stopped reacting.
+            if (shot.wallpaper == Wallpaper::Split && stats.rimLeft > 0.0f) {
+                const float ratio = stats.rimRight / stats.rimLeft;
+                std::printf("%-9s %-9s   rim reflects: %.3f dark end, %.3f bright "
+                            "end, %.1fx\n", "", "",
+                            static_cast<double>(stats.rimLeft),
+                            static_cast<double>(stats.rimRight),
+                            static_cast<double>(ratio));
+                Check(ratio >= 3.0f,
+                      "the rim reflects its backdrop instead of being a painted line");
+            }
+
+            // The environment's hue has to reach the panel. Red desktop, red
+            // panel: the transmission path carries it at the end gain times the
+            // saturation boost, and if this fails the material has gone neutral
+            // and the glass has become a coloured card.
+            if (shot.wallpaper == Wallpaper::Red) {
+                Check(stats.panelChroma >= 0.15f,
+                      "a red desktop gives a red panel");
+            }
+        }
+
+        // How much of the desktop actually survives, as a number.
+        //
+        // "It looks too opaque" is a judgement nobody on this side of the build
+        // can check. This turns it into one: a bar target of halving period sits
+        // under the panel, and for each period the amplitude inside the panel is
+        // divided by the amplitude of the same bars outside it. The bars run
+        // vertically and are constant down the image, so a row through the panel
+        // and a row above it see the same pattern and the comparison needs no
+        // alignment.
+        //
+        // Two things are in that ratio and both belong there: the blur, which
+        // takes the fine periods out, and the material's gain, which takes a
+        // flat 29% off everything. What is left is the contrast a person sees.
+        {
+            const layout::Metrics dm = layout::Compute(6, 2400.0f, 1.0f);
+            const int panelW = static_cast<int>(dm.panelWidth);
+            const int panelH = static_cast<int>(dm.panelHeight);
+            const int margin = 60;
+
+            const Bitmap shot = RenderPanel(g_dark, cases,
+                                            static_cast<int>(std::size(cases)),
+                                            1, true, Wallpaper::Detail, nullptr, 6);
+
+            auto amplitude = [&](int row, int x0, int x1) {
+                float lo = 1.0f, hi = 0.0f;
+                for (int x = x0; x < x1; ++x) {
+                    const uint32_t px = shot.At(x, row);
+                    const float l = glass::Luma(RedOf(px)   / 255.0f,
+                                                GreenOf(px) / 255.0f,
+                                                BlueOf(px)  / 255.0f);
+                    lo = (std::min)(lo, l);
+                    hi = (std::max)(hi, l);
+                }
+                return hi - lo;
+            };
+
+            const int outsideRow = margin / 2;   // sharp wallpaper above the panel
+            // Inside the panel, above the icons. The tiles start at the panel
+            // padding, 22 logical pixels down, and the lit edge is done by 13,
+            // so this is the only band of pure glass across the full width.
+            const int insideRow = margin + 18;
+
+            std::printf("\nbar target, amplitude through the glass\n");
+            std::printf("%8s %9s %9s %8s\n", "period", "outside", "inside", "kept");
+
+            float keptWidest = 0.0f;
+            for (int g = 0; g < kBarGroups; ++g) {
+                const int gs = BarGroupStart(shot.width, g);
+                const int ge = BarGroupStart(shot.width, g + 1);
+                if (gs < margin + 20 || ge > margin + panelW - 20) continue;
+
+                const float out = amplitude(outsideRow, gs, ge);
+                const float in  = amplitude(insideRow,  gs, ge);
+                const float kept = (out > 1e-4f) ? in / out : 0.0f;
+                if (g == 0) keptWidest = kept;
+
+                std::printf("%8d %9.3f %9.3f %7.0f%%\n", kBarPeriods[g],
+                            static_cast<double>(out), static_cast<double>(in),
+                            static_cast<double>(kept * 100.0f));
+            }
+
+            // The widest bars are 48px of light against 48px of dark, roughly
+            // the scale of a window on the building in the reference shot.
+            // Losing those means the backdrop is gone and the panel is a card.
+            //
+            // The ceiling is the material's own gain, 0.71, and there is no
+            // getting past it, so this only has a floor. At sigma 8 the blur
+            // takes another 13% off that period, which lands it near 0.62.
+            Check(keptWidest >= 0.50f,
+                  "coarse structure stays visible through the glass");
         }
 
         // The rim over structure that survives the blur, with the lens on and
@@ -1251,7 +1849,7 @@ int main(int argc, char** argv) {
         // identical.
         for (int off = 0; off < 2; ++off) {
             g_noRefract = (off == 1);
-            const Bitmap panel = RenderPanel(glass::kDark, cases,
+            const Bitmap panel = RenderPanel(g_dark, cases,
                                              static_cast<int>(std::size(cases)),
                                              1, true, Wallpaper::Bars, nullptr, 6);
             const char* topName  = off ? "/bars-top-flat-4x.png"  : "/bars-top-4x.png";
@@ -1265,12 +1863,50 @@ int main(int argc, char** argv) {
         }
         g_noRefract = false;
 
+        // The rim tap, on and off, over text.
+        //
+        // Text is the right surface for it: the whole claim of the second tap is
+        // that the bezel bends recognisable content rather than mush, and a
+        // letterform either survives being bent or it does not. It is also the
+        // exact screenshot to take on Windows, so it is worth having the two
+        // sides of it side by side before anyone is asked to judge.
+        //
+        // The assertion is the one that caught the lens doing nothing at all in
+        // 0.4.0, when the on and off renders came out identical: two taps that
+        // agree everywhere are one tap and some wasted work.
+        {
+            Bitmap withTap, withoutTap;
+            for (int off = 0; off < 2; ++off) {
+                g_noRimTap = (off == 1);
+                Bitmap panel = RenderPanel(g_dark, cases,
+                                           static_cast<int>(std::size(cases)),
+                                           1, true, Wallpaper::Text, nullptr, 6);
+                const char* name = off ? "/rimtap-off-4x.png" : "/rimtap-on-4x.png";
+                if (!WritePng(outDir + name, Zoom(panel, 70, 42, 180, 78, 4))) {
+                    std::fprintf(stderr, "failed to write %s\n", name);
+                    ++failures;
+                }
+                (off ? withoutTap : withTap) = std::move(panel);
+            }
+            g_noRimTap = false;
+
+            long long differing = 0;
+            if (withTap.width == withoutTap.width &&
+                withTap.height == withoutTap.height) {
+                for (int y = 0; y < withTap.height; ++y)
+                    for (int x = 0; x < withTap.width; ++x)
+                        if (withTap.At(x, y) != withoutTap.At(x, y)) ++differing;
+            }
+            std::printf("\nrim tap changes %lld pixels\n", differing);
+            Check(differing > 2000,
+                  "the rim's sharper tap actually reaches the picture");
+        }
 
         // The top-left corner at 4x, both themes. The numbers above say the map
         // is right; this says whether the result looks like glass, which is the
         // question that started all of this and the one no assertion answers.
         for (int i = 0; i < 2; ++i) {
-            const glass::Params& p = i ? glass::kLight : glass::kDark;
+            const glass::Params& p = i ? g_light : g_dark;
             const Bitmap panel = RenderPanel(p, cases,
                                              static_cast<int>(std::size(cases)),
                                              1, true, Wallpaper::Gradient, nullptr, 6);

@@ -32,6 +32,7 @@
 
 #include "com.h"
 #include "glass.h"
+#include "glass_map.h"
 #include "image.h"
 #include "panel_layout.h"
 
@@ -120,15 +121,18 @@ void CheckMaterial(ID2D1DeviceContext* dc, ID2D1Bitmap1* captured, ID2D1Bitmap1*
 // The tap builder, in ComPtr terms. Same reason as CheckUpload: this is where
 // the returns-an-empty-ComPtr and the ternary-on-a-ComPtr live, and both of
 // those are hand-rolled behaviour rather than anything the standard guarantees.
-ComPtr<ID2D1Effect> CheckTap(ID2D1DeviceContext* dc, ID2D1Effect* scale,
-                             ID2D1Bitmap1* map, float sigma) {
+ComPtr<ID2D1Effect> CheckTap(ID2D1DeviceContext* dc, ID2D1Image* src,
+                             ID2D1Bitmap1* map, float sigma, float srcScale) {
     ComPtr<ID2D1Effect> blur, matrix, place;
     dc->CreateEffect(CLSID_D2D1GaussianBlur, blur.Put());
     dc->CreateEffect(CLSID_D2D1ColorMatrix, matrix.Put());
     dc->CreateEffect(CLSID_D2D12DAffineTransform, place.Put());
-    if (!blur || !matrix || !place) return {};
+    if (!blur || !matrix || !place || !src) return {};
 
-    blur->SetInputEffect(0, scale);
+    blur->SetInput(0, src);
+    place->SetValue(D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX,
+                    D2D1::Matrix3x2F::Scale(1.0f / srcScale, 1.0f / srcScale) *
+                    D2D1::Matrix3x2F::Translation(0.0f, 0.0f));
     blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, sigma * 0.25f);
     blur->SetValue(D2D1_PROPERTY_CACHED, TRUE);
     matrix->SetInputEffect(0, blur.Get());
@@ -153,21 +157,64 @@ ComPtr<ID2D1Effect> CheckTap(ID2D1DeviceContext* dc, ID2D1Effect* scale,
     return bound;
 }
 
-void CheckTapChoice(ID2D1DeviceContext* dc, ID2D1Effect* scale, ID2D1Bitmap1* map) {
+// Both taps and both draws, in the shape and the order panel.cpp uses them.
+//
+// The interior comes off the quarter-resolution Scale; the rim comes off the
+// full-resolution capture, which is the difference that made the second tap
+// worth having.
+void CheckTapChoice(ID2D1DeviceContext* dc, ID2D1Effect* scale,
+                    ID2D1Bitmap1* captured, ID2D1Bitmap1* map,
+                    ID2D1Bitmap1* bezelMask) {
+    // An effect is not an image. This is the exact shape panel.cpp needs and
+    // the exact mistake this file exists to catch: passing the Scale effect
+    // straight into SetInput compiles nowhere and was written that way first.
+    ComPtr<ID2D1Image> scaled;
+    if (scale) scale->GetOutput(scaled.Put());
+
     ComPtr<ID2D1Effect> frosted =
-        scale ? CheckTap(dc, scale, map, glass::kBlurSigma) : ComPtr<ID2D1Effect>{};
+        scaled ? CheckTap(dc, scaled.Get(), map, glass::g_tuning.blurSigma, 0.25f)
+               : ComPtr<ID2D1Effect>{};
     if (frosted) dc->DrawImage(frosted.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
+
+    if (!frosted || !map || !bezelMask) return;
+
+    ComPtr<ID2D1Effect> rim =
+        CheckTap(dc, captured, map, glass::g_tuning.rimBlurSigma, 1.0f);
+
+    ComPtr<ID2D1Effect> masked;
+    if (rim) dc->CreateEffect(CLSID_D2D1AlphaMask, masked.Put());
+    if (!masked) return;
+
+    masked->SetInputEffect(0, rim.Get());
+    masked->SetInput(1, bezelMask);
+    dc->DrawImage(masked.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
 }
 
-// The second tap: the same graph off a lighter blur, masked to the bezel band
-// and drawn over the frosted interior.
-void CheckRimTap(ID2D1DeviceContext* dc, ID2D1Effect* clear, ID2D1Bitmap1* rimMask) {
-    ID2D1Effect* masked = nullptr;
-    dc->CreateEffect(CLSID_D2D1AlphaMask, &masked);
+// The CPU-generated maps, called exactly as panel.cpp calls them.
+//
+// panel.cpp is the one file nothing off Windows compiles, so a signature it uses
+// and nobody else does is unchecked until CI. These four are the ones that
+// changed when the rim started reflecting its backdrop.
+void CheckMaps(const Bitmap& frame, const glass::Surface& surface,
+               const RECT& rect, const RECT& bounds, float dpiScale) {
+    const glass::Params piece =
+        glass::Adapt(glass::kDark, glass::Luma(0.4f, 0.4f, 0.4f));
 
-    masked->SetInputEffect(0, clear);
-    masked->SetInput(1, rimMask);
-    dc->DrawImage(masked, D2D1_INTERPOLATION_MODE_LINEAR);
+    glass::LumaField env =
+        glass::BuildLumaField(frame, rect.left - bounds.left,
+                              rect.top - bounds.top,
+                              static_cast<int>(surface.width),
+                              static_cast<int>(surface.height),
+                              static_cast<int>(dpiScale * 16.0f));
+
+    Bitmap light = glass::BuildEdgeLight(surface, piece,
+                                         env.Empty() ? nullptr : &env);
+    Bitmap map   = glass::BuildDisplacementMap(surface);
+    Bitmap bezel = glass::BuildBezelMask(surface);
+
+    const float rim = glass::MeanRimAlpha(piece, surface.height, dpiScale,
+                                          env.At(0.0f, 0.0f));
+    (void)light; (void)map; (void)bezel; (void)rim;
 }
 
 void CheckRim(ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& toSurface,

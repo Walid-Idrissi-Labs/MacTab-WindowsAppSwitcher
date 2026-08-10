@@ -114,6 +114,22 @@ inline constexpr float kBlurSigma = 8.0f;
 // frame budget.
 inline constexpr float kBlurDownscale = 0.25f;
 
+// The rim's own blur.
+//
+// Blur and refraction are different effects, and up to 0.4.1 this material was
+// only really doing one of them: the lens bent an image that had already been
+// through a sigma of 8, which comes out as a soft smear rather than as anything
+// anyone would call a lens. Bending a much sharper copy at the bezel and fading
+// it into the frosted interior is what makes the difference visible.
+//
+// 2 rather than 0 because it is still glass and not a window, and because a
+// perfectly sharp band at the edge would put aliased desktop detail right where
+// the eye is drawn. Full resolution, not the quarter-resolution path the
+// interior uses: at 0.25 a sigma of 2 becomes 0.5 before a 4x bilinear upscale,
+// and the upscale alone is worth more softening than that, which is most of why
+// the two-tap version tried in 0.4.0 looked like one tap.
+inline constexpr float kRimBlurSigma = 2.0f;
+
 // The bezel: how far in from the edge the surface is curved rather than flat.
 // Fitted from the Tahoe switcher, where the lens band runs about 45 screenshot
 // pixels on a 588px-tall panel, scaled to our 172px panel height.
@@ -153,6 +169,33 @@ inline constexpr float kSpecExp = 6.0f;
 inline constexpr float kSpecInner = 1.0f;
 inline constexpr float kSpecOuter = 2.5f;
 
+// The optics, as the running copy actually has them.
+//
+// Everything above is the shipped default. This is what is in force, which may
+// differ because settings.ini said so. Every drawing path reads from here rather
+// than from the constants, so a value typed into the ini reaches the pixels
+// without a rebuild, which on this project is the difference between a change
+// taking twenty minutes and taking seconds.
+//
+// A mutable global, which is worth being explicit about. It is written on the UI
+// thread by config::Load and config::ReloadGlass, and read on the UI thread by
+// everything that draws. The icon worker never touches the material, so there is
+// no second thread and no atomic is needed. If anything ever reads the glass off
+// another thread, this is the thing that has to change first.
+//
+// tools/preview writes it too, from --set, so a value that looked right on
+// Windows can be replayed and measured here under the same name.
+struct Tuning {
+    float blurSigma       = kBlurSigma;
+    float rimBlurSigma    = kRimBlurSigma;
+    float bezelWidth      = kBezelWidth;
+    float glassDepth      = kGlassDepth;
+    float maxDisplacement = kMaxDisplacement;
+    float rimSpan         = kRimSpan;
+};
+
+inline Tuning g_tuning{};
+
 struct Params {
     float saturation;   // s. See note 3 above; this is well above 1.
     float gain;         // g, multiplies the backdrop's luma range
@@ -180,6 +223,21 @@ struct Params {
     float rimLobe;
     float specLine;
 
+    // What the rim reflects.
+    //
+    // All three amounts above are multiplied by envFloor + envGain * L, where L
+    // is the luma of the backdrop under that piece of rim. A highlight is a
+    // reflection of whatever is in front of the surface, so a rim that is the
+    // same brightness over a black wallpaper and a white one is not a highlight,
+    // it is a painted-on border. Up to 0.4.1 it was the second thing.
+    //
+    // Set so a mid backdrop, L = 0.5, comes out at exactly 1.0 and leaves the
+    // measured numbers above meaning what they say. Black then gives 0.30 and
+    // white 1.70, which is a factor of nearly six across the range and is meant
+    // to be obvious.
+    float rimEnvFloor;
+    float rimEnvGain;
+
     // A darker stroke on the outermost pixel. Not optional now that there is no
     // drop shadow: without it a dark panel on a dark wallpaper has no boundary
     // at all, and a pale one dissolves into a pale wallpaper.
@@ -187,6 +245,17 @@ struct Params {
 
     // The band Adapt() steers the panel's resulting mean luma into.
     float targetMin, targetMax;
+
+    // How much of an excursion past the band survives it. 0 is the hard clamp
+    // this used to be, 1 is no adaptation at all.
+    //
+    // Asymmetric on purpose, and the two themes are asymmetric in opposite
+    // directions. The dark theme softens both ends, so a bright desktop gives a
+    // brighter panel and a dark one a darker panel. The light theme softens only
+    // its floor: soften its ceiling as well and a white desktop drives the panel
+    // to white, which is the single failure mode a material like this is most
+    // often accused of, and rightly.
+    float kneeBelow, kneeAbove;
 };
 
 // Dark.
@@ -200,8 +269,10 @@ inline constexpr Params kDark{
     { 0.09f, 0.09f, 0.11f, 0.10f },
     0.96f,
     0.065f, 0.035f, 0.045f,
+    0.30f, 1.40f,
     0.30f,
-    0.16f, 0.44f
+    0.16f, 0.44f,
+    0.35f, 0.35f
 };
 
 // Light.
@@ -215,8 +286,10 @@ inline constexpr Params kLight{
     { 0.97f, 0.97f, 0.98f, 0.10f },
     0.96f,
     0.085f, 0.045f, 0.055f,
+    0.30f, 1.40f,
     0.12f,
-    0.50f, 0.88f
+    0.50f, 0.88f,
+    0.35f, 0.05f
 };
 
 // --- The transfer, end to end -----------------------------------------------
@@ -270,12 +343,29 @@ inline constexpr float kMinEndGain = 0.65f;
 inline constexpr float kBiasFloor   = -0.36f;
 inline constexpr float kBiasCeiling =  0.50f;
 
-// Bend the bias so the panel lands inside [targetMin, targetMax].
+// Where the panel is allowed to land, given where it would land on its own.
 //
-// This is the step that makes one material work over a white wallpaper and a
-// black one. Only the bias moves: the gain sets how much of the desktop's
-// contrast survives, which is a property of the material, while the bias is only
-// where that window sits, which is a property of what is behind it today.
+// Inside the band, nowhere: the material is left alone. Outside it, the
+// excursion is kept but reduced, so the direction always survives even when the
+// size does not. Over a bright desktop the panel is brighter than over a dim
+// one; over a black desktop it is genuinely dark rather than lifted to a fixed
+// grey.
+//
+// This is the part 0.2 through 0.4.1 got wrong. The clamp was hard, so past
+// either end the panel was a constant plus texture, and a constant that ignores
+// what is behind it is a UI colour rather than a material. That single fact did
+// more to make the thing read as a card than the blur ever did.
+constexpr float LandingPoint(const Params& p, float raw) {
+    if (raw < p.targetMin) return p.targetMin - (p.targetMin - raw) * p.kneeBelow;
+    if (raw > p.targetMax) return p.targetMax + (raw - p.targetMax) * p.kneeAbove;
+    return raw;
+}
+
+// Bend the bias so the panel lands where LandingPoint says it should.
+//
+// Only the bias moves: the gain sets how much of the desktop's contrast
+// survives, which is a property of the material, while the bias is only where
+// that window sits, which is a property of what is behind it today.
 //
 // `backdropLuma` is the mean luma of the captured frame under the panel, in the
 // same 0..1 sRGB-encoded space everything else here uses. With no captured frame
@@ -286,18 +376,24 @@ inline Params Adapt(const Params& base, float backdropLuma) {
     const float a = p.tint[3];
     if (a >= 1.0f) return p;
 
-    const float panel = PanelLuma(p, backdropLuma);
-
-    if (panel < p.targetMin)
-        p.bias += (p.targetMin - panel) / (1.0f - a);
-    else if (panel > p.targetMax)
-        p.bias -= (panel - p.targetMax) / (1.0f - a);
+    const float raw = PanelLuma(p, backdropLuma);
+    p.bias += (LandingPoint(p, raw) - raw) / (1.0f - a);
 
     // Nothing below the floor is dangerous, because the matrix output is clamped
     // at zero, so a more negative bias only crushes blacks. The floor is there
     // to stop a retune from wandering, not to protect anything.
     p.bias = (std::min)(kBiasCeiling, (std::max)(kBiasFloor, p.bias));
     return p;
+}
+
+// How much the rim reflects, given the backdrop luma just outside it.
+//
+// Clamped at the top because a blown-out wallpaper would otherwise push the
+// additive rim past the point where it stops being a highlight and becomes a
+// white line, which is the thing this material is least allowed to look like.
+inline float RimReflection(const Params& p, float envLuma) {
+    const float v = p.rimEnvFloor + p.rimEnvGain * (std::max)(0.0f, envLuma);
+    return (std::min)(1.9f, v);
 }
 
 // --- Contrast ---------------------------------------------------------------
@@ -337,15 +433,22 @@ inline constexpr float kMinTextContrast = 4.5f;
 // before it is drawn, matches what actually gets drawn. Without it the estimate
 // is systematically too dark and the text shadow switches on when it is not
 // needed.
-inline float MeanRimAlpha(const Params& p, float height, float dpiScale) {
+// `envLuma` is the backdrop luma under the shape, which the rim now scales with.
+// Passing the wrong one here does not change a pixel, it changes whether the app
+// name decides it needs a shadow, so it has to be the same backdrop the shape is
+// actually drawn over.
+inline float MeanRimAlpha(const Params& p, float height, float dpiScale,
+                          float envLuma) {
     if (height <= 0.0f) return 0.0f;
 
-    const float span = (std::min)(kRimSpan * dpiScale, height * 0.35f);
+    const float env = RimReflection(p, envLuma);
+
+    const float span = (std::min)(g_tuning.rimSpan * dpiScale, height * 0.35f);
     const float top    = (p.rimAmbient + p.rimLobe) * span * 0.5f;
     const float bottom =  p.rimAmbient              * span * 0.5f;
     const float line   =  p.specLine * (kSpecOuter - kSpecInner) * dpiScale;
 
-    return (top + bottom + line) / height;
+    return env * (top + bottom + line) / height;
 }
 
 // White composited over `luma` at `alpha`, which is what the lit edge does.
