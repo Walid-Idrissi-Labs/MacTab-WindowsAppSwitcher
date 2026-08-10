@@ -37,6 +37,12 @@ struct Gesture {
     int  index      = 0;
     bool active     = false;
     bool panelShown = false;
+
+    // Down-arrow expands the highlighted app into its individual windows, and
+    // Tab then cycles those instead of apps — the macOS behaviour. `appIndex`
+    // remembers where to return to when the expansion collapses.
+    bool windowMode = false;
+    int  appIndex   = 0;
 };
 
 struct AppState {
@@ -95,6 +101,37 @@ void PopulatePanel() {
     const int tileSize = g_app.panel.TileSizePx();
 
     std::vector<PanelItem> items;
+
+    if (g.windowMode) {
+        // Every entry is a window of one app, so they all share its icon and
+        // are told apart by title.
+        if (g.appIndex < 0 || g.appIndex >= static_cast<int>(g.apps.size())) return;
+        const SwitcherApp& app = g.apps[static_cast<size_t>(g.appIndex)];
+
+        icons::Request request;
+        request.key            = app.key;
+        request.exePath        = app.exePath;
+        request.aumid          = app.aumid;
+        request.packaged       = app.packaged;
+        request.fallbackWindow = app.PrimaryWindow();
+        request.size           = tileSize;
+
+        Bitmap shared;
+        icons::Acquire(request, shared);
+
+        items.reserve(app.windows.size());
+        for (const SwitcherWindow& window : app.windows) {
+            PanelItem item;
+            item.key   = app.key;
+            item.label = window.title.empty() ? app.displayName : window.title;
+            item.icon  = shared;
+            items.push_back(std::move(item));
+        }
+
+        g_app.panel.SetItems(std::move(items), g.index);
+        return;
+    }
+
     items.reserve(g.apps.size());
 
     for (const SwitcherApp& app : g.apps) {
@@ -125,11 +162,17 @@ void AdvanceSelection(int direction) {
     Gesture& g = g_app.gesture;
     if (!g.active || g.apps.empty()) return;
 
-    const int n = static_cast<int>(g.apps.size());
+    // The list being cycled is the app list normally, and the expanded app's
+    // windows when the panel is showing those.
+    int n = static_cast<int>(g.apps.size());
+    if (g.windowMode && g.appIndex >= 0 && g.appIndex < n)
+        n = static_cast<int>(g.apps[static_cast<size_t>(g.appIndex)].windows.size());
+    if (n <= 0) return;
+
     g.index = ((g.index + direction) % n + n) % n;   // wrap in both directions
 
-    MACTAB_DIAG("gesture: select -> index %d (%s)", g.index,
-                ToUtf8(g.apps[static_cast<size_t>(g.index)].displayName).c_str());
+    MACTAB_DIAG("gesture: select -> index %d of %d (%s)", g.index, n,
+                g.windowMode ? "window" : "app");
 
     g_app.panel.SetSelection(g.index);
 }
@@ -146,7 +189,14 @@ void CommitGesture(WORD altVirtualKey) {
 
     HWND target = nullptr;
     std::wstring targetName;
-    if (g.index >= 0 && g.index < static_cast<int>(g.apps.size())) {
+
+    if (g.windowMode && g.appIndex >= 0 && g.appIndex < static_cast<int>(g.apps.size())) {
+        const SwitcherApp& app = g.apps[static_cast<size_t>(g.appIndex)];
+        if (g.index >= 0 && g.index < static_cast<int>(app.windows.size())) {
+            target     = app.windows[static_cast<size_t>(g.index)].hwnd;
+            targetName = app.windows[static_cast<size_t>(g.index)].title;
+        }
+    } else if (g.index >= 0 && g.index < static_cast<int>(g.apps.size())) {
         const SwitcherApp& app = g.apps[static_cast<size_t>(g.index)];
         target     = app.PrimaryWindow();
         targetName = app.displayName;
@@ -154,6 +204,7 @@ void CommitGesture(WORD altVirtualKey) {
 
     g.active     = false;
     g.panelShown = false;
+    g.windowMode = false;
     g_app.panel.Hide();
 
     if (!target) {
@@ -174,6 +225,7 @@ void CancelGesture(WORD altVirtualKey) {
     Gesture& g = g_app.gesture;
     g.active     = false;
     g.panelShown = false;
+    g.windowMode = false;
     g.apps.clear();
     g_app.panel.Hide();
 
@@ -202,19 +254,26 @@ void HandleActionKey(WORD virtualKey) {
     if (!g.active || g.apps.empty()) return;
     if (g.index < 0 || g.index >= static_cast<int>(g.apps.size())) return;
 
-    SwitcherApp& app = g.apps[static_cast<size_t>(g.index)];
+    // In window mode the highlighted entry is a window, but Q/W/H still act on
+    // the owning app — which is the one that was expanded.
+    const int appSlot = g.windowMode ? g.appIndex : g.index;
+    if (appSlot < 0 || appSlot >= static_cast<int>(g.apps.size())) return;
+
+    SwitcherApp& app = g.apps[static_cast<size_t>(appSlot)];
 
     switch (virtualKey) {
     case 'Q':
         QuitApp(app);
         // The app is going away, so drop its tile and keep the gesture alive —
-        // macOS lets you quit several apps in one Cmd-Tab hold.
-        g.apps.erase(g.apps.begin() + g.index);
+        // macOS lets you quit several apps in one Cmd-Tab hold. Quitting the
+        // app you were looking inside also collapses the expansion.
+        g.apps.erase(g.apps.begin() + appSlot);
+        g.windowMode = false;
         if (g.apps.empty()) {
             g_app.panel.Hide();
             return;
         }
-        g.index = (std::min)(g.index, static_cast<int>(g.apps.size()) - 1);
+        g.index = (std::min)(appSlot, static_cast<int>(g.apps.size()) - 1);
         PopulatePanel();
         return;
 
@@ -227,17 +286,43 @@ void HandleActionKey(WORD virtualKey) {
         return;
 
     case VK_OEM_3:      // backquote: cycle windows within the highlighted app
+        if (g.windowMode) {
+            // Already looking at the windows; just advance the selection.
+            AdvanceSelection(1);
+            return;
+        }
         if (app.windows.size() > 1) {
+            // Rotating makes the next window primary, so committing now lands
+            // on it without leaving the app row.
             std::rotate(app.windows.begin(), app.windows.begin() + 1, app.windows.end());
             MACTAB_DIAG("gesture: cycled to window %p of %s",
                         static_cast<void*>(app.PrimaryWindow()),
                         ToUtf8(app.displayName).c_str());
+            PopulatePanel();
         }
         return;
 
     case VK_DOWN:
-        // M6 leaves expansion to a later pass; cycling covers the common case.
-        MACTAB_DIAG("gesture: expand requested (%zu windows)", app.windows.size());
+        // Expand the app into its windows, as macOS does. Pointless for a
+        // single-window app, so leave the row alone in that case.
+        if (!g.windowMode && app.windows.size() > 1) {
+            g.appIndex   = appSlot;
+            g.windowMode = true;
+            g.index      = 0;
+            MACTAB_DIAG("gesture: expanded %s into %zu windows",
+                        ToUtf8(app.displayName).c_str(), app.windows.size());
+            PopulatePanel();
+        }
+        return;
+
+    case VK_UP:
+        // Collapse back to the app row, landing on the app we came from.
+        if (g.windowMode) {
+            g.windowMode = false;
+            g.index      = g.appIndex;
+            MACTAB_DIAG("gesture: collapsed back to the app row");
+            PopulatePanel();
+        }
         return;
 
     default:

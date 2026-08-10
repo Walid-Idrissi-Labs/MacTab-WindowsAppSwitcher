@@ -151,6 +151,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         case 'W':   // close window
         case 'H':   // minimise all windows of the app
         case VK_DOWN:      // expand the app's windows
+        case VK_UP:        // collapse back to the app row
         case VK_OEM_3:     // backquote: cycle windows within the app
             // Only meaningful once the panel is visible. Before that the user
             // is mid-quick-switch and these should not fire.
