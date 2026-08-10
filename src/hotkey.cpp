@@ -37,6 +37,11 @@ volatile LONG g_running = 0;
 // Mirrors g_gestureAltVk for UI-thread readers; see GestureAltKey().
 volatile LONG g_sharedAltVk = 0;
 
+// True while the Mission Control overlay is on screen. Written from the UI
+// thread, read in the hook callback; a plain bool for the same reason
+// missionOnWinTab is one.
+bool g_missionOpen = false;
+
 // --- Hook-thread state ------------------------------------------------------
 HHOOK    g_hook          = nullptr;
 State    g_state         = State::Idle;
@@ -141,6 +146,18 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
             ::SendInput(2, tap, sizeof(INPUT));
             return 1;
         }
+
+        // While Mission Control is up, the shell's own desktop switch is taken
+        // out of service.
+        //
+        // Ctrl+Win+Left and Ctrl+Win+Right move the viewed desktop, and the
+        // overlay belongs to the desktop it was created on: switching under it
+        // leaves a full-screen window stranded on a desktop nobody is looking
+        // at. The arrows walk the strip inside Mission Control instead, which
+        // is the same gesture aimed at the same thing.
+        if (down && g_missionOpen && (vk == VK_LEFT || vk == VK_RIGHT) &&
+            KeyDown(VK_CONTROL) && (KeyDown(VK_LWIN) || KeyDown(VK_RWIN)))
+            return 1;
 
         // Gesture opens on Alt+Tab. Note Tab arrives as WM_SYSKEYDOWN because
         // Alt is down, which is why `down` tests both message forms.
@@ -448,6 +465,10 @@ void EndGestureQuietly() {
 
 WORD GestureAltKey() {
     return static_cast<WORD>(::InterlockedCompareExchange(&g_sharedAltVk, 0, 0));
+}
+
+void SetMissionOpen(bool open) {
+    g_missionOpen = open;
 }
 
 void SetMissionOnWinTab(bool enabled) {

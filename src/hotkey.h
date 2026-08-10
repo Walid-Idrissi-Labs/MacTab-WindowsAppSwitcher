@@ -128,6 +128,15 @@ bool IsRunning();
 // through to Task View, which is exactly what turning it off asks for anyway.
 void SetMissionOnWinTab(bool enabled);
 
+// Tell the hook that Mission Control is on screen.
+//
+// While it is, Ctrl+Win+Left and Ctrl+Win+Right are swallowed. Those switch
+// virtual desktops, and switching the desktop out from under a full-screen
+// overlay that belongs to the old one leaves the overlay stranded. Inside
+// Mission Control the arrows walk the strip instead, which is the same gesture
+// pointed at the same thing.
+void SetMissionOpen(bool open);
+
 // Abort any in-flight gesture and clear the stuck-Alt state. Called on session
 // lock/unlock: the secure desktop means we may never see the Alt release.
 void AbortGesture();

@@ -51,11 +51,19 @@ constexpr float kChipRadius   = 10.0f;
 constexpr float kChipLabel    = 24.0f;    // the name under a miniature
 constexpr float kBarInset     = 40.0f;    // how far the add button sits from the edge
 constexpr float kOuterMargin  = 56.0f;
-constexpr float kBadgeSize    = 46.0f;    // the app icon under a pile
+constexpr float kBadgeSize    = 46.0f;    // the app icon over a window
 constexpr float kTitleHeight  = 26.0f;
 constexpr float kTitleGap     = 8.0f;
 constexpr float kTileRadius   = 8.0f;
 constexpr float kOutlineWidth = 3.0f;
+
+// How far outside the window the hover outline's texture reaches.
+//
+// Its own number, and small. Reusing the shadow's spread put the nine-grid's
+// fixed corner region at 24 plus the corner radius, which on a window under
+// about seventy pixels leaves no stretchable middle at all and the outline
+// comes out crushed. This only has to cover the stroke.
+constexpr float kOutlinePad   = 10.0f;
 
 // The shadow under each window, as a nine-grid texture baked once.
 //
@@ -185,7 +193,8 @@ struct Mission::Impl {
     WUC::CompositionDrawingSurface outlineSurface{ nullptr };
     WUC::CompositionNineGridBrush  shadowBrush{ nullptr };
     WUC::CompositionNineGridBrush  outlineBrush{ nullptr };
-    float                          textureSpread = 0.0f;
+    float                          textureSpread = 0.0f;   // the shadow's
+    float                          outlinePad    = 0.0f;   // the outline's
 
     struct Tile {
         WUC::ContainerVisual holder{ nullptr };
@@ -195,9 +204,13 @@ struct Mission::Impl {
         WUC::CompositionDrawingSurface contentSurface{ nullptr };
         WUC::CompositionDrawingSurface chromeSurface{ nullptr };
         HTHUMBNAIL thumbnail = nullptr;
-        RECT       screenRect{};   // where it lands, in overlay coordinates
+        RECT       screenRect{};   // where it lands in the arrangement
+        RECT       liveRect{};     // where it is NOW, which differs while expanded
         RECT       sourceRect{};   // where the window really is
+        float      baseW = 1.0f;   // the holder's own size, which Scale multiplies
+        float      baseH = 1.0f;
         int        item  = -1;     // index into Impl::items
+        int        group = 0;
         int        depth = 0;      // 0 is the front of its pile
         float      pileX = 0.0f;   // the pile's box, for anchoring the chrome
         float      pileW = 0.0f;
@@ -225,6 +238,10 @@ struct Mission::Impl {
         std::vector<mission::SpaceChip> chips;
         int hovered = -1;
 
+        // The application whose pile is spread out, or -1. Spreading is how you
+        // pick between several windows of one app without leaving.
+        int expandedGroup = -1;
+
         float Scaled(float logical) const { return logical * dpiScale; }
         float Width()  const { return static_cast<float>(rect.right - rect.left); }
         float Height() const { return static_cast<float>(rect.bottom - rect.top); }
@@ -233,6 +250,9 @@ struct Mission::Impl {
     std::vector<Screen>       screens;
     std::vector<MissionItem>  items;
     std::vector<MissionSpace> spaces;
+
+    // The desktop being looked at, which is not necessarily the one being used.
+    int browsed = -1;
 
     // The app icons, uploaded once each rather than once per window.
     std::map<std::wstring, ComPtr<ID2D1Bitmap1>> iconBitmaps;
@@ -246,11 +266,15 @@ struct Mission::Impl {
     void BakeBackdrop(Screen& screen);
     void BakeBar(Screen& screen);
     void BakeChrome(Screen& screen, Tile& tile);
-    void BuildTiles(Screen& screen, const std::vector<int>& members);
+    void BuildTiles(Screen& screen, const std::vector<int>& members, int slide);
+    void BuildForDesktop(int desktop, int slide);
+    void ExpandPile(Screen& screen, int group);
+    void CollapsePile(Screen& screen);
     void ReleaseTiles(Screen& screen);
     void PositionOutline(Screen& screen);
     void SetHovered(Screen& screen, int index);
     int  HitTestTile(const Screen& screen, POINT client) const;
+    int  PileSize(const Screen& screen, int group) const;
     int  HitTestChip(const Screen& screen, POINT client) const;
     int  Neighbour(const Screen& screen, int from, int dx, int dy) const;
 
@@ -395,43 +419,122 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
-        // A click on empty space dismisses, which is what macOS does and what
-        // makes the gesture feel like a place rather than a dialog.
         const int tile = impl->HitTestTile(*screen, point);
-        if (tile >= 0) {
-            ::PostMessageW(impl->notifyWindow, impl->activateMessage,
-                           static_cast<WPARAM>(screen->tiles[static_cast<size_t>(tile)].item), 0);
-        } else {
-            ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
+
+        // A click on empty space closes a spread pile if there is one, and
+        // dismisses otherwise, which is what macOS does and what makes the
+        // gesture feel like a place rather than a dialog.
+        if (tile < 0) {
+            if (screen->expandedGroup >= 0) impl->CollapsePile(*screen);
+            else ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
+            return 0;
         }
+
+        // Clicking the app's icon spreads its pile instead of activating,
+        // because the icon is the pile's handle. Anywhere else on the window
+        // goes to that window.
+        const Mission::Impl::Tile& hit = screen->tiles[static_cast<size_t>(tile)];
+        if (screen->expandedGroup < 0 && hit.depth == 0 && impl->PileSize(*screen, hit.group) > 1) {
+            const float badge = screen->Scaled(kBadgeSize);
+            const float cx    = static_cast<float>(hit.liveRect.left + hit.liveRect.right) * 0.5f;
+            const float cy    = static_cast<float>(hit.liveRect.bottom) - badge * 0.16f;
+            const float dx    = point.x - cx;
+            const float dy    = point.y - cy;
+            if (dx * dx + dy * dy <= (badge * 0.5f) * (badge * 0.5f)) {
+                impl->ExpandPile(*screen, hit.group);
+                return 0;
+            }
+        }
+
+        ::PostMessageW(impl->notifyWindow, impl->activateMessage,
+                       static_cast<WPARAM>(hit.item), 0);
         return 0;
     }
 
     case WM_KEYDOWN: {
         if (!impl->notifyWindow) return 0;
-        const int hovered = screen->hovered;
+        const int  hovered  = screen->hovered;
+        const bool expanded = screen->expandedGroup >= 0;
+
+        // Left and right walk the desktops when there is more than one, which
+        // is what the strip is for. With a single desktop there is nothing to
+        // walk, so they go back to moving between windows.
+        const bool arrowsBrowse = impl->spaces.size() > 1 && !expanded;
+
         switch (wParam) {
         case VK_ESCAPE:
-            ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
+            // Out of the spread first, out of Mission Control second. Escape
+            // that skipped a level would throw away the thing the user was
+            // half way through doing.
+            if (expanded) impl->CollapsePile(*screen);
+            else          ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
             return 0;
+
         case VK_RETURN:
         case VK_SPACE:
             if (hovered >= 0)
                 ::PostMessageW(impl->notifyWindow, impl->activateMessage,
                                static_cast<WPARAM>(screen->tiles[static_cast<size_t>(hovered)].item), 0);
             return 0;
-        case VK_LEFT:  impl->SetHovered(*screen, impl->Neighbour(*screen, hovered, -1,  0)); return 0;
-        case VK_RIGHT: impl->SetHovered(*screen, impl->Neighbour(*screen, hovered,  1,  0)); return 0;
-        case VK_UP:    impl->SetHovered(*screen, impl->Neighbour(*screen, hovered,  0, -1)); return 0;
-        case VK_DOWN:  impl->SetHovered(*screen, impl->Neighbour(*screen, hovered,  0,  1)); return 0;
+
+        case VK_LEFT:
+            if (arrowsBrowse)
+                ::PostMessageW(impl->notifyWindow, impl->spaceMessage,
+                               static_cast<WPARAM>((std::max)(0, impl->browsed - 1)), 0);
+            else
+                impl->SetHovered(*screen, impl->Neighbour(*screen, hovered, -1, 0));
+            return 0;
+
+        case VK_RIGHT:
+            if (arrowsBrowse)
+                ::PostMessageW(impl->notifyWindow, impl->spaceMessage,
+                               static_cast<WPARAM>((std::min)(
+                                   static_cast<int>(impl->spaces.size()) - 1,
+                                   impl->browsed + 1)), 0);
+            else
+                impl->SetHovered(*screen, impl->Neighbour(*screen, hovered, 1, 0));
+            return 0;
+
+        case VK_UP:
+            if (expanded) impl->CollapsePile(*screen);
+            else          impl->SetHovered(*screen, impl->Neighbour(*screen, hovered, 0, -1));
+            return 0;
+
+        case VK_DOWN:
+            // Down on a pile spreads it, which is how you pick between several
+            // windows of one application.
+            if (!expanded && hovered >= 0)
+                impl->ExpandPile(*screen, screen->tiles[static_cast<size_t>(hovered)].group);
+            else if (!expanded)
+                impl->SetHovered(*screen, impl->Neighbour(*screen, hovered, 0, 1));
+            return 0;
+
         case VK_TAB:
             if (!screen->tiles.empty())
                 impl->SetHovered(*screen,
                                  (hovered + 1) % static_cast<int>(screen->tiles.size()));
             return 0;
+
         default:
             return 0;
         }
+    }
+
+    // Scrolling up on a pile spreads it, and down puts it back. The gesture the
+    // reference uses is a two-finger swipe, which arrives here as a wheel.
+    case WM_MOUSEWHEEL: {
+        POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ::ScreenToClient(hwnd, &point);
+
+        const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        if (delta > 0) {
+            const int tile = impl->HitTestTile(*screen, point);
+            if (tile >= 0 && screen->expandedGroup < 0)
+                impl->ExpandPile(*screen, screen->tiles[static_cast<size_t>(tile)].group);
+        } else if (delta < 0) {
+            impl->CollapsePile(*screen);
+        }
+        return 0;
     }
 
     // Losing focus to something that is not one of our own overlays.
@@ -566,8 +669,20 @@ bool Mission::Impl::BakeTextures() {
         }
     }
 
+    // The outline gets its own, much smaller, padding.
+    //
+    // The sprite is sized to the window plus twice this and offset back by it,
+    // so the stroke lands exactly on the window's edge whatever size that
+    // window is. Sharing the shadow's padding was the bug: it made the
+    // nine-grid's fixed corners 24 plus the radius, which on anything under
+    // about seventy pixels leaves no stretchable middle and the outline comes
+    // out crushed and offset.
+    outlinePad = kOutlinePad * dpi;
+
+    const float outlineSide = outlinePad * 2 + radius * 2 + 4.0f;
+
     outlineSurface = graphics.CreateDrawingSurface(
-        { side, side },
+        { outlineSide, outlineSide },
         winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
         winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
 
@@ -581,23 +696,24 @@ bool Mission::Impl::BakeTextures() {
         ComPtr<ID2D1SolidColorBrush> brush;
         if (SUCCEEDED(dc->CreateSolidColorBrush(accent, brush.Put()))) {
             const float width = kOutlineWidth * dpi;
+
+            // Centred half a stroke outside the window's edge, so the line sits
+            // against the window rather than over its contents.
+            const float inset = outlinePad - width * 0.5f;
             const D2D1_ROUNDED_RECT shape{
-                D2D1::RectF(spread - width, spread - width,
-                            side - spread + width, side - spread + width),
-                radius + width, radius + width };
+                D2D1::RectF(inset, inset, outlineSide - inset, outlineSide - inset),
+                radius + width * 0.5f, radius + width * 0.5f };
             dc->DrawRoundedRectangle(shape, brush.Get(), width);
         }
     }
 
-    auto ninegrid = [&](const WUC::CompositionDrawingSurface& surface) {
-        auto brush = compositor.CreateNineGridBrush();
-        brush.Source(compositor.CreateSurfaceBrush(surface));
-        brush.SetInsets(spread + radius);
-        return brush;
-    };
+    shadowBrush = compositor.CreateNineGridBrush();
+    shadowBrush.Source(compositor.CreateSurfaceBrush(shadowSurface));
+    shadowBrush.SetInsets(spread + radius);
 
-    shadowBrush  = ninegrid(shadowSurface);
-    outlineBrush = ninegrid(outlineSurface);
+    outlineBrush = compositor.CreateNineGridBrush();
+    outlineBrush.Source(compositor.CreateSurfaceBrush(outlineSurface));
+    outlineBrush.SetInsets(outlinePad + radius);
     return true;
 }
 
@@ -679,10 +795,13 @@ bool Mission::Impl::BuildScreens() {
         screen.chromeLayer = compositor.CreateContainerVisual();
         screen.bar         = compositor.CreateSpriteVisual();
 
+        // The outline goes ABOVE the windows, not below them. Under them it was
+        // covered by the hovered window's own shadow, which reaches further out
+        // than the outline does, so most of it was never visible.
         auto children = screen.root.Children();
         children.InsertAtTop(screen.backdrop);
-        children.InsertAtTop(screen.outline);
         children.InsertAtTop(screen.tileLayer);
+        children.InsertAtTop(screen.outline);
         children.InsertAtTop(screen.chromeLayer);
         children.InsertAtTop(screen.bar);
 
@@ -1176,7 +1295,7 @@ void Mission::Impl::BakeChrome(Screen& screen, Tile& tile) {
     // Wide enough for a readable name under a narrow window, and never so wide
     // that two neighbours' names run into each other.
     const float width  = (std::max)(tile.pileW, screen.Scaled(190.0f));
-    const float height = badge * 0.5f + screen.Scaled(kTitleGap) + titleH;
+    const float height = badge + screen.Scaled(kTitleGap) + titleH;
 
     tile.chromeSurface = graphics.CreateDrawingSurface(
         { width, height },
@@ -1191,13 +1310,17 @@ void Mission::Impl::BakeChrome(Screen& screen, Tile& tile) {
 
     const float centre = width * 0.5f;
 
-    // The badge sits half in and half out of the pile's bottom edge, which is
-    // what makes it read as belonging to those windows rather than floating
-    // under them. This surface holds the lower half.
+    // The icon sits ON the window, over its lower edge, rather than under the
+    // pile. That is what makes it read as this window's application instead of
+    // a caption floating below a group of rectangles.
+    //
+    // The whole badge is inside this surface. The first version drew it from
+    // minus half a badge, so the top half fell outside the surface and was
+    // silently clipped away, and only the bottom half of every icon appeared.
     if (ComPtr<ID2D1Bitmap1> icon = IconFor(dc, item)) {
         dc->DrawBitmap(icon.Get(),
-                       D2D1::RectF(centre - badge * 0.5f, -badge * 0.5f,
-                                   centre + badge * 0.5f,  badge * 0.5f));
+                       D2D1::RectF(centre - badge * 0.5f, 0.0f,
+                                   centre + badge * 0.5f, badge));
     }
 
     ComPtr<IDWriteTextFormat> format =
@@ -1210,7 +1333,7 @@ void Mission::Impl::BakeChrome(Screen& screen, Tile& tile) {
         format->SetTrimming(&trimming, ellipsis.Get());
     }
 
-    const float top = badge * 0.5f + screen.Scaled(kTitleGap);
+    const float top = badge + screen.Scaled(kTitleGap);
 
     // A capsule behind the name. It sits over the wallpaper, which can be any
     // colour at all, so bare text is unreadable on roughly half of all desktops.
@@ -1231,16 +1354,26 @@ void Mission::Impl::BakeChrome(Screen& screen, Tile& tile) {
 
     tile.chrome.Brush(compositor.CreateSurfaceBrush(tile.chromeSurface));
     tile.chrome.Size({ width, height });
-    tile.chrome.Offset({ tile.pileX + (tile.pileW - width) * 0.5f, tile.pileBottom, 0.0f });
+
+    // Anchored on the FRONT window, not on the pile's bounding box: the pile
+    // fans down and to the right, so its box bottom is under the last window in
+    // the fan and the icon would sit under a window nobody is looking at. Two
+    // thirds of the badge overlaps the window it belongs to.
+    const float anchorX = static_cast<float>(tile.screenRect.left + tile.screenRect.right) * 0.5f;
+    tile.chrome.Offset({ anchorX - width * 0.5f,
+                         static_cast<float>(tile.screenRect.bottom) - badge * 0.66f, 0.0f });
 }
 
-void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members) {
+void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
+                               int slide) {
     ReleaseTiles(screen);
     if (members.empty()) return;
 
     const float margin  = screen.Scaled(kOuterMargin);
     const float barH    = spaces.empty() ? 0.0f : screen.Scaled(kBarHeight);
-    const float chromeH = screen.Scaled(kBadgeSize) * 0.5f + screen.Scaled(kTitleGap) +
+    // What the badge and the name need below the lowest window. The badge
+    // mostly overlaps the window, so only its tail counts.
+    const float chromeH = screen.Scaled(kBadgeSize) * 0.34f + screen.Scaled(kTitleGap) +
                           screen.Scaled(kTitleHeight);
 
     const float regionX = margin;
@@ -1315,12 +1448,23 @@ void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members) 
             static_cast<LONG>(regionX + place.x + place.w),
             static_cast<LONG>(regionY + place.y + place.h),
         };
-        tile.sourceRect = RECT{
-            item.bounds.left   - screen.rect.left,
-            item.bounds.top    - screen.rect.top,
-            item.bounds.right  - screen.rect.left,
-            item.bounds.bottom - screen.rect.top,
-        };
+        tile.liveRect = tile.screenRect;
+        tile.group    = item.group;
+        tile.baseW    = place.w;
+        tile.baseH    = place.h;
+
+        // Where it flies in from. Zero means the window's own place on screen,
+        // which is the reveal; a direction means off the side, which is a
+        // desktop sliding past.
+        tile.sourceRect = (slide == 0)
+            ? RECT{ item.bounds.left   - screen.rect.left,
+                    item.bounds.top    - screen.rect.top,
+                    item.bounds.right  - screen.rect.left,
+                    item.bounds.bottom - screen.rect.top }
+            : RECT{ tile.screenRect.left   + slide * static_cast<LONG>(screen.Width()),
+                    tile.screenRect.top,
+                    tile.screenRect.right  + slide * static_cast<LONG>(screen.Width()),
+                    tile.screenRect.bottom };
 
         // The pile's box, so the badge and the name sit under all of it rather
         // than under the front window alone.
@@ -1453,16 +1597,16 @@ void Mission::Impl::PositionOutline(Screen& screen) {
         return;
     }
 
-    const RECT& rect = screen.tiles[static_cast<size_t>(screen.hovered)].screenRect;
+    const RECT& rect = screen.tiles[static_cast<size_t>(screen.hovered)].liveRect;
     const bool wasHidden = screen.outline.Opacity() < 0.5f;
 
     screen.outline.Brush(outlineBrush);
     screen.outline.Opacity(1.0f);
-    screen.outline.Size({ static_cast<float>(rect.right - rect.left) + textureSpread * 2,
-                          static_cast<float>(rect.bottom - rect.top) + textureSpread * 2 });
+    screen.outline.Size({ static_cast<float>(rect.right - rect.left) + outlinePad * 2,
+                          static_cast<float>(rect.bottom - rect.top) + outlinePad * 2 });
 
-    const WFN::float3 destination{ static_cast<float>(rect.left) - textureSpread,
-                                   static_cast<float>(rect.top)  - textureSpread, 0.0f };
+    const WFN::float3 destination{ static_cast<float>(rect.left) - outlinePad,
+                                   static_cast<float>(rect.top)  - outlinePad, 0.0f };
 
     // Springing from wherever it was left is right between two windows and
     // wrong for the first one, where "wherever it was left" is the corner.
@@ -1488,7 +1632,7 @@ int Mission::Impl::HitTestTile(const Screen& screen, POINT client) const {
     // Front to back, so the window on top of a pile takes the click.
     int best = -1;
     for (size_t i = 0; i < screen.tiles.size(); ++i) {
-        const RECT& r = screen.tiles[i].screenRect;
+        const RECT& r = screen.tiles[i].liveRect;
         if (client.x < r.left || client.x >= r.right ||
             client.y < r.top  || client.y >= r.bottom)
             continue;
@@ -1496,6 +1640,13 @@ int Mission::Impl::HitTestTile(const Screen& screen, POINT client) const {
             best = static_cast<int>(i);
     }
     return best;
+}
+
+int Mission::Impl::PileSize(const Screen& screen, int group) const {
+    int n = 0;
+    for (const Tile& tile : screen.tiles)
+        if (tile.group == group) ++n;
+    return n;
 }
 
 int Mission::Impl::HitTestChip(const Screen& screen, POINT client) const {
@@ -1517,7 +1668,7 @@ int Mission::Impl::Neighbour(const Screen& screen, int from, int dx, int dy) con
     if (screen.tiles.empty()) return -1;
     if (from < 0 || from >= static_cast<int>(screen.tiles.size())) return 0;
 
-    const RECT& origin = screen.tiles[static_cast<size_t>(from)].screenRect;
+    const RECT& origin = screen.tiles[static_cast<size_t>(from)].liveRect;
     const float ox = static_cast<float>(origin.left + origin.right) * 0.5f;
     const float oy = static_cast<float>(origin.top + origin.bottom) * 0.5f;
 
@@ -1527,7 +1678,7 @@ int Mission::Impl::Neighbour(const Screen& screen, int from, int dx, int dy) con
     for (size_t i = 0; i < screen.tiles.size(); ++i) {
         if (static_cast<int>(i) == from) continue;
 
-        const RECT& r = screen.tiles[i].screenRect;
+        const RECT& r = screen.tiles[i].liveRect;
         const float cx = static_cast<float>(r.left + r.right) * 0.5f;
         const float cy = static_cast<float>(r.top + r.bottom) * 0.5f;
 
@@ -1549,7 +1700,225 @@ int Mission::Impl::Neighbour(const Screen& screen, int from, int dx, int dy) con
 
 // ---------------------------------------------------------------------------
 
-void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spaces) {
+// Rebuild every display's arrangement for one desktop.
+//
+// `slide` is 0 for the reveal, where each window flies from where it really is,
+// and plus or minus one when a desktop is sliding past, where the outgoing
+// arrangement leaves one way and the incoming arrives from the other.
+void Mission::Impl::BuildForDesktop(int desktop, int slide) {
+    browsed = desktop;
+
+    // Which windows belong to which display. A window straddling two monitors
+    // belongs to whichever holds its centre. A window with no desktop of its
+    // own is pinned and appears on every one.
+    std::vector<std::vector<int>> members(screens.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (items[i].desktop >= 0 && items[i].desktop != desktop) continue;
+
+        const RECT& b = items[i].bounds;
+        const POINT centre{ (b.left + b.right) / 2, (b.top + b.bottom) / 2 };
+        const HMONITOR monitor = ::MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST);
+
+        for (size_t s = 0; s < screens.size(); ++s)
+            if (screens[s].monitor == monitor) {
+                members[s].push_back(static_cast<int>(i));
+                break;
+            }
+    }
+
+    for (size_t s = 0; s < screens.size(); ++s) {
+        Screen& screen = screens[s];
+        screen.expandedGroup = -1;
+        BakeBackdrop(screen);
+        BakeBar(screen);
+        BuildTiles(screen, members[s], slide);
+    }
+}
+
+namespace {
+
+// Fly every window from where it came in from to where it lands, and bring the
+// names and icons up behind them.
+//
+// Offset and Scale only, both on the compositor thread, so this costs the
+// process nothing while it runs.
+void StartReveal(WUC::Compositor compositor, Mission::Impl::Screen& screen,
+                 std::chrono::milliseconds duration, bool fadeRoot) {
+    auto easing = compositor.CreateCubicBezierEasingFunction({ 0.22f, 1.0f },
+                                                            { 0.36f, 1.0f });
+
+    for (Mission::Impl::Tile& tile : screen.tiles) {
+        const float finalW = static_cast<float>(tile.screenRect.right - tile.screenRect.left);
+        const float finalH = static_cast<float>(tile.screenRect.bottom - tile.screenRect.top);
+        if (finalW <= 0.0f || finalH <= 0.0f) continue;
+
+        auto offset = compositor.CreateVector3KeyFrameAnimation();
+        offset.InsertKeyFrame(0.0f, { static_cast<float>(tile.sourceRect.left),
+                                      static_cast<float>(tile.sourceRect.top), 0.0f });
+        offset.InsertKeyFrame(1.0f, { static_cast<float>(tile.screenRect.left),
+                                      static_cast<float>(tile.screenRect.top), 0.0f },
+                              easing);
+        offset.Duration(duration);
+        tile.holder.StartAnimation(L"Offset", offset);
+
+        auto scale = compositor.CreateVector3KeyFrameAnimation();
+        scale.InsertKeyFrame(0.0f,
+            { static_cast<float>(tile.sourceRect.right - tile.sourceRect.left) / finalW,
+              static_cast<float>(tile.sourceRect.bottom - tile.sourceRect.top) / finalH,
+              1.0f });
+        scale.InsertKeyFrame(1.0f, { 1.0f, 1.0f, 1.0f }, easing);
+        scale.Duration(duration);
+        tile.holder.StartAnimation(L"Scale", scale);
+    }
+
+    // The names and icons arrive once the windows have landed. A label
+    // hurtling across the screen and shrinking as it goes is unreadable.
+    auto chromeFade = compositor.CreateScalarKeyFrameAnimation();
+    chromeFade.InsertKeyFrame(0.0f, 0.0f);
+    chromeFade.InsertKeyFrame(0.62f, 0.0f);
+    chromeFade.InsertKeyFrame(1.0f, 1.0f, easing);
+    chromeFade.Duration(duration);
+    screen.chromeLayer.StartAnimation(L"Opacity", chromeFade);
+
+    if (!fadeRoot) return;
+
+    auto fade = compositor.CreateScalarKeyFrameAnimation();
+    fade.InsertKeyFrame(0.0f, 0.0f);
+    fade.InsertKeyFrame(1.0f, 1.0f, easing);
+    fade.Duration(duration);
+    screen.root.StartAnimation(L"Opacity", fade);
+}
+
+} // namespace
+
+// Spread one application's pile out so its windows can be told apart.
+//
+// The tiles are not rebuilt, they are moved: the same visuals travel from the
+// pile to their spread positions, which is what makes it read as the pile
+// opening rather than as one arrangement being swapped for another. Everything
+// belonging to another application dims rather than disappearing, so the pile
+// is still somewhere on a desktop you recognise.
+void Mission::Impl::ExpandPile(Screen& screen, int group) {
+    std::vector<size_t> pile;
+    for (size_t i = 0; i < screen.tiles.size(); ++i)
+        if (screen.tiles[i].group == group) pile.push_back(i);
+
+    if (pile.size() < 2) return;
+
+    const float margin  = screen.Scaled(kOuterMargin);
+    const float barH    = spaces.empty() ? 0.0f : screen.Scaled(kBarHeight);
+    const float chromeH = screen.Scaled(kBadgeSize) * 0.34f + screen.Scaled(kTitleGap) +
+                          screen.Scaled(kTitleHeight);
+
+    const float regionX = margin;
+    const float regionY = barH + margin;
+    const float regionW = (std::max)(screen.Scaled(160.0f), screen.Width() - margin * 2);
+    const float regionH = (std::max)(screen.Scaled(120.0f),
+                                     screen.Height() - barH - margin * 2 - chromeH);
+
+    std::vector<mission::Window> windows;
+    for (size_t i : pile) {
+        const MissionItem& item = items[static_cast<size_t>(screen.tiles[i].item)];
+        mission::Window w;
+        w.x = static_cast<float>(item.bounds.left - screen.rect.left);
+        w.y = static_cast<float>(item.bounds.top  - screen.rect.top);
+        w.w = static_cast<float>((std::max)(1l, item.bounds.right - item.bounds.left));
+        w.h = static_cast<float>((std::max)(1l, item.bounds.bottom - item.bounds.top));
+        w.group = 0;
+        w.order = item.order;
+        windows.push_back(w);
+    }
+
+    mission::Params params;
+    params.gap        = screen.Scaled(config::Current().missionGap);
+    params.groupByApp = false;   // inside one app there is nothing left to group
+
+    const mission::Result result = mission::Layout(windows, regionW, regionH, params);
+    if (result.tiles.size() != pile.size()) return;
+
+    const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
+    auto easing = compositor.CreateCubicBezierEasingFunction({ 0.22f, 1.0f }, { 0.36f, 1.0f });
+
+    for (size_t k = 0; k < pile.size(); ++k) {
+        Tile& tile = screen.tiles[pile[k]];
+        const mission::Placement& place = result.tiles[k];
+
+        tile.liveRect = RECT{
+            static_cast<LONG>(regionX + place.x),
+            static_cast<LONG>(regionY + place.y),
+            static_cast<LONG>(regionX + place.x + place.w),
+            static_cast<LONG>(regionY + place.y + place.h),
+        };
+
+        auto offset = compositor.CreateVector3KeyFrameAnimation();
+        offset.InsertKeyFrame(1.0f, { regionX + place.x, regionY + place.y, 0.0f }, easing);
+        offset.Duration(duration);
+        tile.holder.StartAnimation(L"Offset", offset);
+
+        auto scale = compositor.CreateVector3KeyFrameAnimation();
+        scale.InsertKeyFrame(1.0f, { place.w / (std::max)(1.0f, tile.baseW),
+                                     place.h / (std::max)(1.0f, tile.baseH), 1.0f }, easing);
+        scale.Duration(duration);
+        tile.holder.StartAnimation(L"Scale", scale);
+
+        // Every window in the pile is its own thing now, so each gets its own
+        // name rather than sharing the application's.
+        if (!tile.chrome) {
+            tile.chrome = compositor.CreateSpriteVisual();
+            screen.chromeLayer.Children().InsertAtTop(tile.chrome);
+        }
+        tile.screenRect = tile.liveRect;
+        tile.pileX      = static_cast<float>(tile.liveRect.left);
+        tile.pileW      = place.w;
+        tile.pileBottom = static_cast<float>(tile.liveRect.bottom);
+    }
+
+    for (size_t i = 0; i < screen.tiles.size(); ++i) {
+        if (screen.tiles[i].group == group) continue;
+
+        auto dim = compositor.CreateScalarKeyFrameAnimation();
+        dim.InsertKeyFrame(1.0f, 0.18f, easing);
+        dim.Duration(duration);
+        screen.tiles[i].holder.StartAnimation(L"Opacity", dim);
+        if (screen.tiles[i].chrome)
+            screen.tiles[i].chrome.StartAnimation(L"Opacity", dim);
+    }
+
+    screen.expandedGroup = group;
+    screen.hovered = -1;
+
+    // Re-baked after the geometry is settled, because the label text changes
+    // from the application's name to each window's own.
+    for (size_t i : pile) BakeChrome(screen, screen.tiles[i]);
+
+    MACTAB_DIAG("mission: spread %zu window(s) of app %d", pile.size(), group);
+}
+
+void Mission::Impl::CollapsePile(Screen& screen) {
+    if (screen.expandedGroup < 0) return;
+
+    const int group = screen.expandedGroup;
+    screen.expandedGroup = -1;
+
+    // Nothing here knows the collapsed geometry any more, and reconstructing it
+    // by hand would be a second copy of the arrangement. Rebuilding it is one
+    // call and it comes back with the same reveal it had.
+    BuildForDesktop(browsed, 0);
+
+    for (Screen& other : screens) {
+        for (Tile& tile : other.tiles) {
+            tile.holder.Opacity(1.0f);
+            if (tile.chrome) tile.chrome.Opacity(1.0f);
+        }
+        StartReveal(compositor, other,
+                    std::chrono::milliseconds(config::Current().missionRevealMs), false);
+    }
+
+    MACTAB_DIAG("mission: pile of app %d collapsed", group);
+}
+
+void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spaces,
+                   int desktop) {
     Impl& impl = *m_impl;
     if (impl.visible || impl.screens.empty()) return;
 
@@ -1566,27 +1935,7 @@ void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spa
             for (Impl::Screen& screen : impl.screens) screen.backdropSurface = nullptr;
         }
 
-        // Which windows belong to which display. A window straddling two
-        // monitors belongs to whichever holds its centre.
-        std::vector<std::vector<int>> members(impl.screens.size());
-        for (size_t i = 0; i < impl.items.size(); ++i) {
-            const RECT& b = impl.items[i].bounds;
-            const POINT centre{ (b.left + b.right) / 2, (b.top + b.bottom) / 2 };
-            const HMONITOR monitor = ::MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST);
-
-            for (size_t s = 0; s < impl.screens.size(); ++s)
-                if (impl.screens[s].monitor == monitor) {
-                    members[s].push_back(static_cast<int>(i));
-                    break;
-                }
-        }
-
-        for (size_t s = 0; s < impl.screens.size(); ++s) {
-            Impl::Screen& screen = impl.screens[s];
-            impl.BakeBackdrop(screen);
-            impl.BakeBar(screen);
-            impl.BuildTiles(screen, members[s]);
-        }
+        impl.BuildForDesktop(desktop, 0);
 
         impl.restoreWindow = ::GetForegroundWindow();
 
@@ -1613,53 +1962,8 @@ void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spa
         ::SetFocus(focus);
 
         const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
-        auto easing = impl.compositor.CreateCubicBezierEasingFunction({ 0.22f, 1.0f },
-                                                                     { 0.36f, 1.0f });
-
-        for (Impl::Screen& screen : impl.screens) {
-            // Every window starts at the position and size it really has and
-            // travels to its slot. That is the whole illusion: the desktop
-            // pulls itself apart rather than a dialog appearing. Offset and
-            // Scale only, both on the compositor thread, so it costs this
-            // process nothing while it runs.
-            for (Impl::Tile& tile : screen.tiles) {
-                const float finalW = static_cast<float>(tile.screenRect.right - tile.screenRect.left);
-                const float finalH = static_cast<float>(tile.screenRect.bottom - tile.screenRect.top);
-                if (finalW <= 0.0f || finalH <= 0.0f) continue;
-
-                auto offset = impl.compositor.CreateVector3KeyFrameAnimation();
-                offset.InsertKeyFrame(0.0f, { static_cast<float>(tile.sourceRect.left),
-                                              static_cast<float>(tile.sourceRect.top), 0.0f });
-                offset.InsertKeyFrame(1.0f, { static_cast<float>(tile.screenRect.left),
-                                              static_cast<float>(tile.screenRect.top), 0.0f },
-                                      easing);
-                offset.Duration(duration);
-                tile.holder.StartAnimation(L"Offset", offset);
-
-                auto scale = impl.compositor.CreateVector3KeyFrameAnimation();
-                scale.InsertKeyFrame(0.0f,
-                    { static_cast<float>(tile.sourceRect.right - tile.sourceRect.left) / finalW,
-                      static_cast<float>(tile.sourceRect.bottom - tile.sourceRect.top) / finalH,
-                      1.0f });
-                scale.InsertKeyFrame(1.0f, { 1.0f, 1.0f, 1.0f }, easing);
-                scale.Duration(duration);
-                tile.holder.StartAnimation(L"Scale", scale);
-            }
-
-            // The names and icons arrive once the windows have landed.
-            auto chromeFade = impl.compositor.CreateScalarKeyFrameAnimation();
-            chromeFade.InsertKeyFrame(0.0f, 0.0f);
-            chromeFade.InsertKeyFrame(0.62f, 0.0f);
-            chromeFade.InsertKeyFrame(1.0f, 1.0f, easing);
-            chromeFade.Duration(duration);
-            screen.chromeLayer.StartAnimation(L"Opacity", chromeFade);
-
-            auto fade = impl.compositor.CreateScalarKeyFrameAnimation();
-            fade.InsertKeyFrame(0.0f, 0.0f);
-            fade.InsertKeyFrame(1.0f, 1.0f, easing);
-            fade.Duration(duration);
-            screen.root.StartAnimation(L"Opacity", fade);
-        }
+        for (Impl::Screen& screen : impl.screens)
+            StartReveal(impl.compositor, screen, duration, true);
 
         impl.visible = true;
     });
@@ -1668,6 +1972,53 @@ void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spa
         MACTAB_FAIL("mission: Show failed; hiding again");
         Hide();
     }
+}
+
+int Mission::BrowsedDesktop() const { return m_impl->browsed; }
+
+// Look at another desktop from inside Mission Control.
+//
+// The desktop is NOT switched. Windows on another desktop are shell-cloaked but
+// they are still enumerable and still have geometry, so the arrangement can be
+// built for any of them, and activating one of those windows is what actually
+// takes you there, which Windows does as part of the activation. Switching for
+// real here would mean either losing the overlay, because it belongs to the
+// desktop it was made on, or moving it, and either way the user would arrive
+// somewhere instead of looking somewhere.
+void Mission::BrowseDesktop(int index) {
+    Impl& impl = *m_impl;
+    if (!impl.visible) return;
+    if (index < 0 || index >= static_cast<int>(impl.spaces.size())) return;
+    if (index == impl.browsed) return;
+
+    GuardMission(impl, "BrowseDesktop", [&] {
+        const int direction = (index > impl.browsed) ? 1 : -1;
+        const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
+        auto easing = impl.compositor.CreateCubicBezierEasingFunction({ 0.22f, 1.0f },
+                                                                     { 0.36f, 1.0f });
+
+        // The outgoing arrangement leaves the way you came from. It is animated
+        // before the rebuild because the rebuild throws these visuals away, so
+        // what is actually seen is the incoming set arriving over a backdrop
+        // that never moved. Sliding both would need the old tiles kept alive
+        // through the swap, which is a lot of machinery for a quarter second.
+        for (Impl::Screen& screen : impl.screens) {
+            screen.outline.Opacity(0.0f);
+            for (Impl::Tile& tile : screen.tiles)
+                tile.holder.Opacity(0.0f);
+            screen.chromeLayer.Opacity(0.0f);
+        }
+
+        impl.BuildForDesktop(index, direction);
+
+        for (Impl::Screen& screen : impl.screens) {
+            for (Impl::Tile& tile : screen.tiles) tile.holder.Opacity(1.0f);
+            StartReveal(impl.compositor, screen, duration, false);
+        }
+
+        (void)easing;
+        MACTAB_DIAG("mission: browsing desktop %d", index);
+    });
 }
 
 void Mission::Hide(bool restoreFocus) {

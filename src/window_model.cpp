@@ -4,6 +4,7 @@
 #include "common.h"
 #include "diag.h"
 #include "config.h"
+#include "desktops.h"
 #include "foreground_history.h"
 
 namespace mactab {
@@ -33,10 +34,17 @@ std::wstring TitleOf(HWND hwnd) {
 // apps that are not running, and, importantly, every window living on a
 // different virtual desktop. This single check is what keeps the switcher
 // scoped to the current desktop.
-bool IsCloaked(HWND hwnd) {
+//
+// The two are told apart by the reason. DWM_CLOAKED_SHELL is the shell hiding a
+// window because its desktop is not the one being viewed, and that is the only
+// kind Mission Control wants back; DWM_CLOAKED_APP and DWM_CLOAKED_INHERITED
+// mean the window is genuinely not there.
+bool IsCloaked(HWND hwnd, bool allowOtherDesktops) {
     DWORD cloaked = 0;
     const HRESULT hr = ::DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-    return SUCCEEDED(hr) && cloaked != 0;
+    if (FAILED(hr) || cloaked == 0) return false;
+    if (allowOtherDesktops && cloaked == DWM_CLOAKED_SHELL) return false;
+    return true;
 }
 
 // Where a window visually is, which is not what GetWindowRect returns.
@@ -99,7 +107,7 @@ bool IsShellWindow(const std::wstring& className) {
 
 } // namespace
 
-bool IsSwitcherWindow(HWND hwnd) {
+bool IsSwitcherWindow(HWND hwnd, bool includeOtherDesktops) {
     if (!hwnd || !::IsWindowVisible(hwnd))
         return false;
 
@@ -107,7 +115,7 @@ bool IsSwitcherWindow(HWND hwnd) {
     if (::GetAncestor(hwnd, GA_ROOT) != hwnd)
         return false;
 
-    if (IsCloaked(hwnd))
+    if (IsCloaked(hwnd, includeOtherDesktops))
         return false;
 
     const LONG_PTR exStyle = ::GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -159,22 +167,29 @@ namespace {
 
 struct Enumeration {
     std::vector<HWND> windows;
+    bool              includeOtherDesktops = false;
 };
 
 BOOL CALLBACK EnumProc(HWND hwnd, LPARAM param) {
-    if (IsSwitcherWindow(hwnd))
-        reinterpret_cast<Enumeration*>(param)->windows.push_back(hwnd);
+    auto* enumeration = reinterpret_cast<Enumeration*>(param);
+    if (IsSwitcherWindow(hwnd, enumeration->includeOtherDesktops))
+        enumeration->windows.push_back(hwnd);
     return TRUE;
 }
 
 } // namespace
 
 std::vector<SwitcherApp> BuildSwitcherList() {
-    MACTAB_DIAG_TIMER("window_model: BuildSwitcherList");
+    return BuildWindowList(false);
+}
+
+std::vector<SwitcherApp> BuildWindowList(bool includeOtherDesktops) {
+    MACTAB_DIAG_TIMER("window_model: BuildWindowList");
 
     // EnumWindows walks in Z-order, top first, which is a sane fallback
     // ordering for anything the MRU tracker has not seen yet.
     Enumeration enumeration;
+    enumeration.includeOtherDesktops = includeOtherDesktops;
     ::EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&enumeration));
 
     // MRU rank lookup. foreground::Snapshot() is already most-recent-first.
@@ -213,6 +228,8 @@ std::vector<SwitcherApp> BuildSwitcherList() {
         window.title     = TitleOf(hwnd);
         window.minimized = ::IsIconic(hwnd) != FALSE;
         window.bounds    = BoundsOf(hwnd, window.minimized);
+        if (includeOtherDesktops)
+            desktops::DesktopIdOf(hwnd, window.desktop);
 
         const int windowRank = rankOf(hwnd, z);
 

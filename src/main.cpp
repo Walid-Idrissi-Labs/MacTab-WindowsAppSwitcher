@@ -435,6 +435,7 @@ bool EnsureMission() {
 void CloseMission() {
     if (g_app.mission.Visible()) {
         g_app.mission.Hide();
+        hotkey::SetMissionOpen(false);
         MACTAB_DIAG("mission: dismissed");
     }
 }
@@ -453,10 +454,21 @@ void OpenMission() {
     // can have it.
     if (g_app.gesture.active) return;
 
+    // Every desktop's windows, not just this one's, so the strip can be walked
+    // from inside without leaving.
+    const desktops::State state = desktops::Query(g_app.host);
+
+    std::vector<MissionSpace> spaces;
+    if (state.known) {
+        for (size_t i = 0; i < state.all.size(); ++i)
+            spaces.push_back(MissionSpace{ state.all[i].name,
+                                           static_cast<int>(i) == state.current });
+    }
+
     std::vector<MissionItem> items;
     int group = 0;
 
-    for (const SwitcherApp& app : BuildSwitcherList()) {
+    for (const SwitcherApp& app : BuildWindowList(state.known && state.all.size() > 1)) {
         // Whatever the icon worker already has. A miss queues the work and
         // WM_MACTAB_ICON_READY brings it back, so an app seen for the first
         // time gets its icon a moment later rather than never.
@@ -481,29 +493,34 @@ void OpenMission() {
             item.bounds  = window.bounds;
             item.group   = group;
             item.order   = static_cast<int>(items.size());
+
+            // -1 stays -1 for a pinned window, whose desktop id is a sentinel
+            // that is in no list, and that is exactly right: it shows on every
+            // desktop because it is on every desktop.
+            item.desktop = state.known ? desktops::IndexOf(state, window.desktop) : -1;
+
             items.push_back(std::move(item));
         }
         ++group;
     }
 
-    std::vector<MissionSpace> spaces;
-    const desktops::State state = desktops::Query(g_app.host);
-    if (state.known) {
-        for (size_t i = 0; i < state.all.size(); ++i)
-            spaces.push_back(MissionSpace{ state.all[i].name,
-                                           static_cast<int>(i) == state.current });
-    }
-
     MACTAB_DIAG("mission: opening with %zu window(s) and %zu space(s)",
                 items.size(), spaces.size());
 
-    g_app.mission.Show(std::move(items), std::move(spaces));
+    g_app.mission.Show(std::move(items), std::move(spaces),
+                       (std::max)(0, state.current));
+
+    // The hook stops passing Ctrl+Win+Left and Ctrl+Win+Right through while the
+    // overlay is up: they would switch the desktop out from under a window that
+    // belongs to the old one.
+    hotkey::SetMissionOpen(g_app.mission.Visible());
 }
 
 void ActivateFromMission(int index) {
     // The items live inside the overlay, which is about to throw them away, so
     // the handle is read before hiding.
     const HWND target = g_app.mission.ItemWindow(index);
+    hotkey::SetMissionOpen(false);
 
     // Hidden without putting focus back where it was, because it is about to go
     // somewhere else entirely. Restoring first would hand foreground to the old
@@ -517,25 +534,24 @@ void ActivateFromMission(int index) {
 }
 
 void HandleMissionSpace(WPARAM which) {
-    // The overlay comes down first, always.
+    if (which == Mission::kSpaceAdd || which == Mission::kSpaceClose) {
+        // Adding or removing a desktop is a change to the machine, not a change
+        // of view, so the overlay comes down first: the switch may animate, and
+        // an overlay still on screen while the desktop slides underneath it
+        // looks like a bug.
+        CloseMission();
+        if (which == Mission::kSpaceAdd) desktops::Create();
+        else                             desktops::CloseCurrent();
+        return;
+    }
+
+    // Clicking a desktop LOOKS at it. It does not go there.
     //
-    // Switching desktops may animate, and an overlay still on screen while the
-    // desktop slides underneath it looks like a bug. Creating a desktop has the
-    // same problem and additionally moves the foreground, which the overlay
-    // would immediately read as a reason to close itself.
-    const desktops::State state = desktops::Query(g_app.host);
-    CloseMission();
-
-    if (which == Mission::kSpaceAdd) {
-        desktops::Create();
-        return;
-    }
-    if (which == Mission::kSpaceClose) {
-        desktops::CloseCurrent();
-        return;
-    }
-
-    desktops::SwitchTo(state, static_cast<int>(which));
+    // The windows on another desktop are shell-cloaked but they are still
+    // enumerable and still have geometry, so the arrangement can be built for
+    // any of them without leaving. Going there for real happens when one of
+    // those windows is activated, which Windows does as part of the activation.
+    g_app.mission.BrowseDesktop(static_cast<int>(which));
 }
 
 // --- Tray ------------------------------------------------------------------

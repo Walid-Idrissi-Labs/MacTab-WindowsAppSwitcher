@@ -15,6 +15,11 @@ struct MissionItem {
     RECT         bounds{};   // where the window really is, virtual-screen coords
     int          group = 0;  // app index, for the grouped arrangement
     int          order = 0;  // most recently used first
+
+    // Which desktop it lives on, as an index into the spaces. -1 means the
+    // window is pinned to every desktop, or its desktop could not be read, and
+    // either way it shows on all of them.
+    int          desktop = -1;
 };
 
 // One entry in the bar across the top.
@@ -62,10 +67,21 @@ public:
     static constexpr WPARAM kSpaceAdd   = 0xFFFF;
     static constexpr WPARAM kSpaceClose = 0xFFFE;
 
-    // Build and reveal. Items may name windows on any display; each is arranged
-    // on the display that holds it. An empty list shows the bar over an empty
-    // desktop, exactly as macOS does with nothing open.
-    void Show(std::vector<MissionItem> items, std::vector<MissionSpace> spaces);
+    // Build and reveal. Items may name windows on any display and any desktop;
+    // each is arranged on the display that holds it, and only the windows of
+    // `desktop` are shown to begin with. An empty list shows the bar over an
+    // empty desktop, exactly as macOS does with nothing open.
+    void Show(std::vector<MissionItem> items, std::vector<MissionSpace> spaces,
+              int desktop);
+
+    // Look at another desktop without leaving. The arrangement slides out in
+    // the direction of travel and the new one slides in behind it; the desktop
+    // itself is not switched until a window on it is activated, which Windows
+    // does as part of the activation.
+    void BrowseDesktop(int index);
+
+    // Which desktop is being looked at, or -1.
+    int  BrowsedDesktop() const;
 
     // `restoreFocus` puts foreground back where it was before the overlay took
     // it. Pass false when the caller is about to activate something itself, so
