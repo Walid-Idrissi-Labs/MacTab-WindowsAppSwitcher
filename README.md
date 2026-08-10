@@ -24,6 +24,16 @@ Two, and they pull against each other:
    Windows hands us, MRU app grouping, `Q` to quit an app from the switcher.
 2. **Cost nothing.** No polling, no timers at rest, no runtime dependencies.
 
+Target budget:
+
+| | |
+|---|---|
+| Idle CPU | 0.0% |
+| Idle working set | < 20 MB |
+| Binary | < 2 MB, no redistributables |
+| Warm Alt+Tab to first pixel | < 16 ms |
+| CPU during animation | ~0% (runs on the compositor thread) |
+
 ## Install
 
 Download `MacTab-Setup-x.y.z.exe` from
@@ -37,16 +47,6 @@ The hook is the whole mechanism, `RegisterHotKey` cannot bind `Alt+Tab` because
 Windows reserves it, and the code is in
 [`src/hotkey.cpp`](src/hotkey.cpp) if you want to read what it does before
 running it. Please do not disable your antivirus for this.
-
-Target budget:
-
-| | |
-|---|---|
-| Idle CPU | 0.0% |
-| Idle working set | < 20 MB |
-| Binary | < 2 MB, no redistributables |
-| Warm Alt+Tab → first pixel | < 16 ms |
-| CPU during animation | ~0% (runs on the compositor thread) |
 
 ## Why C++/WinRT and Windows.UI.Composition
 
