@@ -142,7 +142,11 @@ struct Mission::Impl {
 
     // Whichever DirectComposition device interface the compositor will admit
     // to. Only used as an opaque pointer to hand to DWM.
-    ComPtr<IUnknown> dcompDevice;
+    //
+    // winrt::com_ptr rather than the project's own ComPtr, which is deliberately
+    // minimal and has no way to adopt a pointer that is already referenced.
+    // This file is MSVC-only anyway, so the WinRT one costs nothing here.
+    winrt::com_ptr<IUnknown> dcompDevice;
 
     WUC::ContainerVisual root{ nullptr };
     WUC::SpriteVisual    backdropVisual{ nullptr };
@@ -406,11 +410,11 @@ bool Mission::Impl::CreateDevices() {
     // is not documented anywhere, and the only thing that matters is getting a
     // pointer DWM accepts, so any of them will do.
     if (auto device3 = compositor.try_as<IDCompositionDevice3>())
-        dcompDevice = ComPtr<IUnknown>(device3.as<IUnknown>().get());
+        dcompDevice = device3.as<IUnknown>();
     else if (auto desktop = compositor.try_as<IDCompositionDesktopDevice>())
-        dcompDevice = ComPtr<IUnknown>(desktop.as<IUnknown>().get());
+        dcompDevice = desktop.as<IUnknown>();
     else if (auto device2 = compositor.try_as<IDCompositionDevice2>())
-        dcompDevice = ComPtr<IUnknown>(device2.as<IUnknown>().get());
+        dcompDevice = device2.as<IUnknown>();
 
     if (!dcompDevice)
         MACTAB_WARN("mission: no DirectComposition device behind the compositor; "
@@ -542,7 +546,7 @@ void Mission::Shutdown() {
     impl.target          = nullptr;
     impl.graphics        = nullptr;
     impl.compositor      = nullptr;
-    impl.dcompDevice.Reset();
+    impl.dcompDevice = nullptr;
 
     if (impl.hwnd) {
         ::DestroyWindow(impl.hwnd);
@@ -802,11 +806,13 @@ void Mission::Impl::PositionSelection() {
     selectionVisual.Size({ static_cast<float>(rect.right - rect.left) + inset * 2,
                            static_cast<float>(rect.bottom - rect.top) + inset * 2 });
 
+    const WFN::float3 destination{ static_cast<float>(rect.left) - inset,
+                                   static_cast<float>(rect.top) - inset, 0.0f };
+
     auto spring = compositor.CreateSpringVector3Animation();
     spring.DampingRatio(0.85f);
     spring.Period(std::chrono::milliseconds(45));
-    spring.FinalValue({ static_cast<float>(rect.left) - inset,
-                        static_cast<float>(rect.top) - inset, 0.0f });
+    spring.FinalValue(destination);
     selectionVisual.StartAnimation(L"Offset", spring);
 }
 
@@ -952,7 +958,7 @@ void Mission::Impl::Build() {
         // by the compositor at no CPU cost, which is what the reveal needs.
         if (dcompDevice) {
             void* raw = nullptr;
-            if (thumbnail::CreateSharedVisual(dcompDevice.Get(), hwnd, items[i].hwnd,
+            if (thumbnail::CreateSharedVisual(dcompDevice.get(), hwnd, items[i].hwnd,
                                               &raw, &tile.thumbnail) && raw) {
                 winrt::com_ptr<IUnknown> unknown;
                 unknown.attach(reinterpret_cast<IUnknown*>(raw));
