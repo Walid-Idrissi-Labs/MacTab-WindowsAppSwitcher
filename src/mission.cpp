@@ -542,7 +542,12 @@ bool Mission::Initialize(HINSTANCE instance, HWND notifyWindow,
 
     // Probe the thumbnail path now rather than on the reveal path, and log
     // which tier won so a screenshot arrives with the answer attached.
-    thumbnail::Probe(impl.hwnd);
+    //
+    // The source is the host window rather than the overlay itself. Whether DWM
+    // will compose a window's thumbnail into that same window is not documented
+    // and is exactly the kind of thing that would answer "no" for a reason that
+    // has nothing to do with whether the export works.
+    thumbnail::Probe(impl.hwnd, notifyWindow);
 
     impl.ready = true;
     MACTAB_DIAG("mission: initialised, thumbnails via %s",
@@ -799,7 +804,8 @@ void Mission::Impl::BakeSpaces() {
 }
 
 void Mission::Impl::BakeTitle() {
-    if (hovered < 0 || hovered >= static_cast<int>(items.size())) {
+    if (hovered < 0 || hovered >= static_cast<int>(items.size()) ||
+        hovered >= static_cast<int>(tiles.size())) {
         titleVisual.Size({ 0.0f, 0.0f });
         return;
     }
@@ -981,9 +987,14 @@ void Mission::Impl::Build() {
     const float stripH  = spaces.empty() ? 0.0f : Scaled(kSpacesStripHeight);
     const float regionX = margin;
     const float regionY = stripH + margin;
-    const float regionW = width  - margin * 2;
-    const float regionH = height - stripH - margin * 2 -
-                          Scaled(kTitleHeight + kTitleGap);
+    // Floored, not just computed. On a short display the strip, the margins and
+    // the title band can add up to more than the screen, and Layout answers a
+    // non-positive region with an empty result, which the loop below would then
+    // index straight past the end of.
+    const float regionW = (std::max)(Scaled(160.0f), width - margin * 2);
+    const float regionH = (std::max)(Scaled(120.0f),
+                                     height - stripH - margin * 2 -
+                                     Scaled(kTitleHeight + kTitleGap));
 
     std::vector<mission::Window> windows;
     windows.reserve(items.size());
@@ -1011,6 +1022,14 @@ void Mission::Impl::Build() {
                 items.size(), NowMs() - started, result.scale, result.iterations,
                 result.relaxed ? "" : " (grid fallback)",
                 mission::SpatialAgreement(windows, result));
+
+    // Belt and braces against the case above: if the arrangement ever comes
+    // back short, draw what it did produce rather than reading past it.
+    if (result.tiles.size() != items.size()) {
+        MACTAB_FAIL("mission: arrangement returned %zu placement(s) for %zu window(s)",
+                    result.tiles.size(), items.size());
+        return;
+    }
 
     tiles.resize(items.size());
 

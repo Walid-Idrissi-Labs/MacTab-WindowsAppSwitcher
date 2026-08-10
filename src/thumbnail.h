@@ -48,14 +48,16 @@ enum class Tier {
 
 const char* TierName(Tier tier);
 
-// Probe once, using `destination` as the hosting window. Safe to call again;
-// the answer is cached for the session.
+// Probe once, hosting on `destination` and asking for `source`. Safe to call
+// again; the answer is cached for the session.
 //
-// The probe actually creates a shared visual for `destination` itself and
-// throws it away, rather than only checking that the export resolves. An
-// export that resolves and then fails, or succeeds and returns nothing, is the
-// failure mode that matters, and it cannot be detected any other way.
-Tier Probe(HWND destination);
+// The probe actually calls the export and throws the result away, rather than
+// only checking that it resolves. An export that resolves and then fails is the
+// failure mode that matters, and it cannot be detected any other way. Pass two
+// different windows of your own: whether DWM will compose a window's thumbnail
+// into that same window is undocumented, and a refusal for that reason would
+// say nothing about whether the export works.
+Tier Probe(HWND destination, HWND source);
 
 Tier Current();
 

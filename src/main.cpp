@@ -81,8 +81,14 @@ bool HasFlag(const wchar_t* cmdLine, const wchar_t* flag) {
 void PopulatePanel();
 void RefreshIcons();
 
+void CloseMission();
+
 void BeginGesture(bool reverse) {
     Gesture& g = g_app.gesture;
+
+    // Both own the keyboard and only one of them can have it. Alt+Tab wins,
+    // because it is the gesture that is about to take you somewhere.
+    CloseMission();
 
     g.apps       = BuildSwitcherList();
     g.active     = true;

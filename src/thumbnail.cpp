@@ -97,11 +97,13 @@ void Force(Tier tier) {
         MACTAB_DIAG("thumbnail: tier forced to %s", TierName(tier));
 }
 
-Tier Probe(HWND destination) {
+Tier Probe(HWND destination, HWND source) {
     if (g_probed) return Current();
     g_probed = true;
 
     g_tier = Tier::Snapshot;   // the floor that always works
+
+    if (!source) source = destination;
 
     if (!destination || !ResolveExports()) {
         MACTAB_DIAG("thumbnail: tier is %s", TierName(Current()));
@@ -126,7 +128,7 @@ Tier Probe(HWND destination) {
 
     void*      visual = nullptr;
     HTHUMBNAIL handle = nullptr;
-    const HRESULT hr = g_createShared(destination, destination, 2, &properties,
+    const HRESULT hr = g_createShared(destination, source, 2, &properties,
                                       nullptr, &visual, &handle);
 
     // E_INVALIDARG is the expected answer to a null device on a build where the
