@@ -15,14 +15,14 @@ bool ActivateWindow(HWND target, WORD altVirtualKey) {
     //
     // The synthetic Alt-up must land while the OLD window is still foreground.
     // Its queue processes the key-up after we have already switched away, so it
-    // is no longer active and never opens its menu bar — which is exactly the
+    // is no longer active and never opens its menu bar, which is exactly the
     // bleed-through we are avoiding. Doing this after SetForegroundWindow would
     // deliver a lone Alt to the newly activated app instead.
     //
     // It also earns us the right to change foreground at all: a process may
     // only call SetForegroundWindow if it "received the last input event",
     // among other conditions, and synthesising input is the accepted way to
-    // qualify. This is why we do not use AttachThreadInput — attaching our
+    // qualify. This is why we do not use AttachThreadInput: attaching our
     // input queue to another app's means a hang in that app hangs our hook
     // thread, which would take the keyboard down system-wide.
     hotkey::NeutralizeAlt(altVirtualKey);
@@ -33,7 +33,7 @@ bool ActivateWindow(HWND target, WORD altVirtualKey) {
     if (!focusTarget || !::IsWindow(focusTarget))
         focusTarget = target;
 
-    // Restore before taking foreground — the reverse order leaves the window
+    // Restore before taking foreground; the reverse order leaves the window
     // foreground but still iconic on some shells.
     if (::IsIconic(target))
         ::ShowWindow(target, SW_RESTORE);
@@ -45,7 +45,7 @@ bool ActivateWindow(HWND target, WORD altVirtualKey) {
     //
     // No GetLastError here: SetForegroundWindow does not set it, so logging one
     // would just print whatever unrelated call ran last. SetActiveWindow is not
-    // useful either — it only affects windows owned by the calling thread.
+    // useful either; it only affects windows owned by the calling thread.
     MACTAB_WARN("activate: SetForegroundWindow(%p) refused, falling back",
                 static_cast<void*>(focusTarget));
 

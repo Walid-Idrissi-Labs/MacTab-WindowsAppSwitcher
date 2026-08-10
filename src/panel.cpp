@@ -201,7 +201,7 @@ bool IsDeviceLost(HRESULT hr) {
 } // namespace
 
 // Every C++/WinRT call throws on failure, and these run inside a window
-// procedure — an escaping hresult_error would unwind straight out of wWinMain
+// procedure, an escaping hresult_error would unwind straight out of wWinMain
 // into std::terminate. Device loss after a driver update or a resume is not
 // hypothetical for a process that lives for weeks in a tray, so the panel has
 // to survive it rather than take the app down with it.
@@ -215,7 +215,7 @@ static bool GuardPanel(Panel::Impl& impl, const char* what, F&& fn) {
         const HRESULT hr = e.code();
         MACTAB_FAIL("panel: %s threw 0x%08lX", what, static_cast<unsigned long>(hr));
         if (IsDeviceLost(hr)) {
-            // Recovery creates WinRT objects too, so it can throw — and a throw
+            // Recovery creates WinRT objects too, so it can throw, and a throw
             // from inside a catch handler lands right back in std::terminate,
             // which is the exact path this guard exists to close.
             try {
@@ -338,8 +338,8 @@ bool Panel::Impl::CreatePanelWindow() {
     // It removes the GDI redirection surface so DWM composes our visual tree
     // directly. That kills the blank/flashing first frame a layered window
     // gives you, and avoids UpdateLayeredWindow entirely. The documented
-    // consequence is that there is no per-pixel hit testing — the whole window
-    // rect takes mouse input — which for a switcher is exactly what we want,
+    // consequence is that there is no per-pixel hit testing; the whole window
+    // rect takes mouse input, which for a switcher is exactly what we want,
     // and is why HitTest() is a plain layout test.
     //
     // WS_EX_NOACTIVATE keeps the panel from stealing foreground, so the
@@ -412,7 +412,7 @@ bool Panel::Initialize(HINSTANCE instance, HWND notifyWindow,
     //
     // Microsoft's own Win32 Composition sample passes DQTAT_COM_ASTA here, but
     // that field is documented as relevant only when threadType is
-    // DQTYPE_THREAD_DEDICATED — with DQTYPE_THREAD_CURRENT it is ignored and
+    // DQTYPE_THREAD_DEDICATED, with DQTYPE_THREAD_CURRENT it is ignored and
     // initialises nothing. A Compositor has thread affinity and WinRT
     // activation on an uninitialised thread silently lands in the MTA, so the
     // apartment has to be established here.
@@ -473,7 +473,7 @@ void Panel::Shutdown() {
 
     // Release the Composition graph HERE, not from Impl's destructor.
     //
-    // g_app is a global, so its destructor runs during CRT exit — after
+    // g_app is a global, so its destructor runs during CRT exit; after
     // wWinMain has returned and this thread has stopped pumping its dispatcher
     // queue. Releasing thread-affine Composition objects and a live
     // DispatcherQueueController at that point is a well-known exit hang/crash.
@@ -528,7 +528,7 @@ int  Panel::TileSizePx() const {
 // Rebuild the graphics stack after device loss.
 //
 // The compositor, the desktop target and the visual tree all survive a lost
-// adapter — only the D3D/D2D devices and anything drawn through them do not.
+// adapter, only the D3D/D2D devices and anything drawn through them do not.
 // So this recreates the devices and the surfaces baked at startup; per-gesture
 // surfaces are rebuilt by the next SetItems anyway.
 void Panel::Impl::RecoverDevices() {
@@ -567,7 +567,7 @@ void Panel::Impl::RecoverDevices() {
 // Shadow
 //
 // A nine-grid rather than a Composition DropShadow. The silhouette never
-// changes — only the panel's size does — so the shadow can be rendered once at
+// changes, only the panel's size does, so the shadow can be rendered once at
 // startup and stretched. A DropShadow with a 40px blur is recomputed by the
 // compositor whenever the shadow's size changes, at a cost we cannot see or
 // bound. This is one textured quad per frame instead.
@@ -597,7 +597,7 @@ void Panel::Impl::BakeShadow() {
         //
         // The DC handed back by BeginDraw carries an update clip in atlas
         // coordinates, and D2D's clip stack is context state rather than target
-        // state — so drawing to an offscreen through it can be clipped against
+        // state, so drawing to an offscreen through it can be clipped against
         // wherever this surface happens to sit in the atlas, and leaves the
         // context in a state EndDraw did not expect.
         ComPtr<ID2D1DeviceContext> silhouetteDc;
@@ -661,8 +661,8 @@ void Panel::Impl::BakeShadow() {
 // This is started at gesture BEGIN and consumed at reveal, which matters for
 // two reasons. Capturing synchronously would put a full screen grab plus a
 // Gaussian blur on the reveal path and blow the one-frame budget outright. Worse,
-// BEGIN fires on the first Tab — before the hold delay has decided whether the
-// panel will appear at all — so a synchronous capture would make every quick
+// BEGIN fires on the first Tab, before the hold delay has decided whether the
+// panel will appear at all, so a synchronous capture would make every quick
 // Alt+Tab, the single most common operation, pay for a backdrop nobody ever sees.
 //
 // A packaged_task rather than std::async: a future from std::async blocks in its
@@ -683,7 +683,7 @@ void Panel::Impl::StartCapture() {
 //
 // A SpriteVisual with a colour brush is a hard-edged rectangle, which next to
 // squircle icons reads immediately as wrong. The highlight needs the same
-// rounded shape, and it has to resize as the tile size changes — so it is baked
+// rounded shape, and it has to resize as the tile size changes, so it is baked
 // once as a squircle and stretched with a nine-grid, exactly like the shadow.
 void Panel::Impl::BakeSelection() {
     const float radius = Scaled(layout::kTileSize) * 0.22f;
@@ -743,7 +743,7 @@ void Panel::Impl::BakeBackdrop() {
         winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
 
     // Collect the frame started at gesture begin. It has had the whole hold
-    // delay to finish, so in practice this never waits — but it is bounded
+    // delay to finish, so in practice this never waits, but it is bounded
     // anyway, because a wedged GPU must degrade to a flat tint rather than
     // stall the reveal.
     if (pendingCapture.valid()) {
@@ -992,7 +992,7 @@ void Panel::Impl::Layout(int count) {
 
     // Last line on purpose. Everything above can throw (device loss), and
     // recording the count earlier would let SetItems skip the re-layout after a
-    // recovery — rendering the gesture against half-updated geometry.
+    // recovery; rendering the gesture against half-updated geometry.
     laidOutCount = count;
 }
 
@@ -1003,7 +1003,7 @@ void Panel::Impl::UploadIcon(size_t index) {
     auto visual = tileVisuals[index];
 
     if (icon.Empty()) {
-        // Neutral placeholder until the worker delivers. Never leave a hole —
+        // Neutral placeholder until the worker delivers. Never leave a hole,
         // an empty slot reads as a bug, a grey tile reads as loading.
         visual.Brush(compositor.CreateColorBrush(WUI::Color{ 60, 255, 255, 255 }));
         return;
@@ -1137,7 +1137,7 @@ void Panel::UpdateIcon(const std::wstring& key, const Bitmap& icon) {
     GuardPanel(impl, "UpdateIcon", [&] {
         // Every matching item, not just the first. In window mode all tiles
         // share the expanded app's key, and with GroupByApp=0 every window of
-        // an app does too — returning early left all but one as placeholders.
+        // an app does too, returning early left all but one as placeholders.
         for (size_t i = 0; i < impl.items.size(); ++i) {
             if (impl.items[i].key != key) continue;
             impl.items[i].icon = icon;
@@ -1183,7 +1183,7 @@ void Panel::Show() {
     if (!ok) {
         // The window was already shown before the throw, so it is sitting there
         // topmost at zero opacity, swallowing every click over the middle of the
-        // screen — and Hide() would never run, because `visible` is still false.
+        // screen, and Hide() would never run, because `visible` is still false.
         ::ShowWindow(impl.hwnd, SW_HIDE);
         return;
     }

@@ -3,7 +3,7 @@
 // Deliberately free of windows.h.
 //
 // Everything here is pure computation, which means it can be compiled and RUN
-// natively on a development machine that is not Windows — see tools/preview/,
+// natively on a development machine that is not Windows, see tools/preview/,
 // which renders the icon pipeline's output to PNG so the squircle geometry can
 // actually be looked at rather than guessed at. Win32 interop (HBITMAP/HICON
 // conversion) lives in icon_source.h instead, precisely to keep this header
@@ -17,14 +17,14 @@ namespace mactab {
 
 // A plain 32-bit image.
 //
-// Layout is 0xAARRGGBB per pixel, which in little-endian memory is B,G,R,A —
+// Layout is 0xAARRGGBB per pixel, which in little-endian memory is B,G,R,A,
 // the same byte order as a Win32 32-bit DIB and as DXGI_FORMAT_B8G8R8A8_UNORM.
 // That means a finished bitmap can be handed to both the shell and Direct2D
 // without a channel shuffle.
 //
 // Alpha is STRAIGHT (not premultiplied) everywhere in this type. Premultiplied
 // data is only produced at the boundary, by PremultiplyInPlace, immediately
-// before upload — keeping intermediate stages straight avoids the progressive
+// before upload. Keeping intermediate stages straight avoids the progressive
 // darkening you get from repeatedly compositing premultiplied pixels.
 struct Bitmap {
     int                   width  = 0;
@@ -64,7 +64,7 @@ constexpr uint32_t MakePixel(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 // Resize with correct alpha handling.
 //
 // Resampling straight-alpha pixels bleeds the colour of fully transparent
-// pixels into visible ones — the classic dark or white halo around a scaled
+// pixels into visible ones; the classic dark or white halo around a scaled
 // icon. So this premultiplies, resamples, then unpremultiplies.
 //
 // Downscaling uses a box filter (area average) rather than bilinear: icons are

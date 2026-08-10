@@ -34,7 +34,7 @@ UINT g_msgTaskbarCreated = 0;   // RegisterWindowMessage(L"TaskbarCreated")
 
 // The in-flight switch gesture.
 //
-// Owned entirely by the UI thread. The hook thread never reads it — it posts
+// Owned entirely by the UI thread. The hook thread never reads it; it posts
 // intent (begin / select / commit) and this side decides what that means.
 struct Gesture {
     std::vector<SwitcherApp> apps;
@@ -43,7 +43,7 @@ struct Gesture {
     bool panelShown = false;
 
     // Down-arrow expands the highlighted app into its individual windows, and
-    // Tab then cycles those instead of apps — the macOS behaviour. `appIndex`
+    // Tab then cycles those instead of apps; the macOS behaviour. `appIndex`
     // remembers where to return to when the expansion collapses.
     bool windowMode = false;
     int  appIndex   = 0;
@@ -79,7 +79,7 @@ void BeginGesture(bool reverse) {
     g.panelShown = false;
 
     if (g.apps.size() < 2) {
-        // Nothing to switch to. Stay armed so the keys are still swallowed —
+        // Nothing to switch to. Stay armed so the keys are still swallowed:
         // falling back to the built-in switcher mid-gesture would be worse.
         g.index = 0;
         MACTAB_DIAG("gesture: begin with %zu app(s), nothing to switch to", g.apps.size());
@@ -111,7 +111,7 @@ icons::Request MakeIconRequest(const SwitcherApp& app, int tileSize) {
 // Push newly-arrived tiles into the panel without rebuilding it.
 //
 // A full PopulatePanel per worker completion would re-run layout, re-upload
-// every tile and start another capture — once per icon, during a gesture.
+// every tile and start another capture; once per icon, during a gesture.
 void RefreshIcons() {
     Gesture& g = g_app.gesture;
     if (!g_app.panel.Ready() || g.apps.empty()) return;
@@ -265,14 +265,14 @@ void RevealPanel() {
     Gesture& g = g_app.gesture;
 
     // Fewer than two apps means BeginGesture returned before populating the
-    // panel, so there is nothing valid to show — revealing would display the
+    // panel, so there is nothing valid to show; revealing would display the
     // previous gesture's tiles, complete with stale window handles.
     if (!g.active || g.apps.size() < 2) return;
 
     g.panelShown = true;
 
     // A quick Alt+Tab must never reach this point, and holding Alt must reach
-    // it exactly once — that split is the macOS behaviour, and this log line is
+    // it exactly once; that split is the macOS behaviour, and this log line is
     // how it gets verified without being able to watch the screen.
     const double started = NowMs();
     g_app.panel.Show();
@@ -287,7 +287,7 @@ void HandleActionKey(WORD virtualKey) {
     if (g.index < 0 || g.index >= static_cast<int>(g.apps.size())) return;
 
     // In window mode the highlighted entry is a window, but Q/W/H still act on
-    // the owning app — which is the one that was expanded.
+    // the owning app, which is the one that was expanded.
     const int appSlot = g.windowMode ? g.appIndex : g.index;
     if (appSlot < 0 || appSlot >= static_cast<int>(g.apps.size())) return;
 
@@ -296,7 +296,7 @@ void HandleActionKey(WORD virtualKey) {
     switch (virtualKey) {
     case 'Q':
         QuitApp(app);
-        // The app is going away, so drop its tile and keep the gesture alive —
+        // The app is going away, so drop its tile and keep the gesture alive.
         // macOS lets you quit several apps in one Cmd-Tab hold. Quitting the
         // app you were looking inside also collapses the expansion.
         g.apps.erase(g.apps.begin() + appSlot);
@@ -497,7 +497,7 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_MACTAB_ICON_READY:
         // Tiles usually finish during the hold delay, before the panel is
-        // shown, so this must not be gated on the panel being visible — doing
+        // shown, so this must not be gated on the panel being visible; doing
         // that left the first gesture showing placeholders for its whole
         // lifetime, because the worker never posts again for a cached tile.
         if (g_app.gesture.active)
@@ -586,7 +586,7 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     // Answering all three is what lets an upgrade replace the exe without
     // killing us mid-flight and leaking the tray icon.
     case WM_QUERYENDSESSION:
-        // Agree to exit, but do not tear down yet — the session may still be
+        // Agree to exit, but do not tear down yet; the session may still be
         // cancelled by another application.
         return TRUE;
 
@@ -638,7 +638,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
     // Composition sample is wrong: it passes DQTAT_COM_ASTA to
     // CreateDispatcherQueueController, but that field is documented as relevant
     // ONLY when threadType is DQTYPE_THREAD_DEDICATED. With
-    // DQTYPE_THREAD_CURRENT — which is what a Win32 app uses — it is ignored,
+    // DQTYPE_THREAD_CURRENT, which is what a Win32 app uses; it is ignored,
     // so it does not initialise anything. The thread must therefore be put in
     // an STA explicitly (winrt::init_apartment(apartment_type::single_threaded))
     // with DQTAT_COM_NONE, because a Compositor has thread affinity and WinRT

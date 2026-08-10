@@ -7,7 +7,7 @@
 // macOS Cmd-Tab is MRU-ordered, not Z-ordered, so the list has to be maintained
 // continuously rather than derived when the switcher opens. This does it with a
 // single EVENT_SYSTEM_FOREGROUND WinEvent hook whose callback appends an HWND
-// to a deque — a few instructions per focus change, and nothing at all when the
+// to a deque, a few instructions per focus change, and nothing at all when the
 // user is not switching windows. That is the whole idle cost of the feature.
 //
 // All functions are UI-thread only: WinEvent callbacks are delivered on the

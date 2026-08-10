@@ -7,7 +7,7 @@ namespace mactab {
 // Notification-area icon.
 //
 // Uses NOTIFYICON_VERSION_4, so the callback message arrives with screen
-// coordinates already packed into wParam and the event id in LOWORD(lParam) —
+// coordinates already packed into wParam and the event id in LOWORD(lParam),
 // no GetCursorPos round-trip, and NIN_SELECT/WM_CONTEXTMENU are distinguished
 // properly instead of guessing from raw mouse messages.
 class Tray {

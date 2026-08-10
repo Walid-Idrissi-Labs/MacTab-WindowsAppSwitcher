@@ -59,7 +59,7 @@ bool Tray::Create(HINSTANCE instance, HWND owner, UINT callbackMsg, UINT iconRes
     if (!m_icon) {
         MACTAB_WARN("tray: icon resource %u failed to load (err %lu), using system fallback",
                     iconResourceId, ::GetLastError());
-        // Shared system icon — must NOT be destroyed.
+        // Shared system icon; must NOT be destroyed.
         m_icon = ::LoadIconW(nullptr, IDI_APPLICATION);
     }
 

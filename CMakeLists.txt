@@ -125,7 +125,7 @@ target_precompile_headers(MacTab PRIVATE src/pch.h)
 # The pure image/geometry sources must NOT receive the precompiled header.
 #
 # target_precompile_headers force-includes pch.h into every translation unit,
-# which drags windows.h in behind their backs — defeating the property that lets
+# which drags windows.h in behind their backs, defeating the property that lets
 # tools/preview compile and run them natively, and exposing them to the Win32
 # macro minefield (rpcndr.h's `#define small char` broke squircle.cpp exactly
 # this way, invisibly to the mingw syntax check, which does not force-include).

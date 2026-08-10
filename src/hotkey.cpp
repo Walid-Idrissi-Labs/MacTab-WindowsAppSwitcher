@@ -72,7 +72,7 @@ void EndGesture(UINT message) {
     ::InterlockedExchange(&g_sharedAltVk, 0);
 }
 
-// Same, but tells the UI thread nothing — for callers that have already acted.
+// Same, but tells the UI thread nothing, for callers that have already acted.
 void EndGestureSilent() {
     KillRevealTimer();
     g_state        = State::Idle;
@@ -147,7 +147,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
 
     if (up && releasesGestureAlt) {
         // Record the exact VK we are swallowing so the UI thread can inject a
-        // matching key-up. Symmetry matters — releasing VK_MENU when the user
+        // matching key-up. Symmetry matters, releasing VK_MENU when the user
         // held VK_LMENU can leave the async state inconsistent.
         g_gestureAltVk = static_cast<WORD>(vk);
         EndGesture(WM_MACTAB_COMMIT);

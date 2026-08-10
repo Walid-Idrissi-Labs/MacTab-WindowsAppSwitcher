@@ -85,7 +85,7 @@ std::wstring PackageAumid(HANDLE process) {
     UINT32 length = 0;
     const LONG probe = fn(process, &length, nullptr);
 
-    // Not a packaged app — by far the common case, and not an error.
+    // Not a packaged app, by far the common case, and not an error.
     if (probe == kAppModelErrorNoApplication || length == 0)
         return {};
 
@@ -102,7 +102,7 @@ std::wstring PackageAumid(HANDLE process) {
     return aumid;
 }
 
-// FileDescription from the version resource — this is what Explorer shows as a
+// FileDescription from the version resource; this is what Explorer shows as a
 // program's name, and it is what users expect on the switcher label
 // ("Google Chrome", not "chrome").
 std::wstring VersionFileDescription(const std::wstring& exePath) {

@@ -80,7 +80,7 @@ for f in "${FILES[@]}"; do
     [[ -f "$f" ]] || { echo "skip (missing): $f"; continue; }
 
     if is_winrt_only "$f"; then
-        echo "SKIP  ${f#"$ROOT"/}  (WinRT/Composition — MSVC only)"
+        echo "SKIP  ${f#"$ROOT"/}  (WinRT/Composition, MSVC only)"
         skipped=$((skipped + 1))
         continue
     fi

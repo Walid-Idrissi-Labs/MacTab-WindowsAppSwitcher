@@ -82,7 +82,7 @@ Bitmap FromHIcon(HICON icon) {
         }
 
         // Only fall back to the mask when the colour bitmap has no real alpha
-        // gradient of its own — otherwise we would throw away good data.
+        // gradient of its own, otherwise we would throw away good data.
         if (!anyPartialAlpha) {
             for (int y = 0; y < out.height; ++y) {
                 for (int x = 0; x < out.width; ++x) {

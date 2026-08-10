@@ -4,7 +4,7 @@
 
 // Alt+Tab interception.
 //
-// RegisterHotKey cannot bind MOD_ALT|VK_TAB — Windows reserves it — and would
+// RegisterHotKey cannot bind MOD_ALT|VK_TAB (Windows reserves it) and would
 // not give us the press/hold/release semantics we need anyway, since it reports
 // a discrete chord with no key-up. So this is a WH_KEYBOARD_LL hook that returns
 // non-zero for the keys it consumes, which stops the built-in switcher ever
@@ -21,7 +21,7 @@
 //
 //  2. The gesture state machine lives ON the hook thread. Whether to swallow a
 //     key is the hook procedure's return value and cannot be deferred to
-//     another thread. The UI thread is a pure consumer of the messages below —
+//     another thread. The UI thread is a pure consumer of the messages below,
 //     it is never asked a question the hook is waiting on. Communication is
 //     PostMessage only, never SendMessage, which would block the hook thread on
 //     a possibly-stalled UI thread and get us unhooked.
@@ -31,7 +31,7 @@ namespace mactab::hotkey {
 // Posted to the UI window passed to Start(). All are fire-and-forget.
 enum : UINT {
     // A switch gesture started. wParam: 1 if Shift was held (reverse order).
-    // The panel is NOT shown yet — see WM_MACTAB_REVEAL.
+    // The panel is NOT shown yet, see WM_MACTAB_REVEAL.
     WM_MACTAB_BEGIN  = WM_APP + 10,
 
     // Move the selection. wParam: +1 forward, -1 backward.
@@ -80,7 +80,7 @@ void Stop();
 //
 // Low-level hooks are last-installed-first-served, so another tool installing
 // after us can eat Tab before we see it. There is no way to reclaim priority
-// other than reinstalling, and no notification when we lose it — hence the
+// other than reinstalling, and no notification when we lose it, hence the
 // manual escape hatch in the tray menu.
 bool Reload();
 
@@ -92,7 +92,8 @@ void AbortGesture();
 
 // End the gesture WITHOUT posting a cancellation.
 //
-// For paths that have already committed by other means — clicking a tile — so
+// For paths that have already committed by other means, such as clicking a
+// tile, so
 // the hook stops waiting for an Alt release without a second commit/cancel
 // arriving behind it and injecting a duplicate key-up.
 void EndGestureQuietly();

@@ -12,7 +12,7 @@ namespace mactab {
 // message, letting us exit cleanly.
 inline constexpr wchar_t kHostWindowClass[] = L"MacTabHostWindow";
 
-// Registered via RegisterWindowMessage, so the name — not a numeric id — is the
+// Registered via RegisterWindowMessage, so the name, not a numeric id, is the
 // contract. Any process can broadcast it to ask MacTab to exit.
 inline constexpr wchar_t kQuitMessageName[] = L"MacTab.RequestQuit";
 

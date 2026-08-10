@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate res/mactab.ico — the tray/app icon.
+"""Generate res/mactab.ico, the tray/app icon.
 
 The mark is a squircle inside a squircle, which is the whole point of the
 project: Apple's continuous-corner shape rather than a plain rounded rect.

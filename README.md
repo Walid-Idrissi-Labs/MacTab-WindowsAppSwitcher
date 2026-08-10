@@ -8,7 +8,7 @@ MacTab is the second thing, on Windows.
 
 **Status: feature-complete, unverified on hardware.** Every milestone is
 implemented, but the project is developed on macOS and has never been compiled
-or run on Windows. Treat the first build as a bring-up exercise — see
+or run on Windows. Treat the first build as a bring-up exercise; see
 [What to check first](#what-to-check-first).
 
 ## Goals
@@ -36,7 +36,7 @@ The corner radius decided it. `DWMWA_SYSTEMBACKDROP_TYPE` gives real Desktop
 Acrylic but locks corners to DWM's ~8px. `SetWindowCompositionAttribute` blurs
 the whole window rect, and clipping that needs `SetWindowRgn`, which is aliased.
 The Composition Visual Layer is the only API that will clip a blurred backdrop
-to arbitrary antialiased geometry — which is what a macOS-radius glass panel
+to arbitrary antialiased geometry, which is what a macOS-radius glass panel
 actually requires.
 
 It is also the cheapest option: `windowsapp.lib` is part of Windows (10 1803+),
@@ -91,7 +91,7 @@ parses and type-checks the Win32 sources against the mingw-w64 headers
 (`brew install mingw-w64`). It catches syntax errors, unknown identifiers, type
 mismatches, and wrong Win32 signatures.
 
-It does **not** cover the Composition rendering layer — the C++/WinRT headers
+It does **not** cover the Composition rendering layer: the C++/WinRT headers
 ship only with the Windows SDK, so those files are explicitly listed as skipped
 rather than silently passing. `src/pch.h` deliberately excludes `winrt/base.h`
 for this reason; files that need WinRT include `src/winrt_pch.h`.
@@ -111,20 +111,20 @@ and a mock of the real panel to PNGs in `build-preview/out/`. It uses the same
 geometry.
 
 This is the only part of the project that gets looked at before it ships, and it
-has already earned its keep — it caught icons being scaled by canvas instead of
+has already earned its keep; it caught icons being scaled by canvas instead of
 content, generated tiles landing at the same brightness as the glyph on them,
 and a square selection highlight sitting next to squircle icons.
 
 ## Milestones
 
-- [x] **M0** Skeleton — build system, tray, diagnostics logging
-- [x] **M1** Input capture — low-level keyboard hook, Alt state machine
-- [x] **M2** Window model — enumeration, app grouping, MRU
-- [x] **M3** Panel — Composition, captured-and-blurred backdrop, squircle
-- [x] **M4** Icons — extraction, squircle processing, caching
-- [x] **M5** Visual fidelity — labels, highlight, spring animation, DPI
-- [x] **M6** Actions — Q/W/H, per-app window cycling
-- [x] **M7** Config — settings, icon theme packs, autostart
+- [x] **M0** Skeleton: build system, tray, diagnostics logging
+- [x] **M1** Input capture: low-level keyboard hook, Alt state machine
+- [x] **M2** Window model: enumeration, app grouping, MRU
+- [x] **M3** Panel: Composition, captured-and-blurred backdrop, squircle
+- [x] **M4** Icons: extraction, squircle processing, caching
+- [x] **M5** Visual fidelity: labels, highlight, spring animation, DPI
+- [x] **M6** Actions: Q/W/H, per-app window cycling
+- [x] **M7** Config: settings, icon theme packs, autostart
 - [x] **M8** Performance pass
 - [x] **M9** Installer and uninstaller
 
@@ -135,10 +135,10 @@ early rather than after everything is built on top of them.
 ## What to check first
 
 None of this has run on Windows. Build it, launch with `--diag`, and work down
-this list — the log names the code path taken at each decision point.
+this list; the log names the code path taken at each decision point.
 
 1. **Does Alt+Tab get intercepted at all?** Windows' own switcher must never
-   appear. If it does, the hook was refused — the log says why.
+   appear. If it does, the hook was refused; the log says why.
 2. **Quick tap vs. hold.** A fast Alt+Tab must switch with no panel and must
    *never* log `gesture: reveal`. Holding Alt must log it exactly once.
 3. **AltGr.** On a French or Arabic layout, typing `@ # { } [ ]` must not open
@@ -187,7 +187,7 @@ each of these so the claims can be checked rather than trusted.
   of `SetWindowPos` crosses that boundary from a normal process. The legitimate
   fix is the same `uiAccess` that fixes elevated windows. Nothing renders above
   true exclusive-fullscreen apps either; borderless-windowed is fine.
-- **Windows 10 pre-1803 is unsupported** — that is the Composition floor.
+- **Windows 10 pre-1803 is unsupported**; that is the Composition floor.
 - **HDR displays** fall back to GDI capture. Desktop duplication hands back
   scRGB float rather than BGRA when HDR is on and does not convert, so the
   duplication path bails rather than showing wrong colours.

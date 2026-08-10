@@ -30,7 +30,7 @@ std::wstring TitleOf(HWND hwnd) {
 }
 
 // Cloaked windows are composited but deliberately not shown: UWP ghosts for
-// apps that are not running, and — importantly — every window living on a
+// apps that are not running, and, importantly, every window living on a
 // different virtual desktop. This single check is what keeps the switcher
 // scoped to the current desktop.
 bool IsCloaked(HWND hwnd) {
@@ -89,7 +89,7 @@ bool IsSwitcherWindow(HWND hwnd) {
         return false;
 
     // Owned windows (dialogs, tool palettes) are represented by their owner in
-    // the switcher, not listed separately — unless they opt in.
+    // the switcher, not listed separately, unless they opt in.
     const HWND owner = ::GetWindow(hwnd, GW_OWNER);
     if (owner && !(exStyle & WS_EX_APPWINDOW))
         return false;

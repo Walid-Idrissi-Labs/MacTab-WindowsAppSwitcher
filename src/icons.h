@@ -15,7 +15,7 @@
 //
 // Two cache layers. The memory cache holds finished tiles at display size. The
 // disk cache holds the same finished pixels, keyed by a hash that includes the
-// source executable's timestamp — so from the second launch onward, an app that
+// source executable's timestamp, so from the second launch onward, an app that
 // has not been updated costs a file read rather than shell round-trip plus
 // resampling plus mask.
 

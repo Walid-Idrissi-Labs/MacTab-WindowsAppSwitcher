@@ -14,14 +14,14 @@
 //
 // WHY NOT the host backdrop brush, which would avoid capturing at all:
 // DWMWA_USE_HOSTBACKDROPBRUSH is Windows 11 22000+, and the documentation for
-// CreateHostBackdropBrush states the app cannot read its pixels back — so there
+// CreateHostBackdropBrush states the app cannot read its pixels back, so there
 // is no way to detect the known case where it renders solid black, and no way
 // to probe it. Its transparency is also user- and power-policy-controlled,
 // meaning battery saver can silently flatten the effect.
 //
 // So: capture one frame ourselves and blur it. For a panel that is on screen
 // for a moment while the desktop behind it is static, a frozen backdrop is
-// indistinguishable from a live one — and it buys exact control over radius,
+// indistinguishable from a live one, and it buys exact control over radius,
 // tint and blur, which is the whole point.
 
 namespace mactab::capture {
@@ -49,7 +49,7 @@ struct Frame {
 
 // Capture the screen region `rect` (virtual-screen coordinates).
 //
-// `rect` should already be inflated by the blur margin — capturing only the
+// `rect` should already be inflated by the blur margin; capturing only the
 // panel's neighbourhood rather than the whole monitor is the key economy here:
 // a 1100x260 panel plus margin moves about 1.5 MB, where a 4K monitor would be
 // 33 MB.

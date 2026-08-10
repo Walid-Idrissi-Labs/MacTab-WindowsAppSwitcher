@@ -20,7 +20,7 @@ std::string  ToUtf8(std::wstring_view w);
 std::wstring FromUtf8(std::string_view s);
 
 // %LOCALAPPDATA%\MacTab, created on first call. Returns an empty string if the
-// directory could not be resolved or created — callers must handle that rather
+// directory could not be resolved or created; callers must handle that rather
 // than assuming a valid path.
 const std::wstring& AppDataDir();
 
@@ -30,7 +30,7 @@ const std::wstring& AppDataDir();
 double NowMs();
 
 // Windows build number (e.g. 22621), or 0 if it could not be determined.
-// Read via RtlGetVersion, which — unlike GetVersionEx — is not subject to
+// Read via RtlGetVersion, which, unlike GetVersionEx, is not subject to
 // manifest-based version lying.
 uint32_t WindowsBuildNumber();
 

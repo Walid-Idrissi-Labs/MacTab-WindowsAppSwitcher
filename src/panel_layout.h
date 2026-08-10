@@ -4,8 +4,8 @@
 //
 // These numbers are the difference between "looks like macOS" and "looks like a
 // Windows app with a blurry background", and they were chosen without being able
-// to see the result. Keeping the arithmetic here — rather than inline in
-// panel.cpp — means tools/preview can render the real layout natively and the
+// to see the result. Keeping the arithmetic here, rather than inline in
+// panel.cpp, means tools/preview can render the real layout natively and the
 // proportions can actually be looked at instead of guessed at.
 #include <algorithm>
 #include <cmath>

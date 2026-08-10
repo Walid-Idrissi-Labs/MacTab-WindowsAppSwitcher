@@ -11,8 +11,8 @@ namespace mactab::capture {
 namespace {
 
 // Total time we are willing to spend waiting for a duplicated frame. The reveal
-// is never blocked on this — the panel shows with a flat tint and crossfades the
-// blur in if it arrives late — so this only bounds the worker.
+// is never blocked on this; the panel shows with a flat tint and crossfades the
+// blur in if it arrives late, so this only bounds the worker.
 constexpr DWORD kAcquireTimeoutMs = 8;
 constexpr int   kAcquireAttempts  = 6;
 

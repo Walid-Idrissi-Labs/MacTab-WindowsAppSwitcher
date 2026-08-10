@@ -1,7 +1,7 @@
 #pragma once
 
 // Like image.h, free of windows.h so it can be compiled and run natively for
-// visual verification — see tools/preview/.
+// visual verification, see tools/preview/.
 #include <cstdint>
 #include <vector>
 
@@ -19,7 +19,7 @@
 // wide, so the artwork occupies ~80.5% of the tile.
 //
 // One important non-goal: this does NOT force every icon into a squircle.
-// macOS does not either — Chrome is a circle on macOS and stays a circle. The
+// macOS does not either; Chrome is a circle on macOS and stays a circle. The
 // mask only clips artwork that would otherwise stick out past the shape.
 // Synthesising a coloured tile is reserved for icons that are small glyphs on
 // transparency, which would otherwise float in the panel with nothing behind

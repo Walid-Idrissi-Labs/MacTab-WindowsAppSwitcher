@@ -40,7 +40,7 @@ public:
     // Resolve geometry for `itemCount` tiles without changing the contents.
     //
     // Callers need TileSizePx() before they can request icons at the right
-    // resolution, but that depends on the monitor and the item count — so the
+    // resolution, but that depends on the monitor and the item count, so the
     // layout has to be computed first, not inferred from a stale state.
     void PrepareLayout(int itemCount);
 
@@ -69,7 +69,7 @@ public:
     int TileSizePx() const;
 
     // Opaque; defined in panel.cpp. Public only so the file-local exception
-    // guard there can name it — there is nothing to encapsulate in a forward
+    // guard there can name it. There is nothing to encapsulate in a forward
     // declaration.
     struct Impl;
 

@@ -53,7 +53,7 @@ jobs:
           #
           # Every -D is passed as a QUOTED single token. Unquoted, PowerShell's
           # native-argument parsing mangles a value like 0.1.0 and CMake ends up
-          # receiving "0" — which fails the version check in a way that looks
+          # receiving "0", which fails the version check in a way that looks
           # like the tag was wrong rather than the shell.
           $ver = '${{ steps.ver.outputs.numeric }}'
           Write-Host "Building MacTab $ver"
@@ -70,7 +70,7 @@ jobs:
           if (-not (Test-Path $iscc)) {
             choco install innosetup -y --no-progress
           }
-          # Test-Path rather than running ISCC /? — it exits non-zero after
+          # Test-Path rather than running ISCC /?, which exits non-zero after
           # printing help, which this step would read as a failure.
           if (-not (Test-Path $iscc)) { throw "ISCC.exe still missing after install" }
 

@@ -1,8 +1,8 @@
 // Icon pipeline preview.
 //
 // MacTab is developed on a machine that cannot run it, which means the single
-// most subjective part of the project — whether the squircle geometry actually
-// reads as macOS — would otherwise be entirely unverified until it shipped.
+// most subjective part of the project, whether the squircle geometry actually
+// reads as macOS, would otherwise be entirely unverified until it shipped.
 //
 // image.cpp and squircle.cpp are deliberately free of windows.h, so they build
 // and run natively. This harness feeds them synthetic icons covering the shapes
@@ -140,7 +140,7 @@ Bitmap MakeCircle(int size) {
 
 Bitmap MakeSmallGlyph(int size) {
     // A dark monochrome mark on transparency, occupying a small share of the
-    // canvas — the case that should acquire a generated tile.
+    // canvas, the case that should acquire a generated tile.
     Bitmap bitmap = Bitmap::Create(size, size);
     const int x0 = size * 36 / 100, x1 = size * 64 / 100;
     const int y0 = size * 30 / 100, y1 = size * 70 / 100;
@@ -345,8 +345,8 @@ int main(int argc, char** argv) {
     // A mock of the whole panel at the real layout metrics.
     //
     // The tile size, gap, padding and corner radius were all chosen without
-    // being able to see them. This renders the actual shared layout code — not
-    // a copy of it — so the proportions can be judged rather than assumed.
+    // being able to see them. This renders the actual shared layout code, not
+    // a copy of it, so the proportions can be judged rather than assumed.
     {
         const int count = 6;
         const layout::Metrics m = layout::Compute(count, 2400.0f, 1.0f);
@@ -400,7 +400,7 @@ int main(int argc, char** argv) {
         const int hlSize = static_cast<int>(m.tileSize) + inset * 2;
         Bitmap highlight = Bitmap::Create(hlSize, hlSize);
         for (uint32_t& px : highlight.pixels) px = MakePixel(255, 255, 255, 46);
-        // Rounded, matching BakeSelection in panel.cpp — a hard-edged rectangle
+        // Rounded, matching BakeSelection in panel.cpp, a hard-edged rectangle
         // next to squircle icons reads as wrong immediately.
         {
             const int r = static_cast<int>(m.tileSize * 0.22f);

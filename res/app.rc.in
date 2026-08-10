@@ -1,4 +1,4 @@
-// Generated from res/app.rc.in by CMake — do not edit the generated copy.
+// Generated from res/app.rc.in by CMake , do not edit the generated copy.
 //
 // Version numbers are single-sourced from MACTAB_VERSION_STRING so that the
 // binary's VERSIONINFO, the string the app displays, and the version the

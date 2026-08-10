@@ -42,7 +42,7 @@ void Load();
 //
 // The Run key is the SINGLE source of truth: there is deliberately no mirrored
 // boolean in settings.ini. The installer writes it, this reads and toggles it,
-// and Task Manager's Startup tab shows the same thing — so the three can never
+// and Task Manager's Startup tab shows the same thing, so the three can never
 // disagree.
 
 bool AutostartEnabled();

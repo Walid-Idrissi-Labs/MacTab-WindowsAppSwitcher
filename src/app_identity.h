@@ -22,7 +22,7 @@
 //
 // Deliberately COM-free. AUMIDs come from GetApplicationUserModelId in
 // kernel32, not SHGetPropertyStoreForWindow, so this can run on the UI thread
-// during a gesture without needing an apartment — which matters because the
+// during a gesture without needing an apartment, which matters because the
 // Composition layer wants that thread in an ASTA it initialises itself.
 // Packaged apps' friendly display names DO need the shell, so they are filled
 // in later by the icon worker (M4), which has COM.
@@ -49,7 +49,7 @@ struct AppIdentity {
 // higher-integrity process we are not allowed to open).
 //
 // The returned pointer is owned by the cache and stays valid until
-// ClearIdentityCache(); do not store it across gestures. UI thread only — the
+// ClearIdentityCache(); do not store it across gestures. UI thread only; the
 // cache is unsynchronised by design, which is why nothing else writes to it.
 const AppIdentity* ResolveApp(HWND hwnd);
 
@@ -59,7 +59,7 @@ void ClearIdentityCache();
 // NOTE: there is deliberately no SetDisplayName here.
 //
 // Packaged apps' friendly names come from the shell, which only the icon worker
-// can reach — but publishing them back into this cache would mean writing the
+// can reach, but publishing them back into this cache would mean writing the
 // map from that thread while the UI thread inserts, erases and rehashes it
 // during every BuildSwitcherList, and while callers hold raw pointers into it.
 // The worker owns those names instead; ask icons::DisplayName().

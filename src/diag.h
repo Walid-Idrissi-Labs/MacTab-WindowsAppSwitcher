@@ -6,7 +6,7 @@
 //
 // This exists because the project is developed on a machine that cannot run it.
 // When something misbehaves on a real Windows box, the log is the only channel
-// back — so it is deliberately chatty about decisions (which backdrop tier won,
+// back, so it is deliberately chatty about decisions (which backdrop tier won,
 // why a window was filtered out) and about timings, and the log file is opened
 // with full sharing so it can be tailed while the app runs.
 //

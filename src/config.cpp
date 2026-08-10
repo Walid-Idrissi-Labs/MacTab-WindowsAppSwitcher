@@ -71,7 +71,7 @@ std::wstring ThemeName(const std::wstring& exePath, const std::wstring& aumid) {
 }
 
 // Decode a PNG through WIC, which is in the OS and handles colour profiles and
-// interlacing properly — worth far more than the few lines a minimal decoder
+// interlacing properly, worth far more than the few lines a minimal decoder
 // would save.
 Bitmap DecodeImageFile(const std::wstring& path) {
     ComApartment apartment(COINIT_APARTMENTTHREADED);

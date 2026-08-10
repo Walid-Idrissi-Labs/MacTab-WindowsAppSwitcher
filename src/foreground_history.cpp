@@ -12,7 +12,7 @@ constexpr size_t kMaxTracked = 64;
 HWINEVENTHOOK    g_eventHook = nullptr;
 std::deque<HWND> g_mru;   // most recent at the front
 
-// Cheap pre-filter. This is NOT the real Alt-Tab eligibility test — that needs
+// Cheap pre-filter. This is NOT the real Alt-Tab eligibility test; that needs
 // cloaking checks, owner-chain walking and UWP unwrapping, and it lands in M2.
 // Here we only need to keep obvious noise (tooltips, the shell, our own
 // windows) out of the history.

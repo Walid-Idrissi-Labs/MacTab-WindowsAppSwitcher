@@ -214,7 +214,7 @@ Bitmap ExtractExecutable(const Request& request) {
     return ImageFromShellItem(item.Get(), kSourceIconSize);
 }
 
-// Last resort. WM_GETICON is a send, so it can hang on a wedged app — use the
+// Last resort. WM_GETICON is a send, so it can hang on a wedged app; use the
 // timeout form and accept losing the icon rather than stalling the worker.
 Bitmap ExtractWindowIcon(HWND window) {
     if (!window || !::IsWindow(window)) return {};
@@ -359,7 +359,7 @@ void Stop() {
         g_stopping = true;
         // Abandon anything still queued. Draining it would mean up to a 200ms
         // SendMessageTimeout per pending request, which can add seconds to
-        // shutdown — right when Restart Manager is timing us during an upgrade.
+        // shutdown, right when Restart Manager is timing us during an upgrade.
         g_queue.clear();
     }
     g_wake.notify_all();
@@ -388,7 +388,7 @@ bool Acquire(const Request& request, Bitmap& out) {
             return true;
         }
 
-        // Already queued — do not pile up duplicates while the panel redraws.
+        // Already queued; do not pile up duplicates while the panel redraws.
         if (g_inFlight.find(key) != g_inFlight.end())
             return false;
 

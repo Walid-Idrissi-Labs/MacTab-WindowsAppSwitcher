@@ -217,8 +217,8 @@ IconAnalysis AnalyzeIcon(const Bitmap& icon) {
 
         // The tile is derived from the glyph's own colours, so left alone it
         // lands at the same luma as the glyph and the glyph disappears into it.
-        // Drive the tile to the opposite side of the glyph's brightness — a
-        // light mark gets a dark tile and vice versa — which is also what
+        // Drive the tile to the opposite side of the glyph's brightness, so a
+        // light mark gets a dark tile and vice versa, which is also what
         // macOS-style icons do.
         const int glyphLuma = Luma(MeanOpaqueColour(icon));
         constexpr int kMinLumaSeparation = 70;

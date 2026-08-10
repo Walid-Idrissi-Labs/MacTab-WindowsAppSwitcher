@@ -27,7 +27,7 @@ struct SwitcherApp {
     }
 };
 
-// Enumerate, filter, group and order. Called once per gesture — enumeration is
+// Enumerate, filter, group and order. Called once per gesture. Enumeration is
 // roughly a millisecond, so there is nothing to gain from keeping a live list,
 // and plenty to lose (a background list would have to be invalidated on every
 // window create/destroy, which is a constant CPU drip).
@@ -40,7 +40,7 @@ std::vector<SwitcherApp> BuildSwitcherList();
 // belong in the switcher at all?
 bool IsSwitcherWindow(HWND hwnd);
 
-// Writes the current list to the diag log. This is the M2 verification tool —
+// Writes the current list to the diag log. This is the M2 verification tool:
 // what it prints should match what Windows' own Alt+Tab shows.
 void LogSwitcherList();
 

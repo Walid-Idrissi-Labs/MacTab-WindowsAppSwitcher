@@ -28,7 +28,7 @@
 // them into the shared PCH would make every translation unit parseable only by
 // MSVC-on-Windows. Keeping them out means the Win32-only sources (everything
 // except the Composition rendering layer) can be syntax-checked cross-platform
-// against the mingw-w64 headers — see tools/syntax-check.sh. That is the only
+// against the mingw-w64 headers, see tools/syntax-check.sh. That is the only
 // verification available while developing away from a Windows machine, so it is
 // worth protecting.
 //

@@ -1,5 +1,5 @@
 ; ============================================================================
-; MacTab installer (Inno Setup 6.3+ — uses x64compatible and modern wizard)
+; MacTab installer (Inno Setup 6.3+, uses x64compatible and modern wizard)
 ;
 ; Build:
 ;   ISCC.exe /DMyAppVersion=1.2.3 /DSourceDir=..\build\bin installer\MacTab.iss
@@ -14,7 +14,7 @@
 ;    `MacTab-Setup.exe /ALLUSERS` performs a per-machine install today
 ;    (PrivilegesRequiredOverridesAllowed=commandline); when uiAccess="true"
 ;    lands (signed exe, must live under Program Files), flip the default by
-;    changing PrivilegesRequired to admin — everything else already uses the
+;    changing PrivilegesRequired to admin. Everything else already uses the
 ;    {auto*} constants, so nothing else in this script changes.
 ;  * The app-side contract this installer relies on (see ShutdownRunningInstance
 ;    and the CloseApplications directive):
@@ -30,7 +30,7 @@
 #define MyAppExeName    "MacTab.exe"
 #define MyAppPublisher  "Walid Idrissi Labs"
 #define MyAppURL        "https://github.com/Walid-Idrissi-Labs/WindowsAppSwitcher"
-; FROZEN — never regenerate:
+; FROZEN, never regenerate:
 #define MyAppId         "{E2C26C45-D5E7-4EFD-A956-4168F7C3E0D6}"
 ; Must match kHostWindowClass in src/app.h exactly. If these drift, the graceful
 ; shutdown below silently finds nothing and every upgrade falls back to Restart
@@ -154,7 +154,7 @@ begin
 end;
 
 { Ask the running instance (found via its hidden window) to exit, then wait
-  on its PROCESS handle — not just window destruction — so the exe's file
+  on its PROCESS handle, not just window destruction, so the exe's file
   lock is genuinely gone before files are replaced. Race-free order:
   open the process handle first, THEN post WM_CLOSE, THEN wait. }
 function ShutdownRunningInstance(TimeoutMs: DWORD): Boolean;
@@ -240,7 +240,7 @@ end;
 
 { User data policy: the uninstaller ASKS in interactive mode (default = keep),
   KEEPS data in silent mode unless /REMOVESETTINGS=1 was passed. It only ever
-  touches the CURRENT user's %LOCALAPPDATA%\MacTab — other users' data on a
+  touches the CURRENT user's %LOCALAPPDATA%\MacTab; other users' data on a
   per-machine install is deliberately left (their profiles may not even be
   loaded); the app removes or the user deletes it themselves. }
 procedure MaybeRemoveUserData();
