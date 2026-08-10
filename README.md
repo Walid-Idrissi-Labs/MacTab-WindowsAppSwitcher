@@ -324,9 +324,18 @@ It is a toggle, not a hold. Mission Control is a place you are in.
 large next to a small one and every aspect ratio is exact. Windows start where
 they really are and shove each other apart until nothing overlaps, which is
 what lets you find something by remembering where you left it. There is a
-number for that, printed in the diagnostics log: every pair of windows votes on
-whether the side it was on is the side it ended up on. A typical desktop scores
-0.80, thirty windows 0.87.
+number for that: every pair of windows votes on whether the side it was on is
+the side it ended up on. A typical desktop scores 0.80, thirty windows 0.87.
+
+**Applications are piles.** One app's windows are fanned, each offset behind the
+one in front, so the most recent is almost entirely visible and the others peek
+out from under it. That is what macOS does with grouping on, and it is worth a
+lot of room: thirty windows in six apps come out at a scale of 0.77 as piles
+against 0.27 when each window has to have its own space. The app's icon and name
+sit under the pile. `MissionGroupByApp=0` arranges purely by position instead.
+
+Each window carries a soft shadow that travels with it, and hovering one
+outlines it in your Windows accent colour.
 
 **What you see in each tile** depends on what the machine supports, and the log
 names the tier that won:
@@ -347,6 +356,9 @@ windows off and leaves the desktop, so capturing the screen would put every
 window into the blurred backdrop as well as into the arrangement, and each one
 would appear twice. It also means there is nothing to capture on the reveal
 path.
+
+**It opens on every display**, each with its own arrangement of that screen's
+windows and its own copy of the bar, which is what macOS does.
 
 **Virtual desktops** are read from the registry and driven with the same
 keyboard shortcuts you would press. Everything here is public API. The private
@@ -639,6 +651,10 @@ each of these so the claims can be checked rather than trusted.
 - **The space miniatures show the wallpaper, not their windows.** Windows on
   another desktop are shell-cloaked and DWM will not compose a cloaked window
   through any path available to a normal process.
+- **Windows 10 window thumbnails have square corners**, because that is the
+  shape Windows 10 draws them. A rounded composition clip needs build 17763,
+  above this project's floor, and the visual DWM hands back for a thumbnail
+  cannot be masked in any case.
 - **Minimised windows are not in Mission Control**, which is also true on macOS.
 - **HDR displays** fall back to GDI capture. Desktop duplication hands back
   scRGB float rather than BGRA when HDR is on and does not convert, so the
