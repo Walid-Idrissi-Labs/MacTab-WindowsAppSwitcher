@@ -482,6 +482,12 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // would inject a second Alt-up behind the one CommitGesture already
             // synthesised. Use the key that actually opened the gesture rather
             // than the generic VK_MENU, so the release is symmetric.
+            //
+            // EndGestureQuietly is asynchronous, so a physical Alt-up can still
+            // reach the hook first. That path is harmless: the hook posts
+            // COMMIT, g.active is already false, and CommitGesture just
+            // neutralises a key that is logically up again. GestureAltKey may
+            // return 0 in the same race, which NeutralizeAlt treats as VK_MENU.
             const WORD altKey = hotkey::GestureAltKey();
             hotkey::EndGestureQuietly();
             CommitGesture(altKey);

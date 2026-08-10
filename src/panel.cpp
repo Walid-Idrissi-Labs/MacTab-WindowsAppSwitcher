@@ -926,7 +926,6 @@ void Panel::Impl::BakeLabel() {
 // ---------------------------------------------------------------------------
 
 void Panel::Impl::Layout(int count) {
-    laidOutCount = count;
     // Follow the foreground window's monitor, which matches Alt+Tab semantics
     // better than following the cursor.
     const HWND foreground = ::GetForegroundWindow();
@@ -990,6 +989,11 @@ void Panel::Impl::Layout(int count) {
         BakeShadow();
         bakedShadowScale = dpiScale;
     }
+
+    // Last line on purpose. Everything above can throw (device loss), and
+    // recording the count earlier would let SetItems skip the re-layout after a
+    // recovery — rendering the gesture against half-updated geometry.
+    laidOutCount = count;
 }
 
 void Panel::Impl::UploadIcon(size_t index) {
