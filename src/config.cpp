@@ -35,7 +35,14 @@ const wchar_t* kDefaultIni =
     L"Theme=auto\r\n"
     L"\r\n"
     L"; 1 = one tile per application (macOS). 0 = one tile per window.\r\n"
-    L"GroupByApp=1\r\n";
+    L"GroupByApp=1\r\n"
+    L"\r\n"
+    L"; Which display the panel opens on.\r\n"
+    L";   active = the display holding the window you are currently in\r\n"
+    L";   mouse  = the display the mouse pointer is on\r\n"
+    L";   main   = always the main display\r\n"
+    L"; Also settable from the tray menu.\r\n"
+    L"PanelDisplay=active\r\n";
 
 std::wstring ReadString(const wchar_t* key, const wchar_t* fallback) {
     wchar_t buffer[128] = L"";
@@ -47,6 +54,20 @@ std::wstring ReadString(const wchar_t* key, const wchar_t* fallback) {
 int ReadInt(const wchar_t* key, int fallback) {
     return static_cast<int>(::GetPrivateProfileIntW(kSection, key, fallback,
                                                     g_settingsPath.c_str()));
+}
+
+const wchar_t* PanelDisplayKeyword(PanelDisplay display) {
+    switch (display) {
+        case PanelDisplay::Mouse:   return L"mouse";
+        case PanelDisplay::Primary: return L"main";
+        default:                    return L"active";
+    }
+}
+
+PanelDisplay ParsePanelDisplay(const std::wstring& text) {
+    if (text == L"mouse") return PanelDisplay::Mouse;
+    if (text == L"main" || text == L"primary") return PanelDisplay::Primary;
+    return PanelDisplay::ActiveWindow;
 }
 
 // Executable stem, or a filesystem-safe form of the AUMID.
@@ -160,11 +181,48 @@ void Load() {
     g_settings.tileSize    = (std::max)(48, (std::min)(256, ReadInt(L"TileSize", 128)));
     g_settings.theme       = ReadString(L"Theme", L"auto");
     g_settings.groupByApp  = ReadInt(L"GroupByApp", 1) != 0;
+    g_settings.panelDisplay = ParsePanelDisplay(ReadString(L"PanelDisplay", L"active"));
 
-    MACTAB_DIAG("config: revealDelay %u ms, leftAltOnly %d, tile %d, theme %s, groupByApp %d",
+    MACTAB_DIAG("config: revealDelay %u ms, leftAltOnly %d, tile %d, theme %s, "
+                "groupByApp %d, panelDisplay %s",
                 g_settings.revealDelayMs, g_settings.leftAltOnly ? 1 : 0,
                 g_settings.tileSize, ToUtf8(g_settings.theme).c_str(),
-                g_settings.groupByApp ? 1 : 0);
+                g_settings.groupByApp ? 1 : 0,
+                ToUtf8(PanelDisplayKeyword(g_settings.panelDisplay)).c_str());
+}
+
+bool SetPanelDisplay(PanelDisplay display) {
+    if (g_settingsPath.empty()) {
+        MACTAB_WARN("config: no settings file, cannot persist PanelDisplay");
+        return false;
+    }
+
+    const BOOL ok = ::WritePrivateProfileStringW(kSection, L"PanelDisplay",
+                                                 PanelDisplayKeyword(display),
+                                                 g_settingsPath.c_str());
+    // Apply it either way. Failing to write is a reason to lose the setting on
+    // the next launch, not a reason to ignore what the user just clicked.
+    g_settings.panelDisplay = display;
+
+    MACTAB_DIAG("config: panelDisplay -> %s (%s)",
+                ToUtf8(PanelDisplayKeyword(display)).c_str(), ok ? "saved" : "not saved");
+    return ok != FALSE;
+}
+
+bool SetTheme(const wchar_t* value) {
+    if (!value) return false;
+    if (g_settingsPath.empty()) {
+        MACTAB_WARN("config: no settings file, cannot persist Theme");
+        return false;
+    }
+
+    const BOOL ok = ::WritePrivateProfileStringW(kSection, L"Theme", value,
+                                                 g_settingsPath.c_str());
+    g_settings.theme = value;
+
+    MACTAB_DIAG("config: theme -> %s (%s)", ToUtf8(value).c_str(),
+                ok ? "saved" : "not saved");
+    return ok != FALSE;
 }
 
 bool AutostartEnabled() {

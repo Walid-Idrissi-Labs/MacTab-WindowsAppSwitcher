@@ -28,6 +28,7 @@
 #include "diag.h"
 #include "geometry.h"
 #include "config.h"
+#include "glass.h"
 #include "panel_layout.h"
 
 namespace WUC = winrt::Windows::UI::Composition;
@@ -44,16 +45,26 @@ constexpr wchar_t kPanelClass[] = L"MacTabPanelWindow";
 // panel_layout.h, which is free of windows.h so tools/preview can render the
 // real geometry natively. Only the rendering-specific constants stay here.
 constexpr float kShadowSigma = 22.0f;
-constexpr float kBlurSigma   = 34.0f;
 
-// Extra desktop captured around the panel so the blur has real pixels to pull
-// from instead of clamping at the edge.
-constexpr int kBlurMarginPx = 48;
+// The macOS switcher's backdrop is unrecognisable mush. 34 left window edges
+// readable through the glass, which immediately gives it away as a blurred
+// screenshot rather than a material.
+constexpr float kBlurSigma = 52.0f;
 
-// Downsample factor before blurring. A 34px sigma at quarter resolution costs
-// what an 8.5px sigma costs, and after the matching upscale the difference is
+// Downsample factor before blurring. A 52px sigma at quarter resolution costs
+// what a 13px sigma costs, and after the matching upscale the difference is
 // invisible under a tint.
 constexpr float kBlurDownscale = 0.25f;
+
+// Extra desktop captured around the panel so the blur has real pixels to pull
+// from instead of clamping at the edge under D2D1_BORDER_MODE_HARD.
+//
+// Derived from sigma rather than fixed, and scaled with the DPI. It was 48 raw
+// pixels, which was already thin against a 34px sigma and would smear visibly
+// at 52 on a 150% display.
+inline float BlurMarginPx(float dpiScale) {
+    return std::ceil(kBlurSigma * dpiScale * 1.5f);
+}
 
 bool SystemUsesLightTheme() {
     DWORD value = 0, size = sizeof(value);
@@ -75,26 +86,38 @@ bool ResolveLightTheme() {
 }
 
 struct Theme {
-    D2D1_COLOR_F tint;
-    D2D1_COLOR_F border;
-    D2D1_COLOR_F selection;
-    WUI::Color   label;
+    glass::Params material;     // saturation, gain, bias, tint, rim
+    D2D1_COLOR_F  selection;
+    WUI::Color    label;
 };
 
 Theme MakeTheme(bool light) {
-    Theme theme;
-    if (light) {
-        theme.tint      = D2D1::ColorF(0.96f, 0.96f, 0.97f, 0.62f);
-        theme.border    = D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.10f);
-        theme.selection = D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.10f);
-        theme.label     = WUI::Color{ 255, 20, 20, 22 };
-    } else {
-        theme.tint      = D2D1::ColorF(0.09f, 0.09f, 0.10f, 0.55f);
-        theme.border    = D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.10f);
-        theme.selection = D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.18f);
-        theme.label     = WUI::Color{ 255, 245, 245, 247 };
-    }
+    Theme theme{};
+    theme.material  = light ? glass::kLight : glass::kDark;
+    theme.selection = light ? D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.10f)
+                            : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.18f);
+    theme.label     = light ? WUI::Color{ 255, 20, 20, 22 }
+                            : WUI::Color{ 255, 245, 245, 247 };
     return theme;
+}
+
+D2D1_COLOR_F TintColour(const Theme& theme) {
+    const float* t = theme.material.tint;
+    return D2D1::ColorF(t[0], t[1], t[2], t[3]);
+}
+
+// glass::BuildMatrix is constexpr and D2D-free, so it lives with the numbers it
+// belongs to and tools/preview evaluates the identical coefficients. This just
+// unpacks it into the type Direct2D wants. Written out longhand rather than
+// memcpy'd over the union: the layout does match, but nothing checks that it
+// still does, and this file is the one the syntax checker cannot see.
+D2D1_MATRIX_5X4_F ToD2D(const glass::Matrix5x4& g) {
+    return D2D1::Matrix5x4F(
+        g.m[0][0], g.m[0][1], g.m[0][2], g.m[0][3],
+        g.m[1][0], g.m[1][1], g.m[1][2], g.m[1][3],
+        g.m[2][0], g.m[2][1], g.m[2][2], g.m[2][3],
+        g.m[3][0], g.m[3][1], g.m[3][2], g.m[3][3],
+        g.m[4][0], g.m[4][1], g.m[4][2], g.m[4][3]);
 }
 
 } // namespace
@@ -143,11 +166,25 @@ struct Panel::Impl {
     float  dpiScale  = 1.0f;
     float  tilePx    = layout::kTileSize;
     RECT   panelRect{};        // screen coords
-    Theme  theme     = MakeTheme(false);
+    Theme  theme        = MakeTheme(false);
+    bool   themeIsLight = false;
     HMONITOR monitor = nullptr;
     float    shadowMarginPx = 0.0f;
-    float    bakedShadowScale = 0.0f;
-    int      laidOutCount     = -1;   // skips a redundant second Layout per gesture
+    int      laidOutCount   = -1;   // skips a redundant second Layout per gesture
+
+    // The panel's corner extent in physical pixels, after the clamp in
+    // layout::Compute. The backdrop, the shadow behind it and anything else
+    // tracing the panel outline all read this rather than scaling
+    // layout::kPanelRadius themselves: at kMinTileSize the clamp is live, and
+    // two surfaces that clamp independently would disagree by enough to show a
+    // grey fringe outside the glass.
+    float    panelRadiusPx = layout::kPanelRadius;
+
+    // What BakeShadow was last built for. Both matter: sigma follows the DPI,
+    // and the silhouette follows the radius, which the clamp can move without
+    // the DPI changing at all.
+    float    bakedShadowScale  = 0.0f;
+    float    bakedShadowRadius = -1.0f;
 
     bool CreateDevices();
     bool CreatePanelWindow();
@@ -164,6 +201,8 @@ struct Panel::Impl {
     void BakeSelection();
     void StartCapture();
     void BakeBackdrop();
+    void DrawRim(ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& toSurface,
+                 float width, float height);
     void BakeLabel();
     void PositionTiles(bool animate);
     void UploadIcon(size_t index);
@@ -442,7 +481,8 @@ bool Panel::Initialize(HINSTANCE instance, HWND notifyWindow,
         return false;
     }
 
-    impl.theme = MakeTheme(ResolveLightTheme());
+    impl.themeIsLight = ResolveLightTheme();
+    impl.theme        = MakeTheme(impl.themeIsLight);
 
     if (!impl.CreatePanelWindow()) return false;
     if (!impl.CreateDevices())     return false;
@@ -451,7 +491,8 @@ bool Panel::Initialize(HINSTANCE instance, HWND notifyWindow,
     // Pre-bake at 100% so the common case is warm; Layout re-bakes if the
     // panel lands on a monitor with a different scale.
     impl.BakeShadow();
-    impl.bakedShadowScale = impl.dpiScale;
+    impl.bakedShadowScale  = impl.dpiScale;
+    impl.bakedShadowRadius = impl.panelRadiusPx;
 
     impl.ready = true;
     MACTAB_DIAG("panel: initialised and pre-warmed");
@@ -552,6 +593,8 @@ void Panel::Impl::RecoverDevices() {
 
     try {
         BakeShadow();
+        bakedShadowScale  = dpiScale;
+        bakedShadowRadius = panelRadiusPx;
         BakeSelection();
     } catch (const winrt::hresult_error& e) {
         MACTAB_FAIL("panel: re-baking after device loss threw 0x%08lX",
@@ -573,7 +616,7 @@ void Panel::Impl::RecoverDevices() {
 // bound. This is one textured quad per frame instead.
 void Panel::Impl::BakeShadow() {
     const float sigma  = Scaled(kShadowSigma);
-    const float radius = Scaled(layout::kPanelRadius);
+    const float radius = panelRadiusPx;
     const int   cell   = static_cast<int>(std::ceil(radius + 3.0f * sigma));
     const int   size   = cell * 2 + 4;
 
@@ -616,9 +659,12 @@ void Panel::Impl::BakeShadow() {
         if (FAILED(silhouetteDc->CreateBitmap(pixelSize, nullptr, 0, &props, silhouette.Put())))
             return;
 
+        // Same exponent as the backdrop. A shadow traced with a different corner
+        // shape than the glass it sits under peeks out at the corners.
         auto geometry = CreateSquircleGeometry(d2dFactory.Get(),
                                                static_cast<float>(size - 4),
-                                               static_cast<float>(size - 4), radius);
+                                               static_cast<float>(size - 4), radius,
+                                               layout::kPanelCornerExponent);
         if (!geometry) return;
 
         silhouetteDc->SetTarget(silhouette.Get());
@@ -669,8 +715,10 @@ void Panel::Impl::BakeShadow() {
 // own destructor until the task completes, which would reintroduce exactly the
 // stall this exists to avoid whenever a capture is abandoned.
 void Panel::Impl::StartCapture() {
+    const int margin = static_cast<int>(BlurMarginPx(dpiScale));
+
     RECT captureRect = panelRect;
-    ::InflateRect(&captureRect, kBlurMarginPx, kBlurMarginPx);
+    ::InflateRect(&captureRect, margin, margin);
 
     auto task = std::make_shared<std::packaged_task<capture::Frame()>>(
         [captureRect] { return capture::GrabRegion(captureRect); });
@@ -724,14 +772,88 @@ void Panel::Impl::BakeSelection() {
     selectionVisual.Brush(nine);
 }
 
+// The rim.
+//
+// A flat hairline all the way round reads as a border. Glass reads as glass when
+// the top edge catches more light than the bottom, so this is a vertical
+// gradient from theme.material.rimTop to rimBottom.
+//
+// Every stroke is INSET by half its own width rather than centred on the panel
+// outline. D2D centres strokes on the path, the backdrop surface is exactly
+// panel-sized with no margin, and the surface edge is a rectangle while the
+// panel outline is not: a centred stroke therefore loses its outer half along
+// the straight runs and keeps almost all of it through the corners, so the rim
+// would visibly thicken at the corners at anything above 100% DPI. Inset, the
+// whole stroke stays inside the surface and the width is uniform.
+//
+// The radius is inset by the same amount, which is what keeps the inner outline
+// concentric with the outer one. Reusing the outer radius pinches the corners.
+void Panel::Impl::DrawRim(ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& toSurface,
+                          float width, float height) {
+    const float sw = Scaled(1.0f);
+
+    auto stroke = [&](float inset, ID2D1Brush* brush) {
+        auto geometry = CreateSquircleGeometry(d2dFactory.Get(),
+                                               width  - inset * 2.0f,
+                                               height - inset * 2.0f,
+                                               panelRadiusPx - inset,
+                                               layout::kPanelCornerExponent);
+        if (!geometry) return;
+
+        dc->SetTransform(D2D1::Matrix3x2F::Translation(inset, inset) * toSurface);
+        dc->DrawGeometry(geometry.Get(), brush, sw);
+        dc->SetTransform(toSurface);
+    };
+
+    const glass::Params& m = theme.material;
+
+    // Light theme only: a dark outer stroke, because a pale panel on a pale
+    // wallpaper has no edge at all otherwise. It takes the outermost band and
+    // pushes the bright rim one band inward, which is also how the edge of a
+    // real piece of glass reads.
+    float brightInset = sw * 0.5f;
+    if (m.rimOuterDark > 0.0f) {
+        ComPtr<ID2D1SolidColorBrush> dark;
+        if (SUCCEEDED(dc->CreateSolidColorBrush(
+                D2D1::ColorF(0.0f, 0.0f, 0.0f, m.rimOuterDark), dark.Put()))) {
+            stroke(sw * 0.5f, dark.Get());
+            brightInset = sw * 1.5f;
+        }
+    }
+
+    const D2D1_GRADIENT_STOP stops[] = {
+        { 0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, m.rimTop) },
+        { 1.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, m.rimBottom) },
+    };
+
+    ComPtr<ID2D1GradientStopCollection> collection;
+    if (FAILED(dc->CreateGradientStopCollection(stops, ARRAYSIZE(stops), collection.Put())))
+        return;
+
+    ComPtr<ID2D1LinearGradientBrush> rim;
+    if (FAILED(dc->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties(D2D1::Point2F(0.0f, 0.0f),
+                                                D2D1::Point2F(0.0f, height)),
+            collection.Get(), rim.Put()))) {
+        return;
+    }
+
+    stroke(brightInset, rim.Get());
+}
+
 // ---------------------------------------------------------------------------
 // Backdrop
 //
-// Captured desktop -> downscale -> Gaussian blur -> upscale -> tint -> border,
-// all clipped to the squircle by a D2D layer. Because the source is a single
-// frozen frame, this is a draw-time operation rather than a live effect graph,
-// which is what lets us avoid Win2D and a hand-rolled IGraphicsEffectD2D1Interop
-// entirely.
+// Captured desktop -> downscale -> Gaussian blur -> colour matrix -> upscale ->
+// tint -> rim, all clipped to the squircle by a D2D layer. Because the source is
+// a single frozen frame, this is a draw-time operation rather than a live effect
+// graph, which is what lets us avoid Win2D and a hand-rolled
+// IGraphicsEffectD2D1Interop entirely.
+//
+// The colour matrix sits AFTER the blur, at quarter resolution. It is per-pixel
+// linear and the blur is spatially linear, so the two commute and this is the
+// cheaper of the two orderings by a factor of sixteen. See glass.h for what the
+// matrix is doing and why it is not a saturation effect.
 void Panel::Impl::BakeBackdrop() {
     const int width  = panelRect.right  - panelRect.left;
     const int height = panelRect.bottom - panelRect.top;
@@ -773,7 +895,8 @@ void Panel::Impl::BakeBackdrop() {
         auto geometry = CreateSquircleGeometry(d2dFactory.Get(),
                                                static_cast<float>(width),
                                                static_cast<float>(height),
-                                               Scaled(layout::kPanelRadius));
+                                               panelRadiusPx,
+                                               layout::kPanelCornerExponent);
         if (!geometry) return;
 
         const D2D1_MATRIX_3X2_F toSurface =
@@ -801,11 +924,12 @@ void Panel::Impl::BakeBackdrop() {
             if (SUCCEEDED(draw.dc->CreateBitmap(pixelSize, source.pixels.data(),
                                                 static_cast<UINT32>(source.width * 4),
                                                 &props, captured.Put()))) {
-                ComPtr<ID2D1Effect> scale, blur;
+                ComPtr<ID2D1Effect> scale, blur, material;
                 draw.dc->CreateEffect(CLSID_D2D1Scale, scale.Put());
                 draw.dc->CreateEffect(CLSID_D2D1GaussianBlur, blur.Put());
+                draw.dc->CreateEffect(CLSID_D2D1ColorMatrix, material.Put());
 
-                if (scale && blur) {
+                if (scale && blur && material) {
                     scale->SetInput(0, captured.Get());
                     scale->SetValue(D2D1_SCALE_PROP_SCALE,
                                     D2D1::Vector2F(kBlurDownscale, kBlurDownscale));
@@ -817,6 +941,21 @@ void Panel::Impl::BakeBackdrop() {
                     // transparent at the capture edges and halo the panel.
                     blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
                                    D2D1_BORDER_MODE_HARD);
+
+                    material->SetInputEffect(0, blur.Get());
+                    material->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX,
+                                       ToD2D(glass::BuildMatrix(theme.material)));
+                    // The desktop grab is opaque everywhere, so premultiplied
+                    // and straight are numerically the same here and the bias
+                    // needs no division. Left at the default rather than set,
+                    // so that stays true by construction if the input ever
+                    // gains an alpha channel and someone has to think about it.
+                    //
+                    // Clamping is NOT optional: a saturation above 1 drives
+                    // strongly coloured pixels negative in one channel, and
+                    // those want clipping at the effect rather than wherever
+                    // the upscale interpolator meets them next.
+                    material->SetValue(D2D1_COLORMATRIX_PROP_CLAMP_OUTPUT, TRUE);
 
                     // Undo the downscale on the way out, and shift so the
                     // panel's own area lands at the surface origin.
@@ -832,7 +971,7 @@ void Panel::Impl::BakeBackdrop() {
                         D2D1::Matrix3x2F::Translation(
                             static_cast<float>(draw.offset.x) + dx,
                             static_cast<float>(draw.offset.y) + dy) );
-                    draw.dc->DrawImage(blur.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
+                    draw.dc->DrawImage(material.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
                     draw.dc->SetTransform(toSurface);
                 }
             }
@@ -842,16 +981,13 @@ void Panel::Impl::BakeBackdrop() {
             D2D1::RectF(0, 0, static_cast<float>(width), static_cast<float>(height));
 
         ComPtr<ID2D1SolidColorBrush> tintBrush;
-        draw.dc->CreateSolidColorBrush(theme.tint, tintBrush.Put());
+        draw.dc->CreateSolidColorBrush(TintColour(theme), tintBrush.Put());
         draw.dc->FillRectangle(panelArea, tintBrush.Get());
 
         draw.dc->PopLayer();
 
-        // Hairline border on the shape itself, which is what gives the glass a
-        // defined edge rather than fading into whatever is behind it.
-        ComPtr<ID2D1SolidColorBrush> borderBrush;
-        draw.dc->CreateSolidColorBrush(theme.border, borderBrush.Put());
-        draw.dc->DrawGeometry(geometry.Get(), borderBrush.Get(), Scaled(1.0f));
+        DrawRim(draw.dc.Get(), toSurface, static_cast<float>(width),
+                static_cast<float>(height));
 
         draw.dc->SetTransform(D2D1::Matrix3x2F::Identity());
     }
@@ -865,25 +1001,34 @@ void Panel::Impl::BakeBackdrop() {
 
 // ---------------------------------------------------------------------------
 
+// The app name, centred under the SELECTED tile rather than under the panel.
+//
+// macOS anchors the name to the highlighted icon. It is allowed to be wider than
+// the icon and to extend over its neighbours, because the band under the tiles
+// is empty anyway, but it never leaves the panel: at either end of the row it
+// slides inward instead. Long names are ellipsised.
+//
+// The cap is two tile pitches. One pitch would butcher the most common names
+// ("Visual Studio Code" is about 130px at this size, against a 128px tile), and
+// anything wider than two has nothing left to collide with.
+//
+// Re-baked on every selection change, which is what SetSelection already does.
+// The alternative of baking all N labels up front and animating the visual's
+// offset would let the name slide between tiles for free, but the text changes
+// as it moves, and text that slides while its own content changes looks wrong.
+// macOS snaps it, so this snaps it.
 void Panel::Impl::BakeLabel() {
     if (items.empty()) return;
 
     const int index = (std::max)(0, (std::min)(selected, static_cast<int>(items.size()) - 1));
     const std::wstring& text = items[static_cast<size_t>(index)].label;
 
-    const int width  = panelRect.right - panelRect.left;
-    const int height = static_cast<int>(std::ceil(Scaled(layout::kLabelHeight)));
-    if (width <= 0 || height <= 0) return;
+    const float panelWidth = static_cast<float>(panelRect.right - panelRect.left);
+    const float padding    = Scaled(layout::kPanelPadding);
+    const float gap        = Scaled(layout::kTileGap);
+    const int   height     = static_cast<int>(std::ceil(Scaled(layout::kLabelHeight)));
 
-    labelSurface = graphics.CreateDrawingSurface(
-        { static_cast<float>(width), static_cast<float>(height) },
-        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
-
-    SurfaceDraw draw(labelSurface);
-    if (!draw.ok) return;
-
-    draw.dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+    if (panelWidth <= 0.0f || height <= 0 || text.empty()) return;
 
     // Segoe UI Variable on Windows 11, Segoe UI before it. Shipping SF Pro
     // would be a licence violation, so the system UI font is the honest choice.
@@ -901,35 +1046,136 @@ void Panel::Impl::BakeLabel() {
     format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
-    ComPtr<ID2D1SolidColorBrush> brush;
-    draw.dc->CreateSolidColorBrush(
-        D2D1::ColorF(theme.label.R / 255.0f, theme.label.G / 255.0f,
-                     theme.label.B / 255.0f, 1.0f),
-        brush.Put());
+    const float maxWidth = (std::min)(2.0f * (tilePx + gap), panelWidth - padding * 2.0f);
+    if (maxWidth <= 1.0f) return;
 
-    draw.dc->SetTransform(D2D1::Matrix3x2F::Translation(static_cast<float>(draw.offset.x),
-                                                        static_cast<float>(draw.offset.y)));
-    draw.dc->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format.Get(),
-                       D2D1::RectF(0, 0, static_cast<float>(width), static_cast<float>(height)),
-                       brush.Get());
-    draw.dc->SetTransform(D2D1::Matrix3x2F::Identity());
+    ComPtr<IDWriteTextLayout> textLayout;
+    if (FAILED(dwriteFactory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()),
+                                               format.Get(), maxWidth,
+                                               static_cast<float>(height),
+                                               textLayout.Put()))) {
+        return;
+    }
+
+    ComPtr<IDWriteInlineObject> ellipsis;
+    if (SUCCEEDED(dwriteFactory->CreateEllipsisTrimmingSign(format.Get(), ellipsis.Put()))) {
+        DWRITE_TRIMMING trimming{ DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+        textLayout->SetTrimming(&trimming, ellipsis.Get());
+    }
+
+    // Size the surface to the text, not to the panel. Clamped because with
+    // trimming in play the reported width is the untrimmed line for some
+    // scripts, and a surface wider than the cap would defeat the point of it.
+    DWRITE_TEXT_METRICS metrics{};
+    if (FAILED(textLayout->GetMetrics(&metrics))) return;
+
+    const float labelWidth =
+        (std::min)(maxWidth, std::ceil(metrics.width) + Scaled(4.0f));
+    if (labelWidth <= 1.0f) return;
+
+    // Re-centre the layout inside the surface it is about to be drawn into.
+    textLayout->SetMaxWidth(labelWidth);
+
+    const int surfaceWidth = static_cast<int>(std::ceil(labelWidth));
+
+    labelSurface = graphics.CreateDrawingSurface(
+        { static_cast<float>(surfaceWidth), static_cast<float>(height) },
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+
+    {
+        SurfaceDraw draw(labelSurface);
+        if (!draw.ok) return;
+
+        draw.dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+        const D2D1_POINT_2F origin = D2D1::Point2F(static_cast<float>(draw.offset.x),
+                                                   static_cast<float>(draw.offset.y));
+
+        // A one-pixel shadow under the glyphs, in the opposite direction to the
+        // text.
+        //
+        // Not decoration. The glass now passes about 0.58 of the backdrop
+        // through, so a white wallpaper under a dark panel reads at roughly
+        // 0.50 and white text on it comes out near 2.6:1, well under the 4.5:1
+        // it needs. The label is the one element sitting directly on the
+        // material with nothing opaque behind it, and this is what buys the
+        // transparency without making the name unreadable over a bright
+        // desktop. macOS does the same thing.
+        const bool lightText = theme.label.G > 128;
+        ComPtr<ID2D1SolidColorBrush> shadow;
+        if (SUCCEEDED(draw.dc->CreateSolidColorBrush(
+                lightText ? D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.45f)
+                          : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.55f),
+                shadow.Put()))) {
+            draw.dc->DrawTextLayout(D2D1::Point2F(origin.x, origin.y + Scaled(1.0f)),
+                                    textLayout.Get(), shadow.Get());
+        }
+
+        ComPtr<ID2D1SolidColorBrush> brush;
+        if (FAILED(draw.dc->CreateSolidColorBrush(
+                D2D1::ColorF(theme.label.R / 255.0f, theme.label.G / 255.0f,
+                             theme.label.B / 255.0f, 1.0f),
+                brush.Put()))) {
+            return;
+        }
+
+        draw.dc->DrawTextLayout(origin, textLayout.Get(), brush.Get());
+    }
+
+    // Anchor on the selected tile's centre, then slide inward so the label never
+    // overhangs the panel's padding at either end of the row.
+    const float tileCentre = padding + static_cast<float>(index) * (tilePx + gap) + tilePx * 0.5f;
+    const float x = (std::max)(padding,
+                               (std::min)(tileCentre - labelWidth * 0.5f,
+                                          panelWidth - padding - labelWidth));
 
     labelVisual.Brush(compositor.CreateSurfaceBrush(labelSurface));
-    labelVisual.Size({ static_cast<float>(width), static_cast<float>(height) });
-    labelVisual.Offset({ 0.0f,
-                         static_cast<float>(panelRect.bottom - panelRect.top) -
-                             Scaled(layout::kPanelPadding) - Scaled(layout::kLabelHeight) +
-                             Scaled(4.0f),
-                         0.0f });
+    labelVisual.Size({ static_cast<float>(surfaceWidth), static_cast<float>(height) });
+    labelVisual.Offset({ x, padding + tilePx + Scaled(4.0f), 0.0f });
 }
 
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Pick the display the panel opens on.
+//
+// Sampled once per layout, and never re-sampled at reveal: the desktop grab for
+// the backdrop is started at gesture begin against whatever rect Layout chose,
+// so re-deciding later would let a mouse flicked across displays during the hold
+// delay put the panel on one monitor and its backdrop on another.
+HMONITOR ChooseMonitor(HWND fallbackWindow) {
+    switch (config::Current().panelDisplay) {
+        case config::PanelDisplay::Mouse: {
+            POINT cursor{};
+            // GetCursorPos fails across a secure-desktop transition, which a
+            // gesture can genuinely race. Fall back rather than trusting an
+            // uninitialised point.
+            if (::GetCursorPos(&cursor))
+                return ::MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+            MACTAB_WARN("panel: GetCursorPos failed (err %lu), using the main display",
+                        ::GetLastError());
+            return ::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+        }
+
+        case config::PanelDisplay::Primary:
+            // The primary display always owns the virtual desktop's origin.
+            return ::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+
+        case config::PanelDisplay::ActiveWindow:
+        default: {
+            const HWND foreground = ::GetForegroundWindow();
+            return ::MonitorFromWindow(foreground ? foreground : fallbackWindow,
+                                       MONITOR_DEFAULTTOPRIMARY);
+        }
+    }
+}
+
+} // namespace
+
 void Panel::Impl::Layout(int count) {
-    // Follow the foreground window's monitor, which matches Alt+Tab semantics
-    // better than following the cursor.
-    const HWND foreground = ::GetForegroundWindow();
-    monitor = ::MonitorFromWindow(foreground ? foreground : hwnd, MONITOR_DEFAULTTOPRIMARY);
+    monitor = ChooseMonitor(hwnd);
 
     MONITORINFO monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
@@ -947,7 +1193,8 @@ void Panel::Impl::Layout(int count) {
     const layout::Metrics metrics = layout::Compute(
         count, maxPanelWidth, dpiScale,
         static_cast<float>(config::Current().tileSize));
-    tilePx = metrics.tileSize;
+    tilePx        = metrics.tileSize;
+    panelRadiusPx = metrics.radius;
 
     const float panelWidth  = metrics.panelWidth;
     const float panelHeight = metrics.panelHeight;
@@ -982,12 +1229,15 @@ void Panel::Impl::Layout(int count) {
                           0.0f });
     shadowVisual.Size({ panelWidth + Scaled(kShadowSigma), panelHeight + Scaled(kShadowSigma) });
 
-    // C8: the shadow is baked from dpiScale, which is only known once a monitor
-    // has been chosen. Re-bake whenever it changes rather than keeping the 96
-    // DPI version baked at startup.
-    if (std::fabs(dpiScale - bakedShadowScale) > 0.01f) {
+    // The shadow is baked from dpiScale, which is only known once a monitor has
+    // been chosen, and from the corner radius, which layout::Compute can clamp
+    // without the DPI moving at all. Re-bake when either changes rather than
+    // keeping the 96 DPI version baked at startup.
+    if (std::fabs(dpiScale - bakedShadowScale) > 0.01f ||
+        std::fabs(panelRadiusPx - bakedShadowRadius) > 0.5f) {
         BakeShadow();
-        bakedShadowScale = dpiScale;
+        bakedShadowScale  = dpiScale;
+        bakedShadowRadius = panelRadiusPx;
     }
 
     // Last line on purpose. Everything above can throw (device loss), and
@@ -1082,6 +1332,17 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
 
     impl.items    = std::move(items);
     impl.selected = selectedIndex;
+
+    // Re-resolve the theme once per gesture, so switching Windows between light
+    // and dark, or picking a theme from the tray, takes effect on the next
+    // Alt+Tab rather than on the next launch. Everything else on the panel is
+    // baked per gesture anyway; the selection highlight is the one surface that
+    // is not, so it is the one that has to be rebuilt here.
+    if (const bool light = ResolveLightTheme(); light != impl.themeIsLight) {
+        impl.theme        = MakeTheme(light);
+        impl.themeIsLight = light;
+        MACTAB_DIAG("panel: theme is now %s", light ? "light" : "dark");
+    }
 
     // PrepareLayout has usually just run for this exact count; laying out
     // again would mean a second SetWindowPos per gesture for nothing.

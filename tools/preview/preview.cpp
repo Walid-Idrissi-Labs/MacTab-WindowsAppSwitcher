@@ -27,6 +27,7 @@
 
 #include "image.h"
 #include "squircle.h"
+#include "glass.h"
 #include "panel_layout.h"
 
 using namespace mactab;
@@ -187,6 +188,167 @@ struct Case {
     Bitmap (*make)(int);
 };
 
+// --- the glass material ----------------------------------------------------
+//
+// panel.cpp builds this out of Direct2D effects, which cannot run here. What
+// CAN run here is the maths, and the maths is where the judgement calls are:
+// saturation, gain, bias, tint alpha and the two rim alphas are seven numbers
+// picked by eye, on a machine that cannot show them. So they live in glass.h,
+// free of every Windows type, and both sides read the same constants and the
+// same matrix. The pixel loops differ. The numbers cannot.
+//
+// What is NOT shared, and therefore what this does not prove: that the D2D
+// plumbing is correct. CI and the user's machine cover that. This covers the
+// numbers.
+
+// Corner coverage for a superellipse of extent `r` and exponent `n`.
+//
+// SquircleMask is no use for the panel: it rasterises a superellipse spanning
+// the WHOLE bitmap at n = 5, which is right for an icon tile whose corner
+// extent is half its own width, and wrong for a 900x200 panel with a 62px
+// corner. Same reason CreateSquircleGeometry takes an exponent.
+std::vector<uint8_t> CornerMask(int r, float exponent) {
+    std::vector<uint8_t> mask(static_cast<size_t>(r) * r, 0);
+    constexpr int kSupersample = 4;
+
+    for (int y = 0; y < r; ++y) {
+        for (int x = 0; x < r; ++x) {
+            int hits = 0;
+            for (int sy = 0; sy < kSupersample; ++sy) {
+                for (int sx = 0; sx < kSupersample; ++sx) {
+                    const double u = (r - (x + (sx + 0.5) / kSupersample)) / r;
+                    const double v = (r - (y + (sy + 0.5) / kSupersample)) / r;
+                    if (std::pow(u, exponent) + std::pow(v, exponent) <= 1.0) ++hits;
+                }
+            }
+            mask[static_cast<size_t>(y) * r + x] = static_cast<uint8_t>(
+                (hits * 255 + (kSupersample * kSupersample) / 2) /
+                (kSupersample * kSupersample));
+        }
+    }
+    return mask;
+}
+
+// Three box passes stand in for the Gaussian.
+//
+// Equivalent full box width is sqrt(4*sigma^2 + 1), which is the standard
+// approximation; three passes of it are perceptually indistinguishable from a
+// true Gaussian, and certainly indistinguishable underneath a 0.42 tint. The
+// input is an opaque wallpaper, so there is no premultiplication to worry about.
+void BoxPass(Bitmap& image, int radius, bool horizontal) {
+    if (radius < 1) return;
+
+    const int major = horizontal ? image.width  : image.height;
+    const int minor = horizontal ? image.height : image.width;
+    const int window = radius * 2 + 1;
+
+    std::vector<uint32_t> line(static_cast<size_t>(major));
+
+    for (int j = 0; j < minor; ++j) {
+        auto at = [&](int i) -> uint32_t& {
+            return horizontal ? image.At(i, j) : image.At(j, i);
+        };
+        for (int i = 0; i < major; ++i) line[static_cast<size_t>(i)] = at(i);
+
+        auto sample = [&](int i) {
+            const int c = i < 0 ? 0 : (i >= major ? major - 1 : i);
+            return line[static_cast<size_t>(c)];
+        };
+
+        int sr = 0, sg = 0, sb = 0;
+        for (int i = -radius; i <= radius; ++i) {
+            const uint32_t px = sample(i);
+            sr += RedOf(px); sg += GreenOf(px); sb += BlueOf(px);
+        }
+        for (int i = 0; i < major; ++i) {
+            at(i) = MakePixel(static_cast<uint8_t>(sr / window),
+                              static_cast<uint8_t>(sg / window),
+                              static_cast<uint8_t>(sb / window), 255);
+            const uint32_t out = sample(i - radius);
+            const uint32_t in  = sample(i + radius + 1);
+            sr += RedOf(in)   - RedOf(out);
+            sg += GreenOf(in) - GreenOf(out);
+            sb += BlueOf(in)  - BlueOf(out);
+        }
+    }
+}
+
+void Blur(Bitmap& image, float sigma) {
+    const int radius = static_cast<int>(std::round(std::sqrt(4.0 * sigma * sigma + 1.0) * 0.5));
+    for (int pass = 0; pass < 3; ++pass) {
+        BoxPass(image, radius, true);
+        BoxPass(image, radius, false);
+    }
+}
+
+// The colour matrix from glass.h, then the tint over the top. Exactly the two
+// operations panel.cpp performs, in the same order, with the same coefficients.
+void ApplyMaterial(Bitmap& image, const glass::Params& p) {
+    const glass::Matrix5x4 m = glass::BuildMatrix(p);
+
+    auto clamp255 = [](float v) {
+        return static_cast<uint8_t>(v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v));
+    };
+
+    for (uint32_t& px : image.pixels) {
+        const float r = RedOf(px)   / 255.0f;
+        const float g = GreenOf(px) / 255.0f;
+        const float b = BlueOf(px)  / 255.0f;
+
+        // CLAMP_OUTPUT is on in panel.cpp, so clamp here too: saturation above
+        // 1 drives strongly coloured pixels negative in one channel.
+        const float r2 = r * m.m[0][0] + g * m.m[1][0] + b * m.m[2][0] + m.m[4][0];
+        const float g2 = r * m.m[0][1] + g * m.m[1][1] + b * m.m[2][1] + m.m[4][1];
+        const float b2 = r * m.m[0][2] + g * m.m[1][2] + b * m.m[2][2] + m.m[4][2];
+
+        // Straight "over" with the tint, which is what FillRectangle does on top
+        // of the treated backdrop.
+        const float a = p.tint[3];
+        px = MakePixel(clamp255((r2 * (1.0f - a) + p.tint[0] * a) * 255.0f),
+                       clamp255((g2 * (1.0f - a) + p.tint[1] * a) * 255.0f),
+                       clamp255((b2 * (1.0f - a) + p.tint[2] * a) * 255.0f),
+                       255);
+    }
+}
+
+// A wallpaper deliberately built to break the material if the numbers are
+// wrong: a saturated colour field so the saturation boost is visible, a
+// near-white block and a near-black block so the luma compression can be judged
+// at both ends, and fine detail so an under-strength blur shows up as legible
+// structure through the glass.
+Bitmap MakeWallpaper(int width, int height) {
+    Bitmap out = Bitmap::Create(width, height);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float u = static_cast<float>(x) / width;
+            const float v = static_cast<float>(y) / height;
+            float r = 30.0f + 200.0f * u * u;
+            float g = 60.0f + 90.0f * v;
+            float b = 210.0f - 150.0f * u;
+
+            // Fine structure: if the blur is too weak this survives as legible
+            // detail through the glass, which is exactly the giveaway that the
+            // backdrop is a screenshot rather than a material.
+            if ((y / 7) % 2 == 0) { r *= 0.86f; g *= 0.86f; b *= 0.86f; }
+            if ((x / 31) == 0)    { r *= 0.70f; g *= 0.70f; b *= 0.70f; }
+
+            out.At(x, y) = MakePixel(static_cast<uint8_t>(r),
+                                     static_cast<uint8_t>(g),
+                                     static_cast<uint8_t>(b), 255);
+        }
+    }
+
+    auto block = [&](int x0, int y0, int w, int h, uint8_t v) {
+        for (int y = y0; y < y0 + h && y < height; ++y)
+            for (int x = x0; x < x0 + w && x < width; ++x)
+                out.At(x, y) = MakePixel(v, v, v, 255);
+    };
+    block(width / 8,     height / 5, width / 5, height / 2, 250);   // blown-out white
+    block(width * 5 / 8, height / 5, width / 5, height / 2, 6);     // near black
+
+    return out;
+}
+
 // --- self-checks -----------------------------------------------------------
 //
 // The pure layer is the only part of MacTab that can be executed off Windows,
@@ -200,6 +362,160 @@ void Check(bool condition, const char* what) {
         std::fprintf(stderr, "CHECK FAILED: %s\n", what);
         ++g_checkFailures;
     }
+}
+
+// The whole panel at the real layout metrics, over a real blurred wallpaper,
+// with the real material applied.
+//
+// The tile size, gap, padding, corner radius and every glass coefficient were
+// chosen without being able to see them. This runs the actual shared layout and
+// glass code, not a copy of it, so the proportions and the material can be
+// judged rather than assumed.
+Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCount) {
+    const int count = 6;
+    const layout::Metrics m = layout::Compute(count, 2400.0f, 1.0f);
+
+    const int panelW = static_cast<int>(m.panelWidth);
+    const int panelH = static_cast<int>(m.panelHeight);
+    const int margin = 60;
+
+    Bitmap canvas = MakeWallpaper(panelW + margin * 2, panelH + margin * 2);
+
+    // Backdrop: blur a copy of the wallpaper, crop the panel's own rect out of
+    // it, run the material over it. Blurring the whole canvas and cropping is
+    // equivalent to capturing panel-plus-margin and blurring that, which is
+    // what StartCapture does, and avoids reimplementing the margin logic.
+    Bitmap blurred = canvas;
+    Blur(blurred, 52.0f);   // kBlurSigma
+
+    Bitmap body = Bitmap::Create(panelW, panelH);
+    for (int y = 0; y < panelH; ++y)
+        for (int x = 0; x < panelW; ++x)
+            body.At(x, y) = blurred.At(x + margin, y + margin);
+
+    ApplyMaterial(body, material);
+
+    // Corners.
+    {
+        const int r = static_cast<int>(m.radius);
+        const std::vector<uint8_t> corner = CornerMask(r, layout::kPanelCornerExponent);
+        for (int cy = 0; cy < r; ++cy) {
+            for (int cx = 0; cx < r; ++cx) {
+                const uint8_t a = corner[static_cast<size_t>(cy) * r + cx];
+                auto apply = [&](int x, int y) {
+                    uint32_t& px = body.At(x, y);
+                    px = (px & 0x00FFFFFFu) |
+                         (static_cast<uint32_t>(AlphaOf(px) * a / 255) << 24);
+                };
+                apply(cx, cy);
+                apply(panelW - 1 - cx, cy);
+                apply(cx, panelH - 1 - cy);
+                apply(panelW - 1 - cx, panelH - 1 - cy);
+            }
+        }
+    }
+
+    // Rim. The real one is a stroked geometry inset by half its width; this
+    // approximates it by lightening the outermost opaque pixel of each column
+    // and row, which is enough to judge the two alphas against each other.
+    {
+        auto lighten = [&](int x, int y, float alpha, bool dark) {
+            if (x < 0 || y < 0 || x >= panelW || y >= panelH) return;
+            uint32_t& px = body.At(x, y);
+            if (AlphaOf(px) < 200) return;
+            const float target = dark ? 0.0f : 255.0f;
+            px = MakePixel(static_cast<uint8_t>(RedOf(px)   * (1 - alpha) + target * alpha),
+                           static_cast<uint8_t>(GreenOf(px) * (1 - alpha) + target * alpha),
+                           static_cast<uint8_t>(BlueOf(px)  * (1 - alpha) + target * alpha),
+                           AlphaOf(px));
+        };
+
+        for (int y = 0; y < panelH; ++y) {
+            const float t = static_cast<float>(y) / (panelH - 1);
+            const float a = material.rimTop + (material.rimBottom - material.rimTop) * t;
+
+            // Walk in from each side to the first opaque pixel, which follows
+            // the curve through the corners.
+            for (int x = 0; x < panelW; ++x)
+                if (AlphaOf(body.At(x, y)) >= 200) { lighten(x, y, a, false); break; }
+            for (int x = panelW - 1; x >= 0; --x)
+                if (AlphaOf(body.At(x, y)) >= 200) { lighten(x, y, a, false); break; }
+        }
+        for (int x = 0; x < panelW; ++x) {
+            for (int y = 0; y < panelH; ++y)
+                if (AlphaOf(body.At(x, y)) >= 200) { lighten(x, y, material.rimTop, false); break; }
+            for (int y = panelH - 1; y >= 0; --y)
+                if (AlphaOf(body.At(x, y)) >= 200) { lighten(x, y, material.rimBottom, false); break; }
+        }
+    }
+
+    CompositeOver(canvas, body, margin, margin);
+
+    // Selection highlight behind tile 1, then the tiles themselves.
+    const int selected = 1;
+    const int inset  = static_cast<int>(m.tileSize * layout::kSelectionInset);
+    const int hlSize = static_cast<int>(m.tileSize) + inset * 2;
+
+    Bitmap highlight = Bitmap::Create(hlSize, hlSize);
+    const uint8_t hlAlpha = (material.tint[0] > 0.5f) ? 26 : 46;   // light vs dark theme
+    const uint8_t hlValue = (material.tint[0] > 0.5f) ? 0 : 255;
+    for (uint32_t& px : highlight.pixels) px = MakePixel(hlValue, hlValue, hlValue, hlAlpha);
+    // Rounded, matching BakeSelection in panel.cpp. A hard-edged rectangle next
+    // to squircle icons reads as wrong immediately. This one keeps n = 5,
+    // because it belongs to the icons' shape language rather than the panel's.
+    {
+        const int r = static_cast<int>(m.tileSize * 0.22f);
+        const std::vector<uint8_t>& corner = SquircleMask(r * 2);
+        for (int cy = 0; cy < r; ++cy) {
+            for (int cx = 0; cx < r; ++cx) {
+                const uint8_t a = corner[static_cast<size_t>(cy) * (r * 2) + cx];
+                auto apply = [&](int x, int y) {
+                    uint32_t& px = highlight.At(x, y);
+                    px = (px & 0x00FFFFFFu) |
+                         (static_cast<uint32_t>(AlphaOf(px) * a / 255) << 24);
+                };
+                apply(cx, cy);
+                apply(hlSize - 1 - cx, cy);
+                apply(cx, hlSize - 1 - cy);
+                apply(hlSize - 1 - cx, hlSize - 1 - cy);
+            }
+        }
+    }
+    CompositeOver(canvas, highlight,
+                  margin + static_cast<int>(m.TileX(selected)) - inset,
+                  margin + static_cast<int>(m.padding) - inset);
+
+    for (int i = 0; i < count; ++i) {
+        const Bitmap tile = MakeIconTile(cases[i % caseCount].make(256),
+                                         static_cast<int>(m.tileSize));
+        CompositeOver(canvas, tile,
+                      margin + static_cast<int>(m.TileX(i)),
+                      margin + static_cast<int>(m.padding));
+    }
+
+    // Stand-in for the label. There is no DirectWrite here, so this is a bar of
+    // the width a name like "Visual Studio Code" occupies, placed by the same
+    // rule BakeLabel uses: centred on the selected tile, clamped inside the
+    // panel's padding. It is the placement that needs looking at, not the text.
+    {
+        const float labelWidth =
+            std::min(2.0f * (m.tileSize + m.gap),
+                     std::min(m.panelWidth - m.padding * 2.0f, 150.0f));
+        const float centre = m.TileCentreX(selected);
+        const float x = std::max(m.padding,
+                                 std::min(centre - labelWidth * 0.5f,
+                                          m.panelWidth - m.padding - labelWidth));
+
+        Bitmap bar = Bitmap::Create(static_cast<int>(labelWidth),
+                                    static_cast<int>(m.labelHeight * 0.5f));
+        const uint8_t v = (material.tint[0] > 0.5f) ? 20 : 245;
+        for (uint32_t& px : bar.pixels) px = MakePixel(v, v, v, 90);
+
+        CompositeOver(canvas, bar, margin + static_cast<int>(x),
+                      margin + static_cast<int>(m.padding + m.tileSize + 4.0f));
+    }
+
+    return canvas;
 }
 
 void RunSelfChecks() {
@@ -255,6 +571,43 @@ void RunSelfChecks() {
                   mask[static_cast<size_t>(y) * size + size - 1],
                   "mask is horizontally symmetric");
         }
+    }
+
+    // The glass matrix.
+    //
+    // Two invariants, and they are the only things that can rot silently: a
+    // transposition, or a slip in one of the six coefficients. Both survive
+    // compilation and both are invisible without a screenshot.
+    for (const glass::Params* p : { &glass::kDark, &glass::kLight }) {
+        const glass::Matrix5x4 m = glass::BuildMatrix(*p);
+
+        // Grey in, grey out at the gain: every colour column sums to g.
+        for (int c = 0; c < 3; ++c) {
+            Check(std::fabs(glass::ColumnSum(m, c) - p->gain) < 1e-3f,
+                  "glass matrix column sums to the gain");
+        }
+
+        // White maps to gain + bias, which is where the compression puts the
+        // white point and therefore what a blown-out wallpaper becomes.
+        for (int c = 0; c < 3; ++c) {
+            const float white = m.m[0][c] + m.m[1][c] + m.m[2][c] + m.m[4][c];
+            Check(std::fabs(white - (p->gain + p->bias)) < 1e-3f,
+                  "glass matrix maps white to gain + bias");
+        }
+
+        // Not symmetric. If it is, someone has transposed it, and the
+        // saturation will be applied along the wrong axis.
+        Check(std::fabs(m.m[0][1] - m.m[1][0]) > 1e-3f,
+              "glass matrix is not symmetric (a transposition would be silent)");
+
+        // Alpha passes through untouched.
+        Check(m.m[3][3] == 1.0f && m.m[3][0] == 0.0f, "glass matrix leaves alpha alone");
+
+        // Saturation above 1 must actually push colours apart, not clamp to
+        // identity. This is the failure mode CLSID_D2D1Saturation has.
+        Check(p->saturation > 1.0f, "the material boosts saturation");
+        Check(m.m[0][0] > glass::ColumnSum(m, 0),
+              "a channel contributes more to itself than the whole column sums to");
     }
 
     // Glyph tiles must stay legible: the generated background has to contrast
@@ -342,102 +695,28 @@ int main(int argc, char** argv) {
         ++failures;
     }
 
-    // A mock of the whole panel at the real layout metrics.
-    //
-    // The tile size, gap, padding and corner radius were all chosen without
-    // being able to see them. This renders the actual shared layout code, not
-    // a copy of it, so the proportions can be judged rather than assumed.
+    // The panel, dark and light, over a blurred wallpaper with the real glass
+    // material applied. This is the only place the material's numbers can
+    // actually be looked at before they reach a Windows machine.
     {
-        const int count = 6;
-        const layout::Metrics m = layout::Compute(count, 2400.0f, 1.0f);
+        const layout::Metrics m = layout::Compute(6, 2400.0f, 1.0f);
+        std::printf("\npanel: 6 tiles, tile %.0f, panel %.0fx%.0f, radius %.0f, n %.2f\n",
+                    m.tileSize, m.panelWidth, m.panelHeight, m.radius,
+                    static_cast<double>(layout::kPanelCornerExponent));
 
-        const int margin = 40;
-        Bitmap panel = Bitmap::Create(static_cast<int>(m.panelWidth) + margin * 2,
-                                      static_cast<int>(m.panelHeight) + margin * 2);
+        struct { const char* file; const glass::Params& material; } themes[] = {
+            { "/panel-dark.png",  glass::kDark  },
+            { "/panel-light.png", glass::kLight },
+        };
 
-        // Stand-in for the blurred desktop: a soft gradient, so the glass has
-        // something to sit on and the panel edge is visible.
-        for (int y = 0; y < panel.height; ++y) {
-            for (int x = 0; x < panel.width; ++x) {
-                const int v = 90 + 70 * x / panel.width - 30 * y / panel.height;
-                panel.At(x, y) = MakePixel(static_cast<uint8_t>(v * 0.55),
-                                           static_cast<uint8_t>(v * 0.62),
-                                           static_cast<uint8_t>(v * 0.80), 255);
+        for (const auto& theme : themes) {
+            const Bitmap panel = RenderPanel(theme.material, cases,
+                                             static_cast<int>(std::size(cases)));
+            if (!WritePng(outDir + theme.file, panel)) {
+                std::fprintf(stderr, "failed to write %s\n", theme.file);
+                ++failures;
             }
         }
-
-        // The panel body, superellipse-cornered like the real thing.
-        Bitmap body = Bitmap::Create(static_cast<int>(m.panelWidth),
-                                     static_cast<int>(m.panelHeight));
-        for (int y = 0; y < body.height; ++y) {
-            for (int x = 0; x < body.width; ++x)
-                body.At(x, y) = MakePixel(23, 23, 26, 210);
-        }
-        // Approximate the corner treatment by masking with a squircle whose
-        // radius matches; enough to judge whether 24px reads as macOS.
-        {
-            const int r = static_cast<int>(m.radius);
-            const std::vector<uint8_t>& corner = SquircleMask(r * 2);
-            for (int cy = 0; cy < r; ++cy) {
-                for (int cx = 0; cx < r; ++cx) {
-                    const uint8_t a = corner[static_cast<size_t>(cy) * (r * 2) + cx];
-                    auto apply = [&](int x, int y) {
-                        uint32_t& px = body.At(x, y);
-                        px = (px & 0x00FFFFFFu) | (static_cast<uint32_t>(AlphaOf(px) * a / 255) << 24);
-                    };
-                    apply(cx, cy);
-                    apply(body.width - 1 - cx, cy);
-                    apply(cx, body.height - 1 - cy);
-                    apply(body.width - 1 - cx, body.height - 1 - cy);
-                }
-            }
-        }
-        CompositeOver(panel, body, margin, margin);
-
-        // Selection highlight behind tile 1, then the tiles themselves.
-        const int selected = 1;
-        const int inset = static_cast<int>(m.tileSize * layout::kSelectionInset);
-        const int hlSize = static_cast<int>(m.tileSize) + inset * 2;
-        Bitmap highlight = Bitmap::Create(hlSize, hlSize);
-        for (uint32_t& px : highlight.pixels) px = MakePixel(255, 255, 255, 46);
-        // Rounded, matching BakeSelection in panel.cpp, a hard-edged rectangle
-        // next to squircle icons reads as wrong immediately.
-        {
-            const int r = static_cast<int>(m.tileSize * 0.22f);
-            const std::vector<uint8_t>& corner = SquircleMask(r * 2);
-            for (int cy = 0; cy < r; ++cy) {
-                for (int cx = 0; cx < r; ++cx) {
-                    const uint8_t a = corner[static_cast<size_t>(cy) * (r * 2) + cx];
-                    auto apply = [&](int x, int y) {
-                        uint32_t& px = highlight.At(x, y);
-                        px = (px & 0x00FFFFFFu) |
-                             (static_cast<uint32_t>(AlphaOf(px) * a / 255) << 24);
-                    };
-                    apply(cx, cy);
-                    apply(hlSize - 1 - cx, cy);
-                    apply(cx, hlSize - 1 - cy);
-                    apply(hlSize - 1 - cx, hlSize - 1 - cy);
-                }
-            }
-        }
-        CompositeOver(panel, highlight,
-                      margin + static_cast<int>(m.TileX(selected)) - inset,
-                      margin + static_cast<int>(m.padding) - inset);
-
-        for (int i = 0; i < count; ++i) {
-            const Bitmap tile = MakeIconTile(cases[i % 4].make(kSourceSize),
-                                             static_cast<int>(m.tileSize));
-            CompositeOver(panel, tile,
-                          margin + static_cast<int>(m.TileX(i)),
-                          margin + static_cast<int>(m.padding));
-        }
-
-        if (!WritePng(outDir + "/panel.png", panel)) {
-            std::fprintf(stderr, "failed to write panel.png\n");
-            ++failures;
-        }
-        std::printf("\npanel: %d tiles, tile %.0f, panel %.0fx%.0f, radius %.0f\n",
-                    count, m.tileSize, m.panelWidth, m.panelHeight, m.radius);
     }
 
     std::printf("\nwrote PNGs to %s/\n", outDir.c_str());

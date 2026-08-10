@@ -364,16 +364,64 @@ void HandleActionKey(WORD virtualKey) {
 
 // --- Tray ------------------------------------------------------------------
 
+// Settings submenu.
+//
+// Ownership: appended to the parent with MF_POPUP, so DestroyMenu on the parent
+// destroys this too. Do not destroy it separately.
+HMENU CreateSettingsMenu() {
+    HMENU settings = ::CreatePopupMenu();
+    if (!settings) return nullptr;
+
+    ::AppendMenuW(settings, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"Panel appears on");
+    ::AppendMenuW(settings, MF_STRING, IDM_TRAY_DISPLAY_ACTIVE, L"    Active window's display");
+    ::AppendMenuW(settings, MF_STRING, IDM_TRAY_DISPLAY_MOUSE,  L"    Display with the mouse");
+    ::AppendMenuW(settings, MF_STRING, IDM_TRAY_DISPLAY_MAIN,   L"    Main display");
+
+    UINT checked = IDM_TRAY_DISPLAY_ACTIVE;
+    switch (config::Current().panelDisplay) {
+        case config::PanelDisplay::Mouse:   checked = IDM_TRAY_DISPLAY_MOUSE; break;
+        case config::PanelDisplay::Primary: checked = IDM_TRAY_DISPLAY_MAIN;  break;
+        default: break;
+    }
+    // Radio rather than check marks: the three are mutually exclusive, and this
+    // is the only way to get the bullet glyph instead of a tick.
+    ::CheckMenuRadioItem(settings, IDM_TRAY_DISPLAY_ACTIVE, IDM_TRAY_DISPLAY_MAIN,
+                         checked, MF_BYCOMMAND);
+
+    ::AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
+
+    ::AppendMenuW(settings, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"Appearance");
+    ::AppendMenuW(settings, MF_STRING, IDM_TRAY_THEME_AUTO,  L"    Follow Windows");
+    ::AppendMenuW(settings, MF_STRING, IDM_TRAY_THEME_LIGHT, L"    Light");
+    ::AppendMenuW(settings, MF_STRING, IDM_TRAY_THEME_DARK,  L"    Dark");
+
+    const std::wstring& theme = config::Current().theme;
+    const UINT checkedTheme = (theme == L"light") ? IDM_TRAY_THEME_LIGHT
+                            : (theme == L"dark")  ? IDM_TRAY_THEME_DARK
+                                                  : IDM_TRAY_THEME_AUTO;
+    ::CheckMenuRadioItem(settings, IDM_TRAY_THEME_AUTO, IDM_TRAY_THEME_DARK,
+                         checkedTheme, MF_BYCOMMAND);
+
+    ::AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
+    ::AppendMenuW(settings, MF_STRING | (config::AutostartEnabled() ? MF_CHECKED : 0u),
+                  IDM_TRAY_AUTOSTART, L"Start when I sign in");
+
+    return settings;
+}
+
 void ShowTrayMenu(HWND hwnd, POINT screenPt) {
     HMENU menu = ::CreatePopupMenu();
     if (!menu) return;
 
     ::AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"MacTab " MACTAB_VERSION_W);
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+    if (HMENU settings = CreateSettingsMenu()) {
+        ::AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(settings), L"Settings");
+    }
+
     ::AppendMenuW(menu, MF_STRING | (hotkey::IsRunning() ? 0u : MF_DISABLED),
                   IDM_TRAY_RELOAD_HOOK, L"Reload keyboard hook");
-    ::AppendMenuW(menu, MF_STRING | (config::AutostartEnabled() ? MF_CHECKED : 0u),
-                  IDM_TRAY_AUTOSTART, L"Start when I sign in");
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_LIST, L"Log current switcher list");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_LOG, L"Open diagnostics log");
@@ -533,6 +581,25 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // tab all read the same place and cannot disagree.
             config::SetAutostart(!config::AutostartEnabled());
             return 0;
+
+        // Takes effect on the next gesture: the panel picks its monitor in
+        // Layout, which runs per gesture, so nothing has to be rebuilt here.
+        case IDM_TRAY_DISPLAY_ACTIVE:
+            config::SetPanelDisplay(config::PanelDisplay::ActiveWindow);
+            return 0;
+
+        case IDM_TRAY_DISPLAY_MOUSE:
+            config::SetPanelDisplay(config::PanelDisplay::Mouse);
+            return 0;
+
+        case IDM_TRAY_DISPLAY_MAIN:
+            config::SetPanelDisplay(config::PanelDisplay::Primary);
+            return 0;
+
+        // Also next-gesture: SetItems re-resolves the theme every time.
+        case IDM_TRAY_THEME_AUTO:  config::SetTheme(L"auto");  return 0;
+        case IDM_TRAY_THEME_LIGHT: config::SetTheme(L"light"); return 0;
+        case IDM_TRAY_THEME_DARK:  config::SetTheme(L"dark");  return 0;
 
         case IDM_TRAY_DUMP_LIST:
             // M2 verification: what this prints should match what Windows'
