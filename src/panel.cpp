@@ -1011,8 +1011,18 @@ void Panel::Impl::BakeBackdrop() {
     backdropVisual.Brush(compositor.CreateSurfaceBrush(backdropSurface));
     backdropVisual.Size({ static_cast<float>(width), static_cast<float>(height) });
 
-    MACTAB_DIAG("panel: backdrop baked %dx%d (capture %s)",
-                width, height, capture::SourceName(frame.source));
+    // The material's numbers, in the log, because every report about how the
+    // panel looks arrives as a screenshot from a machine I do not have. Knowing
+    // which theme won, what radius was used and whether the capture succeeded
+    // turns "the glass looks wrong" into something actionable.
+    MACTAB_DIAG("panel: backdrop baked %dx%d radius %.0f n %.2f, %s theme "
+                "(sat %.2f gain %.2f bias %.3f tint a %.2f), capture %s",
+                width, height, panelRadiusPx,
+                static_cast<double>(layout::kPanelCornerExponent),
+                themeIsLight ? "light" : "dark",
+                theme.material.saturation, theme.material.gain,
+                theme.material.bias, theme.material.tint[3],
+                capture::SourceName(frame.source));
 }
 
 // ---------------------------------------------------------------------------
