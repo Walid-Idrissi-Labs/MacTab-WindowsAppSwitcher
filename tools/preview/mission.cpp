@@ -132,7 +132,10 @@ std::vector<Desktop> MakeDesktops() {
         for (int i = 0; i < 20; ++i) {
             const float x = static_cast<float>(100 + (i % 5) * 300);
             const float y = static_cast<float>(200 + (i / 5) * 240);
-            d.windows.push_back(W(x, y, 260.0f, 180.0f, 1 + i % 4, i + 1));
+            // One app per row rather than interleaved. Interleaving gives four
+            // apps the same centroid, and a pile can only be put where its app
+            // was if its app was somewhere in particular.
+            d.windows.push_back(W(x, y, 260.0f, 180.0f, 1 + i / 5, i + 1));
         }
         all.push_back(d);
     }
@@ -282,7 +285,13 @@ Bitmap Render(const Desktop& desktop, const mission::Result& result,
         "XCODE", "FINDER", "MAPS", "PHOTOS", "CALENDAR", "PREVIEW",
     };
 
-    for (size_t i = 0; i < result.tiles.size(); ++i) {
+    std::vector<size_t> order(result.tiles.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return result.tiles[a].depth > result.tiles[b].depth;   // back to front
+    });
+
+    for (size_t i : order) {
         mission::Placement p = result.tiles[i];
         p.x += rx;
         p.y += ry;
@@ -291,6 +300,11 @@ Bitmap Render(const Desktop& desktop, const mission::Result& result,
 
     // Chrome after every tile, so a badge is never buried under a neighbour.
     for (size_t i = 0; i < result.tiles.size(); ++i) {
+        // One badge and one name per pile, under the front window, which is
+        // what the reference does. Every window in an ungrouped arrangement is
+        // its own pile of one, so this covers both.
+        if (params.groupByApp && result.tiles[i].depth != 0) continue;
+
         mission::Placement p = result.tiles[i];
         p.x += rx;
         p.y += ry;
@@ -320,6 +334,35 @@ Bitmap Render(const Desktop& desktop, const mission::Result& result,
 bool Overlaps(const mission::Placement& a, const mission::Placement& b, float slack) {
     return a.x < b.x + b.w - slack && b.x < a.x + a.w - slack &&
            a.y < b.y + b.h - slack && b.y < a.y + a.h - slack;
+}
+
+// Where each app was against where its pile ended up, as the same pairwise
+// vote SpatialAgreement uses.
+float ClusterAgreement(const Desktop& desktop, const mission::Result& r) {
+    std::vector<mission::Window> before;
+    mission::Result after;
+
+    for (const mission::Cluster& cluster : r.clusters) {
+        float cx = 0.0f, cy = 0.0f;
+        int   n  = 0;
+        for (size_t i = 0; i < desktop.windows.size(); ++i) {
+            if (desktop.windows[i].group != cluster.group) continue;
+            cx += desktop.windows[i].CentreX();
+            cy += desktop.windows[i].CentreY();
+            ++n;
+        }
+        if (n == 0) continue;
+
+        mission::Window w;
+        w.x = cx / n; w.y = cy / n; w.w = 1.0f; w.h = 1.0f;
+        before.push_back(w);
+
+        mission::Placement p;
+        p.x = cluster.x; p.y = cluster.y; p.w = cluster.w; p.h = cluster.h;
+        after.tiles.push_back(p);
+    }
+
+    return mission::SpatialAgreement(before, after);
 }
 
 void CheckDesktop(const Desktop& desktop, const mission::Result& r,
@@ -359,12 +402,30 @@ void CheckDesktop(const Desktop& desktop, const mission::Result& r,
         }
     }
 
+    // Windows of DIFFERENT apps may never overlap. Windows of the same app are
+    // a pile and are meant to, but each one has to show an edge, or the pile is
+    // a stack and everything behind the front window is invisible.
     for (size_t i = 0; i < r.tiles.size(); ++i) {
         for (size_t j = i + 1; j < r.tiles.size(); ++j) {
-            if (Overlaps(r.tiles[i], r.tiles[j], 0.5f)) {
-                std::fprintf(stderr, "  %s tiles %zu and %zu overlap\n",
+            const bool sameApp = params.groupByApp &&
+                                 desktop.windows[i].group == desktop.windows[j].group;
+
+            if (!sameApp) {
+                if (Overlaps(r.tiles[i], r.tiles[j], 0.5f)) {
+                    std::fprintf(stderr, "  %s tiles %zu and %zu overlap\n",
+                                 tag.c_str(), i, j);
+                    Check(false, (tag + ": two apps' windows overlap").c_str());
+                    return;
+                }
+                continue;
+            }
+
+            const float dx = std::fabs(r.tiles[i].x - r.tiles[j].x);
+            const float dy = std::fabs(r.tiles[i].y - r.tiles[j].y);
+            if (dx < 1.0f && dy < 1.0f) {
+                std::fprintf(stderr, "  %s tiles %zu and %zu are exactly stacked\n",
                              tag.c_str(), i, j);
-                Check(false, (tag + ": no two tiles overlap").c_str());
+                Check(false, (tag + ": a pile is fanned, not stacked").c_str());
                 return;
             }
         }
@@ -463,15 +524,22 @@ int main(int argc, char** argv) {
             // every pair of windows votes on whether the side it was on is the
             // side it ended up on. Anything below this is not a spread any
             // more, it is a reshuffle.
-            const float agreement = mission::SpatialAgreement(desktop.windows, r);
+            const float agreement = grouped ? ClusterAgreement(desktop, r)
+                                            : mission::SpatialAgreement(desktop.windows, r);
             if (grouped)
-                std::printf("%-10s grouped: agreement %.2f, scale %.3f, %d passes%s\n",
+                std::printf("%-10s grouped: cluster agreement %.2f, scale %.3f, "
+                            "%d passes%s\n",
                             desktop.name, agreement, r.scale, r.iterations,
                             r.relaxed ? "" : "  GRID FALLBACK");
-            // Grouping is allowed to cost spatial order, because pulling an
-            // app's windows together is a promise to move them. The floor is
-            // only there to catch a genuine scramble: chance is 0.
-            Check(agreement > (grouped ? 0.25f : 0.60f),
+
+            // Measured per CLUSTER when grouping is on, not per window.
+            //
+            // A pile collapses an app's windows onto one point by design, so a
+            // per-window score mostly measures how scattered that app was, and
+            // it reads as a failure when the layout did exactly what it was
+            // asked. What has to hold is that each app's pile is still where
+            // that app was, which is the same question one level up.
+            Check(agreement > (grouped ? 0.55f : 0.60f),
                   (std::string(desktop.name) +
                    (grouped ? ": grouping keeps most of the spatial order"
                             : ": the arrangement keeps the desktop's spatial order")).c_str());

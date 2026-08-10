@@ -299,7 +299,7 @@ while the app runs.
 | `H` | Minimise all its windows. Windows has no "hide application" |
 | `Esc` | Cancel without switching |
 | Mouse | Hover selects, click activates |
-| `Win+Tab` | Mission Control: every window, spread out |
+| `Win+Tab` | Mission Control: every window, spread out. Off until you switch it on |
 
 A quick tap and release switches to the previous application without the panel
 ever appearing, which is what macOS does. The panel only shows if Alt is held
@@ -307,8 +307,12 @@ past `RevealDelayMs`.
 
 ### Mission Control
 
-`Win+Tab` spreads every window on the current display out so none of them
-overlap, and puts the virtual desktops in a strip across the top. Click a
+Off by default. Turn it on in the tray menu under *Settings*, or set
+`MissionEnabled=1`. Alt+Tab is the product, and taking over a second key
+uninvited is a different proposition from taking over one.
+
+`Win+Tab` then spreads every window out so none of them overlap, on every
+display at once, and puts the virtual desktops in a glass bar across the top. Click a
 window to go to it, click a desktop to switch, click the `+` to add one,
 `Esc` or a click on the background to leave. Arrow keys move between windows
 geometrically rather than through a list, because the arrangement has no rows
@@ -376,10 +380,11 @@ defaults and comments on first run:
 | `PanelDisplay` | active | `active`, `mouse` or `main` |
 | `GlassRefraction` | 1 | Bend the desktop at the panel's rim. Set to 0 if the edge looks doubled or smeared on your machine |
 | `GlassRimTap` | 1 | Bend a sharper copy at the rim than in the middle, which is what makes the edge read as a lens. Set to 0 if the bezel looks doubled or banded |
-| `MissionEnabled` | 1 | 0 leaves Win+Tab to Windows' own Task View |
-| `MissionGroupByApp` | 0 | 1 gathers each app's windows into a cluster. macOS ships this off, and it costs room |
+| `MissionEnabled` | 0 | 1 makes Win+Tab open Mission Control instead of Task View. Also in the tray menu |
+| `MissionGroupByApp` | 1 | 0 arranges purely by position and ignores which app owns what |
 | `MissionGap` | 26 | Space kept between windows, logical pixels |
-| `MissionClusterGap` | 72 | Space between one app's cluster and the next |
+| `MissionMemberGap` | 12 | Space between two windows of the same app |
+| `MissionClusterGap` | 88 | Space between one app's cluster and the next |
 | `MissionBlurSigma` | 18 | How soft the wallpaper behind the arrangement goes |
 | `MissionDim` | 0.55 | How far back the wallpaper is pushed, 0 to 1 |
 | `MissionRevealMs` | 260 | How long the windows take to fly to their places |
@@ -627,10 +632,6 @@ each of these so the claims can be checked rather than trusted.
   fix is the same `uiAccess` that fixes elevated windows. Nothing renders above
   true exclusive-fullscreen apps either; borderless-windowed is fine.
 - **Windows 10 pre-1803 is unsupported**; that is the Composition floor.
-- **Mission Control shows one display.** macOS puts a separate Mission Control
-  on every screen, each holding that screen's windows. Here the windows on the
-  other displays are simply not in the arrangement, which is at least honest
-  rather than half right.
 - **You cannot drag a window to another desktop.** There is no public way to
   move another process's window between virtual desktops, and the private
   interface that can is the one described above. Closing a desktop other than

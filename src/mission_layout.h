@@ -61,13 +61,16 @@ namespace mactab::mission {
 // of macOS 26.
 inline constexpr float kWindowGap = 26.0f;
 
-// Inside one app's cluster, and between one cluster and the next.
+// How far each window of an app is offset from the one in front of it, and how
+// much room is left between one app's pile and the next.
 //
-// The ratio is what makes grouping legible without drawing a box around
-// anything: an app's windows sit closer to each other than to anything else, so
-// the eye reads the cluster before it reads the windows. Equal gaps and the
-// grouping is invisible however correct it is.
-inline constexpr float kMemberGap  = 12.0f;
+// A pile, not a row. macOS' grouped Mission Control overlaps an application's
+// windows heavily and offsets each one behind the last, so the most recent is
+// almost entirely visible and the others peek out from under it. Laying them
+// out side by side inside the cluster is what the first attempt did, and it is
+// both wrong and expensive: it costs as much room as not grouping at all, which
+// is most of the reason grouped mode looked cramped.
+inline constexpr float kFanOffset  = 30.0f;
 inline constexpr float kClusterGap = 88.0f;
 
 // Never enlarge. A 400x300 window is a small tile in Mission Control, and
@@ -86,7 +89,7 @@ inline constexpr int kMaxIterations = 400;
 
 struct Params {
     float gap        = kWindowGap;
-    float memberGap  = kMemberGap;
+    float fan        = kFanOffset;
     float clusterGap = kClusterGap;
     float maxScale   = kMaxScale;
     float minScale   = kMinScale;
@@ -122,6 +125,11 @@ struct Placement {
     float x = 0.0f, y = 0.0f;      // top left within the region
     float w = 0.0f, h = 0.0f;
     int   source = 0;              // index into the input vector
+
+    // Where this window sits in its application's pile: 0 is the one on top.
+    // Only meaningful when grouping is on, and it is what the caller draws in
+    // reverse so the most recent window is not buried.
+    int   depth = 0;
 };
 
 // The area one application's windows ended up occupying, which is what the app
@@ -328,7 +336,7 @@ inline Result Layout(const std::vector<Window>& windows,
     // open, which is the opposite of what it should do.
     auto arrange = [&](float gapScale, std::vector<detail::Rect>& out) {
         const float gap        = p.gap        / gapScale;
-        const float memberGap  = p.memberGap  / gapScale;
+        const float fan        = p.fan        / gapScale;
         const float clusterGap = p.clusterGap / gapScale;
 
         out.resize(windows.size());
@@ -378,31 +386,46 @@ inline Result Layout(const std::vector<Window>& windows,
         members.reserve(groups.size());
 
         for (int group : groups) {
+            // Most recently used first, because that is the one that ends up on
+            // top of the pile with nothing over it.
             std::vector<size_t> indices;
-            std::vector<detail::Rect> local;
-            for (size_t i = 0; i < windows.size(); ++i) {
-                if (windows[i].group != group) continue;
-                indices.push_back(i);
-                local.push_back(detail::Rect{ windows[i].x, windows[i].y,
-                                              windows[i].w, windows[i].h });
-            }
+            for (size_t i = 0; i < windows.size(); ++i)
+                if (windows[i].group == group) indices.push_back(i);
 
-            bool localSettled = true;
-            passes += detail::Shove(local, memberGap, regionAspect, p.iterations,
-                                    localSettled);
-            if (!localSettled) {
-                detail::GridFallback(local, memberGap);
-                settled = false;
+            std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+                if (windows[a].order != windows[b].order)
+                    return windows[a].order < windows[b].order;
+                return a < b;
+            });
+
+            // The fan. Window k sits down and to the right of window k-1, so
+            // every one of them shows an edge and none is completely hidden,
+            // which is the whole difference between a pile and a stack.
+            std::vector<detail::Rect> local;
+            local.reserve(indices.size());
+            for (size_t k = 0; k < indices.size(); ++k) {
+                const Window& w = windows[indices[k]];
+                local.push_back(detail::Rect{ fan * static_cast<float>(k),
+                                              fan * static_cast<float>(k), w.w, w.h });
             }
 
             const detail::Rect bounds = detail::Union(local);
-            for (size_t k = 0; k < local.size(); ++k) {
-                out[indices[k]] = local[k];
-                out[indices[k]].x -= bounds.x;   // cluster-local offsets
-                out[indices[k]].y -= bounds.y;
-            }
+            for (size_t k = 0; k < local.size(); ++k)
+                out[indices[k]] = local[k];   // already cluster-local
 
-            clusters.push_back(bounds);
+            // The pile is seeded where the app's windows actually are, so the
+            // clusters start near their real positions and the relaxation only
+            // has to resolve the overlaps between apps.
+            float cx = 0.0f, cy = 0.0f;
+            for (size_t i : indices) { cx += windows[i].CentreX(); cy += windows[i].CentreY(); }
+            cx /= static_cast<float>(indices.size());
+            cy /= static_cast<float>(indices.size());
+
+            detail::Rect box = bounds;
+            box.x = cx - box.w * 0.5f;
+            box.y = cy - box.h * 0.5f;
+
+            clusters.push_back(box);
             members.push_back(indices);
         }
 
@@ -463,8 +486,21 @@ inline Result Layout(const std::vector<Window>& windows,
 
     // The box each app ended up in, in the same coordinates as the tiles, so
     // the caller can put an icon and a name under it without repeating the
-    // grouping logic and getting a different answer.
+    // grouping logic and getting a different answer. Depth comes with it: the
+    // caller has to insert the pile back to front or the most recent window
+    // ends up underneath the others.
     if (p.groupByApp) {
+        for (size_t i = 0; i < windows.size(); ++i) {
+            int depth = 0;
+            for (size_t j = 0; j < windows.size(); ++j) {
+                if (j == i || windows[j].group != windows[i].group) continue;
+                if (windows[j].order < windows[i].order ||
+                    (windows[j].order == windows[i].order && j < i))
+                    ++depth;
+            }
+            result.tiles[i].depth = depth;
+        }
+
         for (size_t i = 0; i < windows.size(); ++i) {
             Cluster* found = nullptr;
             for (Cluster& c : result.clusters)
