@@ -17,8 +17,8 @@
 //    Apple's material and a plain blurred rectangle, and it is the reason a
 //    blurred Windows acrylic looks grey where the macOS one looks coloured.
 //    CLSID_D2D1Saturation cannot do it: its property is documented over [0, 1],
-//    so it can only desaturate, and asking it for 1.6 silently clamps to
-//    identity. A colour matrix can.
+//    so it can only desaturate, and asking it for anything above 1 clamps to
+//    identity without complaining. A colour matrix can.
 //
 //  * Luminosity compression. Apple's material is not an alpha blend. It
 //    compresses the backdrop's luma range so that neither a white wallpaper nor
