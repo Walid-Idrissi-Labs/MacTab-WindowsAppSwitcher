@@ -326,6 +326,8 @@ It is a toggle, not a hold. Mission Control is a place you are in.
 | Click an app's icon, scroll up, or `↓` | Spread that app's pile so its windows can be told apart |
 | Click the background, scroll down, `↑` or `Esc` | Put the pile back, or leave |
 | Click a desktop, or `←` `→` | Look at that desktop's windows without going there |
+| Drag a window to another display | Move it there, keeping its size and its proportional place |
+| Drag a window onto a desktop | Move it there, if Windows allows it (see below) |
 | Click the `+` | Add a desktop |
 | `Tab` | Next window |
 | `Enter` | Go to the highlighted window |
@@ -659,13 +661,16 @@ each of these so the claims can be checked rather than trusted.
   fix is the same `uiAccess` that fixes elevated windows. Nothing renders above
   true exclusive-fullscreen apps either; borderless-windowed is fine.
 - **Windows 10 pre-1803 is unsupported**; that is the Composition floor.
-- **You cannot drag a window to another desktop.** There is no public way to
-  move another process's window between virtual desktops, and the private
-  interface that can is the one described above. Closing a desktop other than
-  the one you are on has the same problem.
-- **The space miniatures show the wallpaper, not their windows.** Windows on
-  another desktop are shell-cloaked and DWM will not compose a cloaked window
-  through any path available to a normal process.
+- **Dragging a window to another desktop only works for a few windows.** The
+  public API moves a window between desktops only when the calling process owns
+  it, which is almost never what you want to drag. The drop is attempted and the
+  window snaps back when Windows refuses, rather than pretending it worked. The
+  interface that could do it properly is the one described above. Closing a
+  desktop other than the one you are on has the same problem.
+- **The desktop miniatures show where the windows are, not what is in them.**
+  A window on another desktop is shell-cloaked and DWM will not compose a
+  cloaked window through any path available to a normal process, so each one is
+  drawn as its own shape at its own position with its app icon on it.
 - **Windows 10 window thumbnails have square corners**, because that is the
   shape Windows 10 draws them. A rounded composition clip needs build 17763,
   above this project's floor, and the visual DWM hands back for a thumbnail

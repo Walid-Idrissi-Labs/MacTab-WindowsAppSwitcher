@@ -76,9 +76,31 @@ std::wstring PathForMonitor(HMONITOR monitor) {
     // Either the interface is unavailable or no monitor matched, which happens
     // if the display configuration changed between the two calls.
     wchar_t buffer[MAX_PATH] = L"";
-    if (::SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, buffer, 0))
+    if (::SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, buffer, 0) && buffer[0])
         return buffer;
     return {};
+}
+
+// The copy Windows keeps for itself.
+//
+// Whenever the wallpaper is set, the shell writes a decoded copy here, and it
+// is the only source that survives the cases the two APIs above do not cover:
+// a picture that has been deleted or is on a network share that is not mounted,
+// a wallpaper that came from a theme pack, and a slideshow, where the reported
+// path is whichever file was picked at some point in the past.
+//
+// It has no extension and it is a JPEG, which the decoder works out for itself.
+std::wstring TranscodedPath() {
+    wchar_t* roaming = nullptr;
+    if (FAILED(::SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &roaming)) ||
+        !roaming)
+        return {};
+
+    std::wstring path = roaming;
+    ::CoTaskMemFree(roaming);
+
+    path += L"\\Microsoft\\Windows\\Themes\\TranscodedWallpaper";
+    return path;
 }
 
 // Decode, scale to cover, crop to centre.
@@ -175,10 +197,24 @@ Bitmap ForMonitor(HMONITOR monitor, int width, int height) {
     // Decoding outside the lock. It reads a file and can take tens of
     // milliseconds on a 4K JPEG, and holding the lock across that would make a
     // second monitor's bake wait on the first for no reason.
-    const std::wstring path = PathForMonitor(monitor);
+    std::wstring path = PathForMonitor(monitor);
 
     const double started = NowMs();
     Bitmap pixels = Decode(path, width, height);
+
+    if (pixels.Empty()) {
+        // The reported picture could not be read. That is not unusual: it may
+        // have been deleted, it may be on a share that is not mounted, it may
+        // have come from a theme, or this may be a slideshow whose reported
+        // path is whichever file was current some time ago.
+        const std::wstring transcoded = TranscodedPath();
+        pixels = Decode(transcoded, width, height);
+        if (!pixels.Empty()) {
+            MACTAB_DIAG("wallpaper: \"%s\" was unreadable, used the shell's own copy",
+                        ToUtf8(path).c_str());
+            path = transcoded;
+        }
+    }
 
     if (pixels.Empty()) {
         MACTAB_DIAG("wallpaper: no picture for monitor %p (\"%s\"), using the desktop colour",
