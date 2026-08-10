@@ -36,6 +36,7 @@ fi
 # skip is explicit and visible rather than silent.
 WINRT_ONLY=(
     "src/panel.cpp"
+    "src/mission.cpp"
 )
 
 is_winrt_only() {

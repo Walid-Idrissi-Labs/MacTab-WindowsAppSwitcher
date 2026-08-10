@@ -55,6 +55,37 @@ const wchar_t* kDefaultIni =
     L"; frost. Set to 0 if the bezel looks doubled or banded.\r\n"
     L"GlassRimTap=1\r\n"
     L"\r\n"
+    L"; --- Mission Control -------------------------------------------------\r\n"
+    L";\r\n"
+    L"; Win+Tab spreads every window out instead of opening Task View.\r\n"
+    L"MissionEnabled=1\r\n"
+    L"\r\n"
+    L"; 1 = pull each app's windows into a cluster. macOS ships this off, and\r\n"
+    L"; it costs room: gathering a scattered app's windows means moving them a\r\n"
+    L"; long way, so everything ends up smaller.\r\n"
+    L"MissionGroupByApp=0\r\n"
+    L"\r\n"
+    L"; Space kept between windows, and between one app's cluster and the next,\r\n"
+    L"; in logical pixels.\r\n"
+    L"MissionGap=26\r\n"
+    L"MissionClusterGap=72\r\n"
+    L"\r\n"
+    L"; The wallpaper behind the windows: how soft it goes, and how far back it\r\n"
+    L"; is pushed. Dim is 0 for none and 1 for opaque.\r\n"
+    L"MissionBlurSigma=18\r\n"
+    L"MissionDim=0.55\r\n"
+    L"\r\n"
+    L"; How long the windows take to fly out to their places, in milliseconds.\r\n"
+    L"MissionRevealMs=260\r\n"
+    L"\r\n"
+    L"; How window contents are shown.\r\n"
+    L";   auto     use the best one this machine supports\r\n"
+    L";   shared   live thumbnails, which is the only one that can animate\r\n"
+    L";   snapshot one still picture per window, taken when you press the keys\r\n"
+    L";   icon     no window contents at all, just the app icon on a card\r\n"
+    L"; Drop to snapshot if the windows come out blank, misplaced or flickering.\r\n"
+    L"MissionThumbnails=auto\r\n"
+    L"\r\n"
     L"; --- The glass material ---------------------------------------------\r\n"
     L";\r\n"
     L"; Every number in the material can be set here, and the tray menu has a\r\n"
@@ -325,6 +356,26 @@ void Load() {
     g_settings.panelDisplay = ParsePanelDisplay(ReadString(L"PanelDisplay", L"active"));
     g_settings.glassRefraction = ReadInt(L"GlassRefraction", 1) != 0;
     g_settings.glassRimTap     = ReadInt(L"GlassRimTap", 1) != 0;
+
+    g_settings.missionEnabled    = ReadInt(L"MissionEnabled", 1) != 0;
+    g_settings.missionGroupByApp = ReadInt(L"MissionGroupByApp", 0) != 0;
+    g_settings.missionRevealMs   = static_cast<UINT>(
+        (std::max)(0, (std::min)(2000, ReadInt(L"MissionRevealMs", 260))));
+    g_settings.missionThumbnails = ReadString(L"MissionThumbnails", L"auto");
+
+    ReadFloat(L"MissionGap",        g_settings.missionGap);
+    ReadFloat(L"MissionClusterGap", g_settings.missionClusterGap);
+    ReadFloat(L"MissionBlurSigma",  g_settings.missionBlurSigma);
+    ReadFloat(L"MissionDim",        g_settings.missionDim);
+
+    // Held to ranges the rest of the layout was designed inside, the same way
+    // the material's keys are. A gap of 4000 typed by hand would put every
+    // window off screen and look like a crash rather than a mistake.
+    g_settings.missionGap        = (std::max)(0.0f,  (std::min)(400.0f, g_settings.missionGap));
+    g_settings.missionClusterGap = (std::max)(0.0f,  (std::min)(600.0f, g_settings.missionClusterGap));
+    g_settings.missionBlurSigma  = (std::max)(0.0f,  (std::min)(120.0f, g_settings.missionBlurSigma));
+    g_settings.missionDim        = (std::max)(0.0f,  (std::min)(1.0f,   g_settings.missionDim));
+
     ReadGlass();
 
     MACTAB_DIAG("config: revealDelay %u ms, leftAltOnly %d, tile %d, theme %s, "
@@ -335,6 +386,14 @@ void Load() {
                 ToUtf8(PanelDisplayKeyword(g_settings.panelDisplay)).c_str(),
                 g_settings.glassRefraction ? 1 : 0);
     MACTAB_DIAG("config: glassRimTap %d", g_settings.glassRimTap ? 1 : 0);
+    MACTAB_DIAG("config: mission enabled %d, groupByApp %d, gap %.0f/%.0f, "
+                "blur %.0f, dim %.2f, reveal %u ms, thumbnails %s",
+                g_settings.missionEnabled ? 1 : 0,
+                g_settings.missionGroupByApp ? 1 : 0,
+                g_settings.missionGap, g_settings.missionClusterGap,
+                g_settings.missionBlurSigma, g_settings.missionDim,
+                g_settings.missionRevealMs,
+                ToUtf8(g_settings.missionThumbnails).c_str());
 }
 
 bool SetPanelDisplay(PanelDisplay display) {

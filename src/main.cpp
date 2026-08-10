@@ -10,8 +10,12 @@
 #include "diag.h"
 #include "foreground_history.h"
 #include "hotkey.h"
+#include "desktops.h"
 #include "icons.h"
+#include "mission.h"
 #include "panel.h"
+#include "thumbnail.h"
+#include "wallpaper.h"
 #include "tray.h"
 #include "window_model.h"
 #include "resource.h"
@@ -28,6 +32,11 @@ constexpr UINT WM_MACTAB_ICON_READY = WM_APP + 2;
 // Posted by the panel window when the pointer moves over or clicks a tile.
 constexpr UINT WM_MACTAB_HOVER = WM_APP + 3;
 constexpr UINT WM_MACTAB_CLICK = WM_APP + 4;
+
+// Posted by the Mission Control overlay.
+constexpr UINT WM_MACTAB_MC_ACTIVATE = WM_APP + 5;
+constexpr UINT WM_MACTAB_MC_DISMISS  = WM_APP + 6;
+constexpr UINT WM_MACTAB_MC_SPACE    = WM_APP + 7;
 
 UINT g_msgRequestQuit    = 0;   // RegisterWindowMessage(kQuitMessageName)
 UINT g_msgTaskbarCreated = 0;   // RegisterWindowMessage(L"TaskbarCreated")
@@ -54,6 +63,7 @@ struct AppState {
     HWND      host          = nullptr;
     Tray      tray;
     Panel     panel;
+    Mission   mission;
     Gesture   gesture;
     bool      diagRequested = false;
     bool      wtsRegistered = false;
@@ -380,6 +390,133 @@ void HandleActionKey(WORD virtualKey) {
     }
 }
 
+// --- Mission Control --------------------------------------------------------
+
+// Which display the arrangement opens on.
+//
+// One monitor, deliberately. macOS puts a separate Mission Control on every
+// display, each holding that display's windows, and doing the same here is a
+// second overlay window, a second wallpaper bake and a second set of thumbnails
+// for a case that cannot be tested from the machine this is written on. One
+// display first, and the windows on the others are simply not in it, which is
+// at least honest rather than half right.
+HMONITOR MissionMonitor() {
+    const HWND foreground = ::GetForegroundWindow();
+    if (foreground)
+        return ::MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+
+    POINT cursor{};
+    ::GetCursorPos(&cursor);
+    return ::MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+}
+
+void CloseMission() {
+    if (g_app.mission.Visible()) {
+        g_app.mission.Hide();
+        MACTAB_DIAG("mission: dismissed");
+    }
+}
+
+void OpenMission() {
+    if (!g_app.mission.Ready() || !config::Current().missionEnabled) return;
+
+    // A toggle, like the key it replaces and like the gesture it copies.
+    if (g_app.mission.Visible()) {
+        CloseMission();
+        return;
+    }
+
+    // Never over a switch in flight. Both own the keyboard and only one of them
+    // can have it.
+    if (g_app.gesture.active) return;
+
+    const HMONITOR monitor = MissionMonitor();
+
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!::GetMonitorInfoW(monitor, &info)) return;
+
+    std::vector<MissionItem> items;
+    int group = 0;
+
+    for (const SwitcherApp& app : BuildSwitcherList()) {
+        Bitmap icon;
+        icons::Acquire(MakeIconRequest(app, 128), icon);
+
+        for (const SwitcherWindow& window : app.windows) {
+            // Minimized windows are not in macOS' Mission Control either. They
+            // are in the Dock, which here is the taskbar, and putting them in
+            // the arrangement would mean inventing a size for something that
+            // does not currently have one.
+            if (window.minimized) continue;
+
+            // Only this display's windows. A window straddling two monitors
+            // belongs to whichever holds its centre.
+            const POINT centre{ (window.bounds.left + window.bounds.right) / 2,
+                                (window.bounds.top + window.bounds.bottom) / 2 };
+            if (::MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST) != monitor) continue;
+
+            MissionItem item;
+            item.hwnd    = window.hwnd;
+            item.title   = window.title;
+            item.appName = app.displayName;
+            item.icon    = icon;
+            item.bounds  = window.bounds;
+            item.group   = group;
+            item.order   = static_cast<int>(items.size());
+            items.push_back(std::move(item));
+        }
+        ++group;
+    }
+
+    std::vector<MissionSpace> spaces;
+    const desktops::State state = desktops::Query(g_app.host);
+    if (state.known) {
+        for (size_t i = 0; i < state.all.size(); ++i)
+            spaces.push_back(MissionSpace{ state.all[i].name,
+                                           static_cast<int>(i) == state.current });
+    }
+
+    MACTAB_DIAG("mission: opening with %zu window(s) and %zu space(s)",
+                items.size(), spaces.size());
+
+    g_app.mission.Show(monitor, std::move(items), std::move(spaces));
+}
+
+void ActivateFromMission(int index) {
+    // The items live inside the overlay, which is about to throw them away, so
+    // the handle is read before hiding.
+    const HWND target = g_app.mission.ItemWindow(index);
+    CloseMission();
+
+    if (target && ::IsWindow(target)) {
+        MACTAB_DIAG("mission: activating %p", static_cast<void*>(target));
+        ActivateWindow(target, 0);
+    }
+}
+
+void HandleMissionSpace(WPARAM which) {
+    // The overlay comes down first, always.
+    //
+    // Switching desktops may animate, and an overlay still on screen while the
+    // desktop slides underneath it looks like a bug. Creating a desktop has the
+    // same problem and additionally moves the foreground, which the overlay
+    // would immediately read as a reason to close itself.
+    const desktops::State state = desktops::Query(g_app.host);
+    CloseMission();
+
+    if (which == Mission::kSpaceAdd) {
+        desktops::Create();
+        return;
+    }
+    if (which == Mission::kSpaceClose) {
+        desktops::CloseCurrent();
+        return;
+    }
+
+    desktops::SwitchTo(state, static_cast<int>(which));
+}
+
 // --- Tray ------------------------------------------------------------------
 
 // Settings submenu.
@@ -445,6 +582,7 @@ void ShowTrayMenu(HWND hwnd, POINT screenPt) {
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_RELOAD_GLASS, L"Reload glass from settings.ini");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_LIST, L"Log current switcher list");
+    ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_DESKTOPS, L"Log virtual desktops");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_LOG, L"Open diagnostics log");
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
@@ -486,6 +624,7 @@ void ShutdownSubsystems() {
     hotkey::Stop();
     foreground::Stop();
     icons::Stop();
+    g_app.mission.Shutdown();
     g_app.panel.Shutdown();
 
     if (g_app.wtsRegistered && g_app.host) {
@@ -534,6 +673,22 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case hotkey::WM_MACTAB_ACTION:
         HandleActionKey(static_cast<WORD>(wParam));
+        return 0;
+
+    case hotkey::WM_MACTAB_MISSION:
+        OpenMission();
+        return 0;
+
+    case WM_MACTAB_MC_ACTIVATE:
+        ActivateFromMission(static_cast<int>(static_cast<INT_PTR>(wParam)));
+        return 0;
+
+    case WM_MACTAB_MC_DISMISS:
+        CloseMission();
+        return 0;
+
+    case WM_MACTAB_MC_SPACE:
+        HandleMissionSpace(wParam);
         return 0;
 
     case WM_MACTAB_HOVER: {
@@ -659,6 +814,21 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
             return 0;
 
+        case IDM_TRAY_DUMP_DESKTOPS:
+            // The one thing about virtual desktops that cannot be reasoned
+            // about from here: whether this build keeps the ordered list and
+            // the current desktop where we look for them.
+            if (diag::Enabled()) {
+                desktops::LogState(hwnd);
+                g_app.tray.ShowBalloon(L"MacTab", L"Desktops written to the diagnostics log.");
+            } else {
+                ::MessageBoxW(hwnd,
+                              L"Diagnostics logging is off for this session.\n\n"
+                              L"Relaunch MacTab with --diag to capture them.",
+                              L"MacTab", MB_OK | MB_ICONINFORMATION);
+            }
+            return 0;
+
         case IDM_TRAY_OPEN_LOG:
             OpenDiagnosticsLog(hwnd);
             return 0;
@@ -689,6 +859,19 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         break;
 
+    // The wallpaper is baked once and kept, so the one thing that has to be
+    // noticed is it changing. SPI_SETDESKWALLPAPER arrives here as a broadcast
+    // and costs nothing until Mission Control next opens.
+    case WM_SETTINGCHANGE:
+        if (wParam == SPI_SETDESKWALLPAPER)
+            wallpaper::Invalidate();
+        return 0;
+
+    case WM_DISPLAYCHANGE:
+        // Monitors moved, so every cached wallpaper is the wrong size.
+        wallpaper::Invalidate();
+        return 0;
+
     // --- Session state ------------------------------------------------------
     case WM_WTSSESSION_CHANGE:
         // The secure desktop (lock screen, UAC) means we may never see the Alt
@@ -699,6 +882,7 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             MACTAB_DIAG("session: change %llu, aborting any in-flight gesture",
                         static_cast<unsigned long long>(wParam));
             hotkey::AbortGesture();
+            CloseMission();
 
             // Repair the modifier again once input belongs to this desktop.
             //
@@ -853,6 +1037,22 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
         return 1;
     }
 
+    // Mission Control attaches to the same thread and the same compositing
+    // stack the panel just set up, so it has to come after it. A failure here
+    // is not fatal: the switcher is the product, and Win+Tab falling back to
+    // Windows' own Task View is a far better outcome than refusing to start.
+    if (config::Current().missionEnabled) {
+        if (g_app.mission.Initialize(instance, g_app.host, WM_MACTAB_MC_ACTIVATE,
+                                     WM_MACTAB_MC_DISMISS, WM_MACTAB_MC_SPACE)) {
+            const std::wstring& forced = config::Current().missionThumbnails;
+            if (forced == L"shared")        thumbnail::Force(thumbnail::Tier::SharedVisual);
+            else if (forced == L"snapshot") thumbnail::Force(thumbnail::Tier::Snapshot);
+            else if (forced == L"icon")     thumbnail::Force(thumbnail::Tier::IconOnly);
+        } else {
+            MACTAB_WARN("boot: Mission Control unavailable; Win+Tab left alone");
+        }
+    }
+
     icons::Start(g_app.host, WM_MACTAB_ICON_READY);
 
     // Lock/unlock notifications, so a gesture interrupted by the secure desktop
@@ -868,6 +1068,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
     hotkey::Options hotkeyOptions{};
     hotkeyOptions.revealDelayMs = config::Current().revealDelayMs;
     hotkeyOptions.leftAltOnly   = config::Current().leftAltOnly;
+    hotkeyOptions.missionOnWinTab =
+        config::Current().missionEnabled && g_app.mission.Ready();
     if (!hotkey::Start(g_app.host, hotkeyOptions)) {
         ::MessageBoxW(nullptr,
                       L"MacTab could not install its keyboard hook, so Alt+Tab cannot "

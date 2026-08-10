@@ -70,6 +70,40 @@ struct Settings {
     // panel takes a copy per gesture anyway.
     glass::Params glassDark  = glass::kDark;
     glass::Params glassLight = glass::kLight;
+
+    // --- Mission Control ----------------------------------------------------
+
+    // Win+Tab opens the arrangement instead of Windows' Task View.
+    bool missionEnabled = true;
+
+    // Gap kept between windows in the arrangement, and between one app's
+    // cluster and the next when grouping is on. Logical pixels at 96 DPI.
+    float missionGap        = 26.0f;
+    float missionClusterGap = 72.0f;
+
+    // Relax each app's windows into a cluster before arranging.
+    //
+    // Off by default, because that is macOS' default and has been since El
+    // Capitan. It also costs real estate: pulling a scattered app's windows
+    // together is a promise to move them a long way, which shows up as a
+    // smaller scale and a lower spatial agreement in tools/preview/mission.
+    bool missionGroupByApp = false;
+
+    // The wallpaper behind the arrangement: how far it is blurred and how far
+    // it is pushed back. Dim is the alpha of the tint over it, 0 to 1.
+    float missionBlurSigma = 18.0f;
+    float missionDim       = 0.55f;
+
+    // How long the windows take to fly from where they are to where they land.
+    UINT missionRevealMs = 260;
+
+    // Which thumbnail path to use: "auto", "shared", "snapshot" or "icon".
+    //
+    // Here for the same reason glassRimTap is. The shared-visual path goes
+    // through an undocumented DWM export that nothing off Windows can execute,
+    // and if it misbehaves on some driver this gets a working Mission Control
+    // back without waiting for a build.
+    std::wstring missionThumbnails = L"auto";
 };
 
 const Settings& Current();

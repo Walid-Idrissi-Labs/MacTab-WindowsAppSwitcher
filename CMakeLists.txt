@@ -106,6 +106,7 @@ add_executable(MacTab WIN32
     src/capture.cpp
     src/com.cpp
     src/config.cpp
+    src/desktops.cpp
     src/common.cpp
     src/diag.cpp
     src/foreground_history.cpp
@@ -114,8 +115,11 @@ add_executable(MacTab WIN32
     src/icon_source.cpp
     src/icons.cpp
     src/image.cpp
+    src/mission.cpp
     src/squircle.cpp
+    src/thumbnail.cpp
     src/tray.cpp
+    src/wallpaper.cpp
     src/window_model.cpp
     "${CMAKE_BINARY_DIR}/app.rc"
 )

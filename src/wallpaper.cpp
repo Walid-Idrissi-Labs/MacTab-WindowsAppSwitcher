@@ -1,0 +1,219 @@
+#include "pch.h"
+#include <shobjidl.h>
+#include <wincodec.h>
+
+#include "wallpaper.h"
+#include "com.h"
+#include "common.h"
+#include "diag.h"
+
+namespace mactab::wallpaper {
+namespace {
+
+// One cached decode. There is exactly one wallpaper and one Mission Control
+// size per monitor, so a single entry per monitor is the whole cache.
+struct Entry {
+    HMONITOR    monitor = nullptr;
+    int         width   = 0;
+    int         height  = 0;
+    std::wstring path;
+    Bitmap      pixels;
+};
+
+std::mutex         g_mutex;
+std::vector<Entry> g_cache;
+
+// Which file is on which monitor.
+//
+// SPI_GETDESKWALLPAPER returns one path for the whole desktop, which is wrong
+// the moment a second monitor has a different picture, and wrong again for a
+// slideshow, where it returns a stale transcoded copy. IDesktopWallpaper is the
+// per-monitor answer and has been there since Windows 8.
+//
+// It identifies monitors by device path, not by HMONITOR, so the mapping goes
+// through the rectangles: ask it for each monitor's rect and take the one whose
+// rect matches the HMONITOR's. That is exact, because both come from the same
+// display configuration.
+std::wstring PathForMonitor(HMONITOR monitor) {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    const bool haveRect = ::GetMonitorInfoW(monitor, &info) != FALSE;
+
+    ComPtr<IDesktopWallpaper> wallpaper;
+    if (haveRect &&
+        SUCCEEDED(::CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL,
+                                     IID_PPV_ARGS(wallpaper.Put())))) {
+        UINT count = 0;
+        if (SUCCEEDED(wallpaper->GetMonitorDevicePathCount(&count))) {
+            for (UINT i = 0; i < count; ++i) {
+                LPWSTR id = nullptr;
+                if (FAILED(wallpaper->GetMonitorDevicePathAt(i, &id)) || !id)
+                    continue;
+
+                RECT rect{};
+                const bool match =
+                    SUCCEEDED(wallpaper->GetMonitorRECT(id, &rect)) &&
+                    rect.left   == info.rcMonitor.left &&
+                    rect.top    == info.rcMonitor.top &&
+                    rect.right  == info.rcMonitor.right &&
+                    rect.bottom == info.rcMonitor.bottom;
+
+                std::wstring path;
+                if (match) {
+                    LPWSTR file = nullptr;
+                    if (SUCCEEDED(wallpaper->GetWallpaper(id, &file)) && file) {
+                        path = file;
+                        ::CoTaskMemFree(file);
+                    }
+                }
+
+                ::CoTaskMemFree(id);
+                if (match) return path;
+            }
+        }
+    }
+
+    // Either the interface is unavailable or no monitor matched, which happens
+    // if the display configuration changed between the two calls.
+    wchar_t buffer[MAX_PATH] = L"";
+    if (::SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, buffer, 0))
+        return buffer;
+    return {};
+}
+
+// Decode, scale to cover, crop to centre.
+//
+// Cover rather than fit, because that is what Windows' default "Fill" style
+// does and it is what the overwhelming majority of desktops are set to. Getting
+// every one of the six placement styles exactly right would mean reading
+// WallpaperStyle and TileWallpaper out of the registry and reproducing each
+// one, for a backdrop that is about to be blurred past recognition.
+Bitmap Decode(const std::wstring& path, int width, int height) {
+    if (path.empty() || width <= 0 || height <= 0) return {};
+
+    ComApartment apartment(COINIT_APARTMENTTHREADED);
+
+    ComPtr<IWICImagingFactory> factory;
+    if (FAILED(::CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(factory.Put()))))
+        return {};
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                  WICDecodeMetadataCacheOnDemand,
+                                                  decoder.Put())))
+        return {};
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    if (FAILED(decoder->GetFrame(0, frame.Put())))
+        return {};
+
+    UINT sourceW = 0, sourceH = 0;
+    if (FAILED(frame->GetSize(&sourceW, &sourceH)) || sourceW == 0 || sourceH == 0)
+        return {};
+
+    // Scale so the short side covers, then crop the long side to centre.
+    const double scale = (std::max)(static_cast<double>(width)  / sourceW,
+                                    static_cast<double>(height) / sourceH);
+    const UINT scaledW = (std::max)(static_cast<UINT>(width),
+                                    static_cast<UINT>(sourceW * scale + 0.5));
+    const UINT scaledH = (std::max)(static_cast<UINT>(height),
+                                    static_cast<UINT>(sourceH * scale + 0.5));
+
+    ComPtr<IWICBitmapScaler> scaler;
+    if (FAILED(factory->CreateBitmapScaler(scaler.Put())) ||
+        FAILED(scaler->Initialize(frame.Get(), scaledW, scaledH,
+                                  WICBitmapInterpolationModeFant)))
+        return {};
+
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(factory->CreateFormatConverter(converter.Put())) ||
+        FAILED(converter->Initialize(scaler.Get(), GUID_WICPixelFormat32bppBGRA,
+                                     WICBitmapDitherTypeNone, nullptr, 0.0,
+                                     WICBitmapPaletteTypeCustom)))
+        return {};
+
+    WICRect crop{};
+    crop.X      = static_cast<INT>((scaledW - static_cast<UINT>(width))  / 2);
+    crop.Y      = static_cast<INT>((scaledH - static_cast<UINT>(height)) / 2);
+    crop.Width  = width;
+    crop.Height = height;
+
+    Bitmap out = Bitmap::Create(width, height);
+    const UINT stride = static_cast<UINT>(width) * 4;
+    const UINT bytes  = stride * static_cast<UINT>(height);
+
+    if (FAILED(converter->CopyPixels(&crop, stride, bytes,
+                                     reinterpret_cast<BYTE*>(out.pixels.data()))))
+        return {};
+
+    // A wallpaper has no transparency, but the decoder reports whatever the file
+    // claims, and a PNG with an alpha channel would otherwise composite as a
+    // hole. The desktop is opaque by definition.
+    for (uint32_t& pixel : out.pixels) pixel |= 0xFF000000u;
+
+    return out;
+}
+
+} // namespace
+
+uint32_t SolidColour() {
+    const COLORREF colour = ::GetSysColor(COLOR_DESKTOP);
+    return MakePixel(GetRValue(colour), GetGValue(colour), GetBValue(colour), 255);
+}
+
+Bitmap ForMonitor(HMONITOR monitor, int width, int height) {
+    if (width <= 0 || height <= 0) return {};
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (const Entry& entry : g_cache)
+            if (entry.monitor == monitor && entry.width == width && entry.height == height)
+                return entry.pixels;
+    }
+
+    // Decoding outside the lock. It reads a file and can take tens of
+    // milliseconds on a 4K JPEG, and holding the lock across that would make a
+    // second monitor's bake wait on the first for no reason.
+    const std::wstring path = PathForMonitor(monitor);
+
+    const double started = NowMs();
+    Bitmap pixels = Decode(path, width, height);
+
+    if (pixels.Empty()) {
+        MACTAB_DIAG("wallpaper: no picture for monitor %p (\"%s\"), using the desktop colour",
+                    static_cast<void*>(monitor), ToUtf8(path).c_str());
+    } else {
+        MACTAB_DIAG("wallpaper: %dx%d from \"%s\" in %.1f ms",
+                    width, height, ToUtf8(path).c_str(), NowMs() - started);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        // Another thread may have finished the same decode while this one was
+        // reading the file. Whichever landed first wins; they are identical.
+        for (const Entry& entry : g_cache)
+            if (entry.monitor == monitor && entry.width == width && entry.height == height)
+                return entry.pixels;
+
+        Entry entry;
+        entry.monitor = monitor;
+        entry.width   = width;
+        entry.height  = height;
+        entry.path    = path;
+        entry.pixels  = pixels;
+        g_cache.push_back(std::move(entry));
+    }
+
+    return pixels;
+}
+
+void Invalidate() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_cache.empty()) return;
+    g_cache.clear();
+    MACTAB_DIAG("wallpaper: cache dropped");
+}
+
+} // namespace mactab::wallpaper

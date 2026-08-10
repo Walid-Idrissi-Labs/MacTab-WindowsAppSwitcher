@@ -450,6 +450,65 @@ inline Result Layout(const std::vector<Window>& windows,
     return result;
 }
 
+// --- the spaces strip -------------------------------------------------------
+
+// One chip in the strip across the top: a desktop, or the button that adds one.
+struct SpaceChip {
+    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
+    int   index = 0;      // desktop index, or -1 for the add button
+    bool  add   = false;
+};
+
+// Lay the strip out centred across `stripW`.
+//
+// Each desktop is drawn at the screen's own aspect ratio, because that is what
+// it is: a miniature of the whole display. The add button is square and sits
+// after the last one, inside the same centred run, so the strip stays centred
+// as desktops come and go rather than shifting every time.
+inline std::vector<SpaceChip> LayoutSpaces(int count, float stripW, float stripH,
+                                           float screenAspect, float gap) {
+    std::vector<SpaceChip> chips;
+    if (count <= 0 || stripW <= 0.0f || stripH <= 0.0f) return chips;
+
+    const float height = stripH;
+    const float width  = height * ((screenAspect > 0.1f) ? screenAspect : 1.6f);
+
+    const float total = width * static_cast<float>(count) + height +
+                        gap * static_cast<float>(count);
+
+    // Too many desktops to fit is not a real case (Windows offers no way to
+    // make dozens by hand), but a narrow monitor with several is, so shrink
+    // rather than overflow.
+    const float squeeze = (total > stripW && total > 0.0f) ? stripW / total : 1.0f;
+    const float w = width * squeeze;
+    const float h = height * squeeze;
+    const float g = gap * squeeze;
+
+    float x = (stripW - (w * count + h + g * count)) * 0.5f;
+
+    for (int i = 0; i < count; ++i) {
+        SpaceChip chip;
+        chip.x = x;
+        chip.y = (stripH - h) * 0.5f;
+        chip.w = w;
+        chip.h = h;
+        chip.index = i;
+        chips.push_back(chip);
+        x += w + g;
+    }
+
+    SpaceChip add;
+    add.x = x;
+    add.y = (stripH - h) * 0.5f;
+    add.w = h;              // square
+    add.h = h;
+    add.index = -1;
+    add.add = true;
+    chips.push_back(add);
+
+    return chips;
+}
+
 // How well the arrangement kept the desktop's spatial relationships, as a
 // number in -1..1.
 //

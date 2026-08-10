@@ -28,6 +28,18 @@
 
 namespace mactab::hotkey {
 
+// Tag carried by every key event this process synthesises.
+//
+// The hook must recognise its own injected input and pass it straight through,
+// or it re-enters its own state machine. Deliberately NOT keyed off
+// LLKHF_INJECTED, which is set by any injector: AutoHotkey and PowerToys
+// Keyboard Manager remaps would be skipped too, and their input is real input.
+//
+// Public because desktops.cpp injects the virtual-desktop shortcuts and has to
+// tag them the same way, and a second copy of this constant that drifted would
+// be a hang rather than a bug.
+inline constexpr ULONG_PTR kInjectionTag = 0x4D414354;   // 'MACT'
+
 // "Cycle windows within the highlighted app", the key above Tab.
 //
 // NOT VK_OEM_3. OEM virtual keys move with the keyboard layout: on French
@@ -68,6 +80,10 @@ enum : UINT {
     // wParam: the virtual key ('Q', 'W', 'H', VK_DOWN, VK_UP), or
     // kActionCycleWindows for the key above Tab.
     WM_MACTAB_ACTION = WM_APP + 15,
+
+    // Win+Tab: open Mission Control. Nothing else follows; unlike the switcher
+    // this is a toggle, not a hold, so the hook is done the moment it posts.
+    WM_MACTAB_MISSION = WM_APP + 16,
 };
 
 struct Options {
@@ -81,6 +97,10 @@ struct Options {
     // and is used constantly for @ # { } [ ]. Without both guards, ordinary
     // typing fires the switcher.
     bool leftAltOnly = true;
+
+    // Intercept Win+Tab for Mission Control. Off leaves Windows' Task View
+    // exactly as it was.
+    bool missionOnWinTab = true;
 };
 
 // Spawns the hook thread and installs the hook. Blocks until the hook is

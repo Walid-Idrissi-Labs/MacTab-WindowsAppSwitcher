@@ -11,16 +11,6 @@ namespace {
 // the use site.
 constexpr DWORD kScanBackquote = 0x29;
 
-// Tag on every key event we synthesise. We must recognise our own injected
-// input and pass it straight through, or we would re-enter the state machine
-// with our own Alt-up and loop.
-//
-// Deliberately NOT keyed off LLKHF_INJECTED: that flag is set by *any*
-// injector, so AutoHotkey, PowerToys Keyboard Manager and similar remappers
-// would be skipped too. Their input should be treated as real; only ours is
-// special.
-constexpr ULONG_PTR kInjectionTag = 0x4D414354;   // 'MACT'
-
 // Thread messages to the hook thread. Sent with PostThreadMessage, so they
 // arrive with msg.hwnd == nullptr and are handled in the loop, not dispatched.
 constexpr UINT TM_STOP   = WM_USER + 1;
@@ -117,6 +107,41 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     const DWORD vk  = key->vkCode;
 
     if (g_state == State::Idle) {
+        // Win+Tab opens Mission Control.
+        //
+        // Checked before the Alt gesture because the two chords share their
+        // key, and a user holding both is asking for the more specific one.
+        //
+        // Unlike Alt+Tab this is a toggle, not a hold: it posts once and the
+        // hook is finished. Mission Control is a place the user is in, it takes
+        // foreground and handles its own keyboard, so there is no state machine
+        // to run and nothing to commit on release.
+        if (down && vk == VK_TAB && g_options.missionOnWinTab &&
+            (KeyDown(VK_LWIN) || KeyDown(VK_RWIN))) {
+            PostToUi(WM_MACTAB_MISSION);
+
+            // Two jobs, one injection.
+            //
+            // Swallowing the Tab means the shell never sees a key pressed
+            // while Win was down, so releasing Win would open the Start menu.
+            // A tagged Ctrl tap in between is what tells the shell a chord
+            // happened. The same injection is also what qualifies this process
+            // to call SetForegroundWindow, since a process may take foreground
+            // if it produced the last input event, and the overlay has to have
+            // focus to receive a keystroke at all.
+            INPUT tap[2]{};
+            for (int i = 0; i < 2; ++i) {
+                tap[i].type           = INPUT_KEYBOARD;
+                tap[i].ki.wVk         = VK_LCONTROL;
+                tap[i].ki.wScan       = static_cast<WORD>(
+                    ::MapVirtualKeyW(VK_LCONTROL, MAPVK_VK_TO_VSC));
+                tap[i].ki.dwFlags     = (i == 1) ? KEYEVENTF_KEYUP : 0u;
+                tap[i].ki.dwExtraInfo = kInjectionTag;
+            }
+            ::SendInput(2, tap, sizeof(INPUT));
+            return 1;
+        }
+
         // Gesture opens on Alt+Tab. Note Tab arrives as WM_SYSKEYDOWN because
         // Alt is down, which is why `down` tests both message forms.
         //
@@ -383,8 +408,9 @@ bool Start(HWND uiWindow, const Options& options) {
     }
 
     ::InterlockedExchange(&g_running, 1);
-    MACTAB_DIAG("hotkey: started (revealDelay %u ms, leftAltOnly %d)",
-                g_options.revealDelayMs, g_options.leftAltOnly ? 1 : 0);
+    MACTAB_DIAG("hotkey: started (revealDelay %u ms, leftAltOnly %d, winTab %d)",
+                g_options.revealDelayMs, g_options.leftAltOnly ? 1 : 0,
+                g_options.missionOnWinTab ? 1 : 0);
     return true;
 }
 
