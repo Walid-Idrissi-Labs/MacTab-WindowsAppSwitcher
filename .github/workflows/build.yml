@@ -1,0 +1,56 @@
+# Compile on every push.
+#
+# This exists because of how 0.1.0 went. The project is written on a Mac, where
+# src/panel.cpp cannot be compiled at all: C++/WinRT ships only with the Windows
+# SDK. Nothing built it until a tag was pushed, and the first tag failed twice on
+# real compiler errors that three review rounds had missed.
+#
+# windows-latest has MSVC and the SDK, so it is the compiler this project does
+# not otherwise have. Running it per push rather than per tag means a build break
+# surfaces in minutes instead of at release time.
+#
+# Deliberately does NOT build the installer or produce artifacts. Packaging is
+# the release workflow's job; this one answers a single question, does it
+# compile and link.
+
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]     # tags are the release workflow's, do not build twice
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          # Every -D quoted as a single token. Unquoted, PowerShell's
+          # native-argument parsing mangles a value like 0.0.0 and CMake sees
+          # "0", which fails the version check in a way that looks like the
+          # caller was wrong rather than the shell.
+          cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=Release" "-DMACTAB_VERSION_STRING=0.0.0"
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build build
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+
+      - name: Report size
+        shell: pwsh
+        run: |
+          $exe = Get-Item build/bin/MacTab.exe
+          $kb = [math]::Round($exe.Length / 1KB)
+          Write-Host "MacTab.exe  $kb KB"
+          # The budget is 2 MB with no redistributables. Fail rather than let it
+          # drift, since nobody is watching the number otherwise.
+          if ($exe.Length -gt 2MB) { throw "MacTab.exe is $kb KB, over the 2 MB budget" }
