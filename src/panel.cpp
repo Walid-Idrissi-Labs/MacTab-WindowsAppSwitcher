@@ -600,6 +600,17 @@ void Panel::Impl::RecoverDevices() {
         if (BakeShadow()) {
             bakedShadowScale  = dpiScale;
             bakedShadowRadius = panelRadiusPx;
+
+            // BakeShadow attaches the brush at the default inset scale of 1.0,
+            // and only Layout normally corrects that. Recovery does not go
+            // through Layout, and nothing forces one afterwards: GuardPanel does
+            // not retry the failed operation, and a loss during BakeLabel or
+            // UploadIcon happens after Layout has already recorded the count, so
+            // the next gesture with the same number of apps skips it. Without
+            // this line the shadow comes back in exactly the degenerate state
+            // this release exists to fix, and stays there until the app count or
+            // the DPI happens to change.
+            FitShadowInsets(shadowVisual.Size().x, shadowVisual.Size().y);
         } else {
             shadowVisual.Brush(nullptr);
             bakedShadowScale  = 0.0f;
@@ -744,6 +755,10 @@ bool Panel::Impl::BakeShadow() {
 void Panel::Impl::FitShadowInsets(float destWidth, float destHeight) {
     if (!shadowNine || shadowCellPx <= 0.0f) return;
 
+    // Recovery can reach this before the first Layout, when the visual has no
+    // size yet. Scaling the insets to zero would be worse than leaving them.
+    if (destWidth <= 0.0f || destHeight <= 0.0f) return;
+
     // 0.98 rather than 1.0: leave a sliver of middle rather than landing
     // exactly on the degenerate boundary.
     const float room  = (std::min)(destWidth, destHeight) * 0.98f;
@@ -807,7 +822,11 @@ void Panel::Impl::BakeSelection() {
     {
         SurfaceDraw draw(surface);
         if (!draw.ok) {
+            // Same reason BakeLabel clears first: called from RecoverDevices,
+            // a bail-out here leaves the highlight pointed at a surface from
+            // the device that was just destroyed.
             MACTAB_WARN("panel: selection BeginDraw failed");
+            selectionVisual.Brush(nullptr);
             return;
         }
 
@@ -816,7 +835,10 @@ void Panel::Impl::BakeSelection() {
         auto geometry = CreateSquircleGeometry(d2dFactory.Get(),
                                                static_cast<float>(size),
                                                static_cast<float>(size), radius);
-        if (!geometry) return;
+        if (!geometry) {
+            selectionVisual.Brush(nullptr);
+            return;
+        }
 
         ComPtr<ID2D1SolidColorBrush> brush;
         draw.dc->CreateSolidColorBrush(theme.selection, brush.Put());

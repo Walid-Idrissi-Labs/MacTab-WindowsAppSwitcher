@@ -414,13 +414,18 @@ Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCou
     // it, run the material over it. Blurring the whole canvas and cropping is
     // equivalent to capturing panel-plus-margin and blurring that, which is
     // what StartCapture does, and avoids reimplementing the margin logic.
-    Bitmap blurred = canvas;
-    Blur(blurred, glass::kBlurSigma);
+    // Crop from the BLURRED wallpaper only when there is a capture to blur.
+    // The fallback path has no captured frame at all, so its coat goes over the
+    // sharp live desktop, and that sharpness is the entire reason the coat has
+    // to be as opaque as it is. Blurring it here would make the PNG look better
+    // than the thing it is standing in for, which is worse than not having it.
+    Bitmap source = canvas;
+    if (haveCapture) Blur(source, glass::kBlurSigma);
 
     Bitmap body = Bitmap::Create(panelW, panelH);
     for (int y = 0; y < panelH; ++y)
         for (int x = 0; x < panelW; ++x)
-            body.At(x, y) = blurred.At(x + margin, y + margin);
+            body.At(x, y) = source.At(x + margin, y + margin);
 
     if (haveCapture) {
         ApplyMaterial(body, material);

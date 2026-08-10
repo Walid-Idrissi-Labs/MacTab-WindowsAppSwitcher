@@ -68,6 +68,13 @@ struct Params {
     // top of nothing. 0.1.0 got away with no fallback because its tint was 0.55
     // and half-opaque on its own. It has to be a separate number now, and the
     // machines that hit this path are exactly the ones nobody is testing on.
+    //
+    // Nearly opaque on purpose. This is a degraded state, and a degraded state
+    // should look deliberate rather than broken. Anything that leaves more than
+    // a few percent of a SHARP desktop showing through reads as a rendering
+    // bug: window edges and wallpaper detail come through as hard rectangles,
+    // because there is no blur to soften them. 0.96 with the tint over the top
+    // is about 0.97 total.
     float fallbackAlpha;
 
     // The rim. A single flat hairline reads as a border; the glass reads as
@@ -121,7 +128,7 @@ struct Params {
 inline constexpr Params kDark{
     1.37f, 0.80f, 0.02f,
     { 0.09f, 0.09f, 0.11f, 0.27f },
-    0.80f,
+    0.96f,
     0.34f, 0.08f, 0.0f
 };
 
@@ -130,7 +137,7 @@ inline constexpr Params kDark{
 inline constexpr Params kLight{
     1.47f, 0.70f, 0.06f,
     { 0.97f, 0.97f, 0.98f, 0.32f },
-    0.82f,
+    0.96f,
     0.65f, 0.18f, 0.08f
 };
 
