@@ -98,6 +98,23 @@ for this reason; files that need WinRT include `src/winrt_pch.h`.
 
 A clean run means "this will probably compile", not "this works".
 
+The image, squircle and panel-layout code is deliberately kept free of
+`windows.h`, which means it can be compiled *and executed* natively:
+
+```
+./tools/preview/build.sh
+```
+
+runs a set of regression checks over that layer, then renders the icon pipeline
+and a mock of the real panel to PNGs in `build-preview/out/`. It uses the same
+`panel_layout.h` the app does, not a copy, so what it draws is the actual
+geometry.
+
+This is the only part of the project that gets looked at before it ships, and it
+has already earned its keep — it caught icons being scaled by canvas instead of
+content, generated tiles landing at the same brightness as the glyph on them,
+and a square selection highlight sitting next to squircle icons.
+
 ## Milestones
 
 - [x] **M0** Skeleton — build system, tray, diagnostics logging
