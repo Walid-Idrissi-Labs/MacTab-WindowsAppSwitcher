@@ -219,6 +219,31 @@ inline float ContrastRatio(float srgbA, float srgbB) {
 
 inline constexpr float kMinTextContrast = 4.5f;
 
+// Mean alpha the inner glow adds over a shape `height` physical pixels tall.
+//
+// The falloff is linear from each edge, so each edge contributes alpha * span / 2
+// of area. Spans are clamped exactly as DrawInnerGlow clamps them, because on a
+// short shape (the app name's capsule is 28 logical pixels tall against a 13px
+// top span) the glow covers most of it and is not a rounding error.
+//
+// This exists so the estimate of what the capsule will read at, which is made
+// before it is drawn, matches what actually gets drawn. Without it the estimate
+// is systematically too dark and the text shadow switches on when it is not
+// needed.
+inline float MeanGlowAlpha(const Params& p, float height, float dpiScale) {
+    if (height <= 0.0f) return 0.0f;
+
+    const float topSpan    = (std::min)(p.glowTopSpan    * dpiScale, height * 0.45f);
+    const float bottomSpan = (std::min)(p.glowBottomSpan * dpiScale, height * 0.45f);
+
+    return (p.glowTop * topSpan * 0.5f + p.glowBottom * bottomSpan * 0.5f) / height;
+}
+
+// White composited over `luma` at `alpha`, which is what the glow does.
+constexpr float LitBy(float luma, float alpha) {
+    return luma * (1.0f - alpha) + alpha;
+}
+
 // --- The colour matrix ------------------------------------------------------
 //
 // Row-major, [R G B A 1] * M, which is the convention D2D1_MATRIX_5X4_F uses:

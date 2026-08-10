@@ -1249,7 +1249,17 @@ float Panel::Impl::CapsuleLuma(const RECT& screenRect) const {
                            BlueOf(mean) / 255.0f };
     float out[3];
     glass::Apply(material, in, out);
-    return glass::Luma(out[0], out[1], out[2]);
+
+    // Include the glow. The capsule is short enough that the glow covers most of
+    // it, so leaving it out makes this estimate systematically too dark and
+    // switches the text shadow on when nothing needs it.
+    //
+    // Blurring preserves a region's mean, so running the material over the mean
+    // of the RAW capture gives the same answer as averaging the blurred and
+    // treated result, up to the matrix's clamp.
+    const float height = static_cast<float>(screenRect.bottom - screenRect.top);
+    return glass::LitBy(glass::Luma(out[0], out[1], out[2]),
+                        glass::MeanGlowAlpha(material, height, dpiScale));
 }
 
 // ---------------------------------------------------------------------------
