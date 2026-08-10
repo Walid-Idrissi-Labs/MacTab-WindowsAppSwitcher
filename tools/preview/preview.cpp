@@ -529,8 +529,7 @@ struct PanelStats {
 // so the proportions and the material are the ones that ship.
 Bitmap RenderPanel(const glass::Params& base, const Case* cases, int caseCount,
                    int selected, bool haveCapture, Wallpaper wallpaper,
-                   PanelStats* stats) {
-    const int count = 6;
+                   PanelStats* stats, int count = 6) {
     const layout::Metrics m = layout::Compute(count, 2400.0f, 1.0f);
 
     const int panelW = static_cast<int>(m.panelWidth);
@@ -924,16 +923,21 @@ int main(int argc, char** argv) {
             Wallpaper wallpaper;
             int selected;
             bool capture;
+            int count;
         };
         const Shot shots[] = {
-            { "/panel-dark-gradient.png",  glass::kDark,  "dark",  Wallpaper::Gradient, 1, true  },
-            { "/panel-dark-black.png",     glass::kDark,  "dark",  Wallpaper::Black,    1, true  },
-            { "/panel-dark-white.png",     glass::kDark,  "dark",  Wallpaper::White,    1, true  },
-            { "/panel-light-gradient.png", glass::kLight, "light", Wallpaper::Gradient, 1, true  },
-            { "/panel-light-black.png",    glass::kLight, "light", Wallpaper::Black,    1, true  },
-            { "/panel-light-white.png",    glass::kLight, "light", Wallpaper::White,    1, true  },
-            { "/panel-label-end.png",      glass::kDark,  "dark",  Wallpaper::Gradient, 5, true  },
-            { "/panel-no-capture.png",     glass::kDark,  "dark",  Wallpaper::Gradient, 1, false },
+            { "/panel-dark-gradient.png",  glass::kDark,  "dark",  Wallpaper::Gradient, 1, true,  6 },
+            { "/panel-dark-black.png",     glass::kDark,  "dark",  Wallpaper::Black,    1, true,  6 },
+            { "/panel-dark-white.png",     glass::kDark,  "dark",  Wallpaper::White,    1, true,  6 },
+            { "/panel-light-gradient.png", glass::kLight, "light", Wallpaper::Gradient, 1, true,  6 },
+            { "/panel-light-black.png",    glass::kLight, "light", Wallpaper::Black,    1, true,  6 },
+            { "/panel-light-white.png",    glass::kLight, "light", Wallpaper::White,    1, true,  6 },
+            { "/panel-label-end.png",      glass::kDark,  "dark",  Wallpaper::Gradient, 5, true,  6 },
+            { "/panel-no-capture.png",     glass::kDark,  "dark",  Wallpaper::Gradient, 1, false, 6 },
+            // One app is a real case now: the switcher shows a panel for it
+            // rather than suppressing itself. The panel goes square, which is
+            // the geometry least likely to have been thought about.
+            { "/panel-single-app.png",     glass::kDark,  "dark",  Wallpaper::Gradient, 0, true,  1 },
         };
 
         std::printf("\n%-9s %-9s %8s %8s %8s %7s %7s %8s\n",
@@ -944,7 +948,7 @@ int main(int argc, char** argv) {
             const Bitmap panel = RenderPanel(shot.material, cases,
                                              static_cast<int>(std::size(cases)),
                                              shot.selected, shot.capture,
-                                             shot.wallpaper, &stats);
+                                             shot.wallpaper, &stats, shot.count);
             if (!WritePng(outDir + shot.file, panel)) {
                 std::fprintf(stderr, "failed to write %s\n", shot.file);
                 ++failures;

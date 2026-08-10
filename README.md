@@ -51,6 +51,39 @@ Windows reserves it, and the code is in
 [`src/hotkey.cpp`](src/hotkey.cpp) if you want to read what it does before
 running it. Please do not disable your antivirus for this.
 
+### About "Windows protected your PC"
+
+That dialog, and the "Unknown publisher" line in it, come from **Authenticode
+and nothing else**. It is worth being precise about this because several things
+look like they should help and none of them do:
+
+- `AppPublisher` in the installer shows in Add/Remove Programs and in the wizard.
+  SmartScreen does not read it.
+- `VersionInfoCompany` shows in the file's Properties, Details tab. SmartScreen
+  does not read that either.
+- A self-signed certificate changes nothing. Windows does not trust it, so the
+  publisher still reads as unknown.
+
+Only a certificate from a CA Windows trusts puts a name on that dialog. The
+realistic options, cheapest first:
+
+| Route | Cost | Effect |
+|---|---|---|
+| [SignPath Foundation](https://signpath.org/) | free for qualifying OSS | Real certificate, publisher named. Application and review required. |
+| [Certum open source](https://shop.certum.eu/open-source-code-signing.html) | around €30/year | Real OV certificate for open-source authors, publisher named. |
+| [Azure Trusted Signing](https://learn.microsoft.com/en-us/azure/trusted-signing/) | around $10/month | Short-lived certificates issued per signing, integrates with CI. |
+| EV certificate | $300 to $600/year | Instant SmartScreen reputation, so no warning at all. |
+
+With an OV certificate (the first three) the file is signed and named, but
+SmartScreen can still warn until the signature accumulates reputation across
+enough downloads. Only EV skips that wait.
+
+The release workflow is already wired for this. Add `CERT_PFX_BASE64` and
+`CERT_PASSWORD` as repository secrets and both the executable and the installer
+get signed and timestamped, with no other change: the signing step is skipped
+entirely when the secret is absent, which is why the current builds are
+unsigned rather than broken.
+
 ## Why C++/WinRT and Windows.UI.Composition
 
 The corner radius decided it. `DWMWA_SYSTEMBACKDROP_TYPE` gives real Desktop

@@ -58,7 +58,20 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
+
+; --- what Windows shows about this file -------------------------------------
+; These land in the setup exe's own VERSIONINFO, so right-click, Properties,
+; Details names the publisher. They do NOT change the "Windows protected your
+; PC" dialog: SmartScreen reads the Authenticode signature and nothing else, so
+; without a certificate it says "Unknown publisher" no matter what is written
+; here. See the note at the bottom of this file.
 VersionInfoVersion={#MyAppVersionNumeric}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoProductName={#MyAppName}
+VersionInfoProductTextVersion={#MyAppVersion}
+VersionInfoDescription={#MyAppName} Setup
+VersionInfoCopyright=Walid Idrissi
+VersionInfoOriginalFileName={#MyAppName}-Setup.exe
 
 ; --- install mode: per-user default, per-machine via /ALLUSERS -------------
 PrivilegesRequired=lowest
@@ -96,10 +109,20 @@ WizardStyle=modern
 Compression=lzma2/max
 SolidCompression=yes
 
-; --- future: code signing ---------------------------------------------------
-; When you have a certificate, define a SignTool in the IDE/CI and uncomment:
-; SignTool=mysigntool
-; SignedUninstaller=yes
+; --- code signing -----------------------------------------------------------
+;
+; This is the only thing that removes "Windows protected your PC" and puts a
+; publisher name on that dialog. Nothing else does: AppPublisher above shows in
+; Add/Remove Programs and in the wizard, VersionInfoCompany shows in the file's
+; Properties, and SmartScreen reads neither of them. It reads the Authenticode
+; signature, and an unsigned file has none.
+;
+; The release workflow passes /DSignCommand=... when a signing secret exists, so
+; turning this on is a matter of adding the secret, not of editing this file.
+#ifdef SignCommand
+SignTool=mactab
+SignedUninstaller=yes
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

@@ -78,20 +78,27 @@ void BeginGesture(bool reverse) {
     g.active     = true;
     g.panelShown = false;
 
-    if (g.apps.size() < 2) {
-        // Nothing to switch to. Stay armed so the keys are still swallowed:
+    if (g.apps.empty()) {
+        // Nothing at all to show. Stay armed so the keys are still swallowed:
         // falling back to the built-in switcher mid-gesture would be worse.
         g.index = 0;
-        MACTAB_DIAG("gesture: begin with %zu app(s), nothing to switch to", g.apps.size());
+        MACTAB_DIAG("gesture: begin with no eligible apps");
         return;
     }
 
-    // macOS lands on the previously-used app, not the current one. Shift starts
-    // from the far end of the list instead.
-    g.index = reverse ? static_cast<int>(g.apps.size()) - 1 : 1;
+    // macOS lands on the previously-used app, not the current one, so a forward
+    // gesture starts at index 1. Shift starts from the far end instead.
+    //
+    // A single app is not a special case any more. There is nowhere else to
+    // land, so the selection stays on it and committing is a no-op, but the
+    // panel still comes up and shows it, which is what macOS does and what the
+    // user asked for. Suppressing it meant the switcher looked broken on a
+    // freshly booted machine with one window open.
+    const int count = static_cast<int>(g.apps.size());
+    g.index = (count < 2) ? 0 : (reverse ? count - 1 : 1);
 
-    MACTAB_DIAG("gesture: begin, %zu apps, start index %d (reverse %d)",
-                g.apps.size(), g.index, reverse ? 1 : 0);
+    MACTAB_DIAG("gesture: begin, %d app(s), start index %d (reverse %d)",
+                count, g.index, reverse ? 1 : 0);
 
     PopulatePanel();
 }
@@ -264,10 +271,11 @@ void CancelGesture(WORD altVirtualKey) {
 void RevealPanel() {
     Gesture& g = g_app.gesture;
 
-    // Fewer than two apps means BeginGesture returned before populating the
-    // panel, so there is nothing valid to show; revealing would display the
-    // previous gesture's tiles, complete with stale window handles.
-    if (!g.active || g.apps.size() < 2) return;
+    // An empty list means BeginGesture returned before populating the panel, so
+    // there is nothing valid to show; revealing would display the previous
+    // gesture's tiles, complete with stale window handles. One app is fine and
+    // gets a panel of its own.
+    if (!g.active || g.apps.empty()) return;
 
     g.panelShown = true;
 

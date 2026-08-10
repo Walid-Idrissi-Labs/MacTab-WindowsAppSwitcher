@@ -23,6 +23,13 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+
+    # At job level so the signing step's `if` can test it. A step's own `env`
+    # block is not visible to that step's own condition.
+    env:
+      CERT_PFX_BASE64: ${{ secrets.CERT_PFX_BASE64 }}
+      CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -74,18 +81,56 @@ jobs:
           # printing help, which this step would read as a failure.
           if (-not (Test-Path $iscc)) { throw "ISCC.exe still missing after install" }
 
+      # Code signing, if and only if a certificate has been provided.
+      #
+      # This is the only thing that removes "Windows protected your PC" and puts
+      # a publisher name on that dialog. SmartScreen reads the Authenticode
+      # signature and nothing else: AppPublisher and VersionInfoCompany do not
+      # touch it. See the note at the bottom of installer/MacTab.iss.
+      #
+      # Set the CERT_PFX_BASE64 and CERT_PASSWORD repository secrets and this
+      # step starts working with no other change. Without them it is skipped and
+      # the build is unsigned, exactly as before.
+      - name: Sign the executable
+        id: sign
+        if: ${{ env.CERT_PFX_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'mactab.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+
+          # RFC 3161 timestamp so the signature outlives the certificate.
+          & signtool sign /f $pfx /p $env:CERT_PASSWORD `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+            build\bin\MacTab.exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed on MacTab.exe" }
+
+          "pfx=$pfx" >> $env:GITHUB_OUTPUT
+
       - name: Compile installer
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           $version = '${{ steps.ver.outputs.version }}'
           $numeric = '${{ steps.ver.outputs.numeric }}'
+
+          # Only defined when the signing step ran, which is what the #ifdef in
+          # the .iss keys off.
+          $signArgs = @()
+          $pfx = '${{ steps.sign.outputs.pfx }}'
+          if ($pfx) {
+            $signArgs += "/DSignCommand=1"
+            $signArgs += ("/Smactab=signtool sign /f `"$pfx`" /p `"$env:CERT_PASSWORD`" " +
+                          "/fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `$f")
+          }
+
           # Quoted for the same reason as the cmake arguments above.
           & $iscc `
             "/DMyAppVersion=$version" `
             "/DMyAppVersionNumeric=$numeric" `
             "/DSourceDir=$PWD\build\bin" `
             "/O$PWD\dist" `
+            @signArgs `
             "installer\MacTab.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
 
