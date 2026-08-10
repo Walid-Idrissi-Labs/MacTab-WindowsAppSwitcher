@@ -320,6 +320,25 @@ void ApplyMaterial(Bitmap& image, const glass::Params& p) {
     }
 }
 
+// The no-capture path: an opaque base coat at fallbackAlpha, then the ordinary
+// tint over it, which is exactly the order BakeBackdrop draws them in.
+void ApplyFallback(Bitmap& image, const glass::Params& p) {
+    auto over = [](float dst, float src, float a) { return dst * (1.0f - a) + src * a; };
+    auto to255 = [](float v) {
+        const float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+        return static_cast<uint8_t>(c * 255.0f + 0.5f);
+    };
+
+    for (uint32_t& px : image.pixels) {
+        float c[3] = { RedOf(px) / 255.0f, GreenOf(px) / 255.0f, BlueOf(px) / 255.0f };
+        for (int i = 0; i < 3; ++i) {
+            c[i] = over(c[i],  p.tint[i], p.fallbackAlpha);
+            c[i] = over(c[i],  p.tint[i], p.tint[3]);
+        }
+        px = MakePixel(to255(c[0]), to255(c[1]), to255(c[2]), 255);
+    }
+}
+
 // A wallpaper deliberately built to break the material if the numbers are
 // wrong: a saturated colour field so the saturation boost is visible, a
 // near-white block and a near-black block so the luma compression can be judged
@@ -381,7 +400,7 @@ void Check(bool condition, const char* what) {
 // glass code, not a copy of it, so the proportions and the material can be
 // judged rather than assumed.
 Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCount,
-                   int selected) {
+                   int selected, bool haveCapture) {
     const int count = 6;
     const layout::Metrics m = layout::Compute(count, 2400.0f, 1.0f);
 
@@ -403,7 +422,16 @@ Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCou
         for (int x = 0; x < panelW; ++x)
             body.At(x, y) = blurred.At(x + margin, y + margin);
 
-    ApplyMaterial(body, material);
+    if (haveCapture) {
+        ApplyMaterial(body, material);
+    } else {
+        // No captured frame: a wedged GPU, a remote session, a grab that missed
+        // its deadline. BakeBackdrop lays an opaque base coat down first and
+        // then the normal tint, because at 0.27 the tint alone leaves the tiles
+        // floating over a sharp live desktop. This is the one panel state that
+        // only shows up on machines nobody is testing on, so it gets a PNG.
+        ApplyFallback(body, material);
+    }
 
     // Corners.
     {
@@ -717,16 +745,19 @@ int main(int argc, char** argv) {
         // that exercises BakeLabel's clamp: the name is anchored on the tile's
         // centre, so at the end of the row it has to slide inward instead of
         // overhanging the panel.
-        struct { const char* file; const glass::Params& material; int selected; } shots[] = {
-            { "/panel-dark.png",       glass::kDark,  1 },
-            { "/panel-light.png",      glass::kLight, 1 },
-            { "/panel-label-end.png",  glass::kDark,  5 },
+        struct {
+            const char* file; const glass::Params& material; int selected; bool capture;
+        } shots[] = {
+            { "/panel-dark.png",        glass::kDark,  1, true  },
+            { "/panel-light.png",       glass::kLight, 1, true  },
+            { "/panel-label-end.png",   glass::kDark,  5, true  },
+            { "/panel-no-capture.png",  glass::kDark,  1, false },
         };
 
         for (const auto& shot : shots) {
             const Bitmap panel = RenderPanel(shot.material, cases,
                                              static_cast<int>(std::size(cases)),
-                                             shot.selected);
+                                             shot.selected, shot.capture);
             if (!WritePng(outDir + shot.file, panel)) {
                 std::fprintf(stderr, "failed to write %s\n", shot.file);
                 ++failures;
