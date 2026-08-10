@@ -134,13 +134,14 @@ uint32_t DominantColour(const Bitmap& icon) {
 
     // Working at 32x32 both bounds the cost and averages away single-pixel
     // outliers such as antialiased edge fringes.
-    const Bitmap small = Resize(icon, 32, 32);
-    if (small.Empty()) return kNeutral;
+    // Not named `small`: rpcndr.h defines that as a macro for `char`.
+    const Bitmap thumbnail = Resize(icon, 32, 32);
+    if (thumbnail.Empty()) return kNeutral;
 
     struct Bucket { uint64_t r = 0, g = 0, b = 0, count = 0; };
     std::vector<Bucket> buckets(kBins * kBins * kBins);
 
-    for (uint32_t pixel : small.pixels) {
+    for (uint32_t pixel : thumbnail.pixels) {
         if (AlphaOf(pixel) < 128) continue;   // ignore transparent and near-transparent
 
         const int r = RedOf(pixel), g = GreenOf(pixel), b = BlueOf(pixel);
