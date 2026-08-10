@@ -2,41 +2,52 @@
 
 // Mission Control's arrangement, deliberately free of windows.h.
 //
-// Same reason panel_layout.h is: this is a shape that has to be looked at to be
-// judged, and it cannot be looked at on the machine it is written on. Keeping
-// the arithmetic here means tools/preview can run the real algorithm natively,
-// draw the result to a PNG, and assert on the numbers, which is the only
-// verification available before a Windows machine sees it.
+// Same reason panel_layout.h is: the arrangement is a shape, shapes have to be
+// looked at to be judged, and the machine this is written on cannot run
+// Windows. So the real algorithm runs in tools/preview/mission, against
+// synthetic desktops chosen to break it, and writes what it produced as a PNG
+// next to a set of assertions about it.
 //
-// WHAT MISSION CONTROL ACTUALLY DOES, and what it does not do.
+// WHAT THIS IS NOT.
 //
-// It does not tile. It does not normalise every window to a common size, and it
-// does not stretch anything to fill a row. A large window still looks large next
-// to a small one after the arrangement, which means there is ONE scale factor
-// shared by every window, not one per row and not one per window. That single
-// fact rules out the justified-gallery layout that this otherwise resembles, and
-// it is the difference between an arrangement that reads as "my desktop, pulled
-// apart" and one that reads as a photo grid.
+// The first version of this file packed windows into justified rows. It was
+// tidy, it passed everything asserted about it, and it was the wrong shape.
+// Mission Control does not produce rows. Windows land near where they already
+// were, at irregular heights, with no shared baseline; that is why you can find
+// a window in it by remembering where you left it. A row packer destroys
+// exactly that, and what it leaves behind reads as a photo gallery. GNOME's
+// Activities view and KWin's grid mode both make this trade and both look
+// unmistakably not-macOS as a result.
 //
-// So the algorithm is: pick the largest scale at which everything still fits,
-// then pack rows greedily at that scale.
+// WHAT IT IS.
 //
-//   1. Order the windows roughly as they sit on screen, reading order.
-//   2. For a trial scale, walk the order filling rows left to right, starting a
-//      new row when the next window would not fit the width.
-//   3. That gives a total height. If it overflows, the scale was too big.
-//   4. Binary search the scale for the largest one that fits, capped at 1.0
-//      because nothing is ever shown larger than it really is.
+// A position-preserving proportional spread, the family KWin calls the natural
+// layout. Every window starts exactly where it really is, then overlapping
+// pairs shove each other apart along the line joining their centres until
+// nothing overlaps, and the whole result is mapped into the screen with ONE
+// uniform scale.
 //
-// The ordering step matters more than it looks. Packing in an arbitrary order
-// still produces a tidy arrangement, but windows land nowhere near where they
-// were, and the whole point of the gesture is that you already know where you
-// left the thing you are looking for. Sorting by y and then x is the obvious
-// approach and it is wrong: two windows side by side almost never share an exact
-// y, so a plain y sort interleaves left and right columns. They have to be
-// banded into rows first, and the number of bands worth using is the number of
-// rows the packing produces, which is not known until after packing. Hence two
-// passes: pack once to learn the row count, band by that count, pack again.
+// The single scale is not an implementation convenience, it is the property.
+// A large window still looks large next to a small one afterwards, and every
+// aspect ratio is exact. Normalising sizes, per row or per window, is the other
+// way this stops looking like macOS.
+//
+// Three holes in the naive version, all of which KDE hit and documented before
+// giving up on it, and all of which are defended against below:
+//
+//   coincident centres  a stack of maximised windows has no direction to
+//                       separate along. KWin nudges x by one pixel, which
+//                       collapses the stack into a single horizontal line of
+//                       slivers. Here the direction comes from a deterministic
+//                       fan, so a stack blooms outward instead.
+//   unbounded loop      the relaxation is not guaranteed to terminate, so it is
+//                       capped, and hitting the cap falls back to a grid rather
+//                       than shipping whatever the last iteration held.
+//   nondeterminism      KWin iterates a hash keyed on pointers. Anything that
+//                       reorders the input reorders the arrangement, which is
+//                       invisible in one render and obvious the second time you
+//                       open it. Everything here is ordered by the caller's
+//                       index and the arithmetic is fixed-step.
 
 #include <algorithm>
 #include <cmath>
@@ -45,235 +56,248 @@
 
 namespace mactab::mission {
 
-// Logical pixels at 96 DPI. Provisional until measured against a real
-// screenshot of macOS 26; they are here rather than inline so that the
-// measurement, when it happens, changes one place.
-inline constexpr float kTileGapX = 28.0f;
-inline constexpr float kTileGapY = 44.0f;
+// Logical pixels at 96 DPI, in screen space, so these are the gaps as seen
+// rather than as computed. Provisional until measured against a real screenshot
+// of macOS 26.
+inline constexpr float kWindowGap = 26.0f;
+
+// Between one app's cluster and the next, when grouping is on. Wider than the
+// gap inside a cluster, which is what makes the grouping legible without
+// drawing anything around it.
+inline constexpr float kClusterGap = 72.0f;
 
 // Never enlarge. A 400x300 window is a small tile in Mission Control, and
-// blowing it up to fill space would break the "this is your desktop" reading.
+// blowing it up to fill the screen would break the "this is your desktop"
+// reading that the whole gesture depends on.
 inline constexpr float kMaxScale = 1.0f;
 
-// Below this there is nothing left to recognise. Reached only with a very large
-// number of windows, and at that point macOS is unreadable too, so this exists
-// to stop the search rather than to be hit.
+// Reached only with an absurd number of windows. Exists to stop the search
+// rather than to be hit.
 inline constexpr float kMinScale = 0.04f;
 
-struct Params {
-    float gapX     = kTileGapX;
-    float gapY     = kTileGapY;
-    float maxScale = kMaxScale;
-    float minScale = kMinScale;
+// The relaxation is not provably convergent, so it is bounded. 400 is far past
+// what any real desktop needs; thirty overlapping windows settle in under
+// forty.
+inline constexpr int kMaxIterations = 400;
 
-    // Windows of the same application are kept adjacent in the order, which is
-    // what macOS 26 does by default ("Group windows by application"). Off, the
-    // order is purely positional.
-    bool  groupByApp = true;
+struct Params {
+    float gap        = kWindowGap;
+    float clusterGap = kClusterGap;
+    float maxScale   = kMaxScale;
+    float minScale   = kMinScale;
+    int   iterations = kMaxIterations;
+
+    // Windows of the same application are relaxed into a cluster first, and the
+    // clusters are then relaxed against each other. Off, every window competes
+    // with every other and only position matters, which is what macOS does by
+    // default.
+    bool  groupByApp = false;
 };
 
 // One window, as it actually sits on the desktop.
 //
 // Coordinates are whatever the caller is working in, as long as they are
-// consistent with the region passed to Layout: the algorithm is scale free. The
-// panel uses physical pixels relative to the monitor.
+// consistent with the region passed to Layout: the algorithm is scale free.
 struct Window {
     float x = 0.0f, y = 0.0f;      // top left on screen
     float w = 1.0f, h = 1.0f;      // size on screen
 
     // Grouping key, normally the index of the owning app in the app list. Only
-    // compared for equality, never ordered on directly.
+    // ever compared for equality.
     int   group = 0;
 
-    // Tie break, and the order groups appear in. Most recently used first, so
-    // the app you were just in leads.
+    // Tie break, and the order clusters are seeded in. Most recently used
+    // first.
     int   order = 0;
 
     float CentreX() const { return x + w * 0.5f; }
     float CentreY() const { return y + h * 0.5f; }
-    float Aspect()  const { return h > 0.0f ? w / h : 1.0f; }
 };
 
 struct Placement {
     float x = 0.0f, y = 0.0f;      // top left within the region
     float w = 0.0f, h = 0.0f;
-    int   row    = 0;
     int   source = 0;              // index into the input vector
 };
 
 struct Result {
-    std::vector<Placement> tiles;  // in input order, not layout order
-    float scale    = 1.0f;
-    int   rows     = 0;
-    float contentW = 0.0f;         // bounding box of the arrangement
-    float contentH = 0.0f;
+    std::vector<Placement> tiles;  // in input order
+    float scale      = 1.0f;
+    int   iterations = 0;          // how much shoving it took
+    bool  relaxed    = true;       // false means the grid fallback was used
+    float contentW   = 0.0f;       // bounding box of the arrangement, scaled
+    float contentH   = 0.0f;
 };
 
 namespace detail {
 
-// Where each row starts and ends in the ordered sequence, plus its extent at
-// the trial scale.
-struct Row {
-    size_t begin  = 0;
-    size_t end    = 0;             // exclusive
-    float  width  = 0.0f;
-    float  height = 0.0f;
+struct Rect {
+    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
+
+    float CentreX() const { return x + w * 0.5f; }
+    float CentreY() const { return y + h * 0.5f; }
+    float Right()   const { return x + w; }
+    float Bottom()  const { return y + h; }
 };
 
-// Greedy left-to-right fill at a fixed scale.
+inline Rect Union(const std::vector<Rect>& rects) {
+    Rect bounds;
+    if (rects.empty()) return bounds;
+
+    float left = rects[0].x, top = rects[0].y;
+    float right = rects[0].Right(), bottom = rects[0].Bottom();
+    for (const Rect& r : rects) {
+        left   = (std::min)(left,   r.x);
+        top    = (std::min)(top,    r.y);
+        right  = (std::max)(right,  r.Right());
+        bottom = (std::max)(bottom, r.Bottom());
+    }
+    bounds.x = left;
+    bounds.y = top;
+    bounds.w = (std::max)(1.0f, right - left);
+    bounds.h = (std::max)(1.0f, bottom - top);
+    return bounds;
+}
+
+// How far apart two rects overlap, per axis, once both have been grown by half
+// the gap, which is the same as requiring `gap` of clear space between them.
+// Zero on either axis means they are already clear.
+inline void Overlap(const Rect& a, const Rect& b, float gap,
+                    float& overlapX, float& overlapY) {
+    const float half = gap * 0.5f;
+    overlapX = (std::min)(a.Right() + half, b.Right() + half) -
+               (std::max)(a.x - half, b.x - half);
+    overlapY = (std::min)(a.Bottom() + half, b.Bottom() + half) -
+               (std::max)(a.y - half, b.y - half);
+    if (overlapX <= 0.0f || overlapY <= 0.0f) { overlapX = 0.0f; overlapY = 0.0f; }
+}
+
+// Distance the pair must travel along the unit direction (nx, ny) to stop
+// overlapping.
 //
-// Greedy rather than an optimal partition on purpose. An optimal packer would
-// balance the rows, which looks tidier and is exactly wrong here: balancing
-// moves windows out of the row they visually belong to in order to even up the
-// line lengths, and the arrangement stops matching the desktop it came from. A
-// ragged last row is what macOS produces too.
-inline std::vector<Row> PackRows(const std::vector<const Window*>& ordered,
-                                 float scale, float regionW, const Params& p) {
-    std::vector<Row> rows;
-    if (ordered.empty()) return rows;
+// Not the penetration depth. Two boxes overlapping by 10 pixels vertically,
+// pushed apart along a direction 30 degrees off vertical, have to travel 20 to
+// clear it, not 10. Using the depth instead means every pass makes partial
+// progress, thirty windows never settle, and the whole thing falls out to the
+// grid, which is exactly what happened the first time this was written.
+inline float SeparationAlong(float overlapX, float overlapY, float nx, float ny) {
+    float distance = 1e30f;
+    if (std::fabs(nx) > 1e-4f) distance = (std::min)(distance, overlapX / std::fabs(nx));
+    if (std::fabs(ny) > 1e-4f) distance = (std::min)(distance, overlapY / std::fabs(ny));
+    return (distance > 1e29f) ? (std::max)(overlapX, overlapY) : distance;
+}
 
-    Row row;
-    row.begin = 0;
+// A separation direction that does not depend on the two rects, for the case
+// where their centres coincide.
+//
+// The golden angle spreads successive indices as evenly as any sequence can, so
+// a stack of ten identical maximised windows fans out into a disc rather than a
+// line. KWin's one-pixel x nudge is what produces the line, and a line of ten
+// maximised windows scales down to slivers.
+inline void FanDirection(size_t index, float& dx, float& dy) {
+    const float angle = static_cast<float>(index) * 2.39996323f;
+    dx = std::cos(angle);
+    dy = std::sin(angle);
+}
 
-    for (size_t i = 0; i < ordered.size(); ++i) {
-        const float w = ordered[i]->w * scale;
-        const float h = ordered[i]->h * scale;
+// Shove overlapping rects apart in place. Returns the number of passes used;
+// `settled` reports whether it actually finished.
+//
+// The push is half the penetration depth per rect rather than a fixed step, so
+// a deep overlap resolves in a few passes instead of hundreds, and the
+// direction still comes from the centre-to-centre line, which is what keeps the
+// result organic rather than axis-aligned.
+inline int Shove(std::vector<Rect>& rects, float gap, float regionAspect,
+                 int maxIterations, bool& settled) {
+    settled = true;
+    if (rects.size() < 2) return 0;
 
-        // Width this row would have if the window joined it.
-        const bool  empty = (i == row.begin);
-        const float grown = empty ? w : row.width + p.gapX + w;
+    // Movement along the axis that is already too long is damped, so the
+    // arrangement grows toward the shape of the screen rather than into a tall
+    // column on a wide monitor. The uniform scale is limited by the worse of
+    // the two axes, so an arrangement with the wrong aspect costs size
+    // everywhere.
+    //
+    // Measured once, from where the windows actually start, rather than per
+    // pass. Recomputing it as the bounds grow lets the damping flip axis
+    // between passes, and a pair that is pushed one way and then the other
+    // never settles.
+    const Rect  start  = Union(rects);
+    const float aspect = start.w / start.h;
+    const float dampX  = (aspect > regionAspect) ? 0.6f : 1.0f;
+    const float dampY  = (aspect > regionAspect) ? 1.0f : 0.6f;
 
-        if (!empty && grown > regionW) {
-            row.end = i;
-            rows.push_back(row);
+    int pass = 0;
+    for (; pass < maxIterations; ++pass) {
+        bool moved = false;
 
-            row        = Row{};
-            row.begin  = i;
-            row.width  = w;
-            row.height = h;
-        } else {
-            row.width  = grown;
-            row.height = (std::max)(row.height, h);
+        for (size_t i = 0; i < rects.size(); ++i) {
+            for (size_t j = i + 1; j < rects.size(); ++j) {
+                float overlapX = 0.0f, overlapY = 0.0f;
+                Overlap(rects[i], rects[j], gap, overlapX, overlapY);
+                if (overlapX <= 0.0f) continue;
+
+                float dx = (rects[j].CentreX() - rects[i].CentreX()) * dampX;
+                float dy = (rects[j].CentreY() - rects[i].CentreY()) * dampY;
+                float length = std::sqrt(dx * dx + dy * dy);
+
+                if (length < 0.5f) {
+                    FanDirection(i * 31 + j, dx, dy);
+                    length = 1.0f;
+                }
+
+                dx /= length;
+                dy /= length;
+
+                // Half each, and a little past touching so a pair that lands
+                // exactly tangent does not re-trigger next pass on rounding.
+                const float push = SeparationAlong(overlapX, overlapY, dx, dy) * 0.51f;
+
+                rects[i].x -= dx * push;
+                rects[i].y -= dy * push;
+                rects[j].x += dx * push;
+                rects[j].y += dy * push;
+                moved = true;
+            }
         }
+
+        if (!moved) return pass + 1;
     }
 
-    row.end = ordered.size();
-    rows.push_back(row);
-    return rows;
+    settled = false;
+    return pass;
 }
 
-inline float TotalHeight(const std::vector<Row>& rows, const Params& p) {
-    if (rows.empty()) return 0.0f;
-    float total = p.gapY * static_cast<float>(rows.size() - 1);
-    for (const Row& r : rows) total += r.height;
-    return total;
-}
-
-inline float WidestRow(const std::vector<Row>& rows) {
-    float widest = 0.0f;
-    for (const Row& r : rows) widest = (std::max)(widest, r.width);
-    return widest;
-}
-
-// A trial scale is acceptable when the packing fits the region in both axes.
+// Deterministic fallback when the relaxation refuses to settle.
 //
-// The width check is not redundant with the packer. The packer will place a
-// window that is wider than the whole region on a row of its own rather than
-// loop forever, so a single oversized window can only be caught here.
-inline bool Fits(const std::vector<Row>& rows, const Params& p,
-                 float regionW, float regionH) {
-    return WidestRow(rows) <= regionW + 0.01f &&
-           TotalHeight(rows, p) <= regionH + 0.01f;
+// Not meant to be pretty. It exists so that a pathological desktop produces a
+// readable arrangement rather than whatever the loop happened to hold when the
+// cap fired, which would be a pile of overlapping windows.
+inline void GridFallback(std::vector<Rect>& rects, float gap) {
+    if (rects.empty()) return;
+
+    float cellW = 0.0f, cellH = 0.0f;
+    for (const Rect& r : rects) {
+        cellW = (std::max)(cellW, r.w);
+        cellH = (std::max)(cellH, r.h);
+    }
+
+    const int columns = (std::max)(1, static_cast<int>(
+        std::ceil(std::sqrt(static_cast<float>(rects.size())))));
+
+    for (size_t i = 0; i < rects.size(); ++i) {
+        const int column = static_cast<int>(i) % columns;
+        const int row    = static_cast<int>(i) / columns;
+        rects[i].x = static_cast<float>(column) * (cellW + gap) + (cellW - rects[i].w) * 0.5f;
+        rects[i].y = static_cast<float>(row)    * (cellH + gap) + (cellH - rects[i].h) * 0.5f;
+    }
 }
 
 } // namespace detail
 
-// The order windows are packed in.
-//
-// `bands` is how many horizontal bands the screen is cut into before sorting,
-// which should be the number of rows the arrangement will end up with. Pass 1
-// for the provisional pass, where the row count is not known yet.
-inline std::vector<const Window*> OrderWindows(const std::vector<Window>& windows,
-                                               int bands, const Params& p) {
-    std::vector<const Window*> ordered;
-    ordered.reserve(windows.size());
-    for (const Window& w : windows) ordered.push_back(&w);
-    if (ordered.size() < 2) return ordered;
-
-    // Band boundaries come from the spread of the window centres, not from the
-    // screen. A desktop where everything sits in the top half should still be
-    // cut into distinct rows rather than collapsing into band 0.
-    float minY = ordered.front()->CentreY();
-    float maxY = minY;
-    for (const Window* w : ordered) {
-        minY = (std::min)(minY, w->CentreY());
-        maxY = (std::max)(maxY, w->CentreY());
-    }
-
-    const int   bandCount = (std::max)(1, bands);
-    const float span      = (std::max)(1.0f, maxY - minY);
-    const float bandSize  = span / static_cast<float>(bandCount);
-
-    auto bandOf = [&](const Window* w) {
-        const int b = static_cast<int>((w->CentreY() - minY) / bandSize);
-        return (std::min)(bandCount - 1, (std::max)(0, b));
-    };
-
-    if (!p.groupByApp) {
-        // Reading order: down the bands, left to right inside each.
-        //
-        // The trailing keys are not decoration. std::sort needs a strict weak
-        // ordering and two windows can genuinely share a band and a centre, so
-        // the comparator has to bottom out somewhere deterministic or the
-        // arrangement changes between runs on identical input.
-        std::sort(ordered.begin(), ordered.end(),
-                  [&](const Window* a, const Window* b) {
-                      const int ba = bandOf(a), bb = bandOf(b);
-                      if (ba != bb) return ba < bb;
-                      if (a->CentreX() != b->CentreX()) return a->CentreX() < b->CentreX();
-                      if (a->CentreY() != b->CentreY()) return a->CentreY() < b->CentreY();
-                      return a->order < b->order;
-                  });
-        return ordered;
-    }
-
-    // Grouped: applications appear in most-recently-used order, and an app's
-    // windows stay together. Within an app, positional order again, so a
-    // three-window app still reads left to right.
-    //
-    // The group's position is its best (lowest) order value rather than its
-    // first window's, because the input is not required to be sorted.
-    std::vector<std::pair<int, int>> best;   // group, best order
-    for (const Window* w : ordered) {
-        auto it = std::find_if(best.begin(), best.end(),
-                               [&](const std::pair<int, int>& e) { return e.first == w->group; });
-        if (it == best.end()) best.emplace_back(w->group, w->order);
-        else it->second = (std::min)(it->second, w->order);
-    }
-
-    auto rankOf = [&](int group) {
-        for (size_t i = 0; i < best.size(); ++i)
-            if (best[i].first == group) return best[i].second;
-        return 0;
-    };
-
-    std::sort(ordered.begin(), ordered.end(),
-              [&](const Window* a, const Window* b) {
-                  const int ra = rankOf(a->group), rb = rankOf(b->group);
-                  if (ra != rb) return ra < rb;
-                  if (a->group != b->group) return a->group < b->group;
-                  const int ba = bandOf(a), bb = bandOf(b);
-                  if (ba != bb) return ba < bb;
-                  if (a->CentreX() != b->CentreX()) return a->CentreX() < b->CentreX();
-                  if (a->CentreY() != b->CentreY()) return a->CentreY() < b->CentreY();
-                  return a->order < b->order;
-              });
-    return ordered;
-}
-
 // Arrange `windows` into a region `regionW` by `regionH`.
 //
-// The region is the area left for tiles: the caller has already taken the
+// The region is the area left for windows: the caller has already taken the
 // spaces strip off the top and the outer margin off every side. Output
 // coordinates are relative to the region's top left corner.
 inline Result Layout(const std::vector<Window>& windows,
@@ -282,82 +306,189 @@ inline Result Layout(const std::vector<Window>& windows,
     Result result;
     if (windows.empty() || regionW <= 0.0f || regionH <= 0.0f) return result;
 
-    auto search = [&](const std::vector<const Window*>& ordered) {
-        // Largest scale that fits.
-        //
-        // The packing is a step function of the scale, so this is monotone in
-        // the ordinary case but not provably so at every step boundary. The
-        // walk-down afterwards is what makes an overflow impossible rather than
-        // unlikely, and it costs nothing when the search was already right.
-        float lo = p.minScale, hi = p.maxScale;
-        for (int i = 0; i < 40; ++i) {
-            const float mid = (lo + hi) * 0.5f;
-            if (detail::Fits(detail::PackRows(ordered, mid, regionW, p), p, regionW, regionH))
-                lo = mid;
-            else
-                hi = mid;
+    const float regionAspect = regionW / regionH;
+
+    // The gaps are given in screen space, but the shoving happens in the
+    // windows' own space and everything is scaled at the end. A gap of 26 with
+    // a final scale of 0.4 would come out as 10 on screen. So the whole thing
+    // runs twice: once to learn the scale, once with the gaps divided by it.
+    // Without this the arrangement gets visibly tighter the more windows are
+    // open, which is the opposite of what it should do.
+    auto arrange = [&](float gapScale, std::vector<detail::Rect>& out) {
+        const float gap        = p.gap        / gapScale;
+        const float clusterGap = p.clusterGap / gapScale;
+
+        out.resize(windows.size());
+        for (size_t i = 0; i < windows.size(); ++i)
+            out[i] = detail::Rect{ windows[i].x, windows[i].y, windows[i].w, windows[i].h };
+
+        bool settled = true;
+        int  passes  = 0;
+
+        if (!p.groupByApp) {
+            passes = detail::Shove(out, gap, regionAspect, p.iterations, settled);
+            if (!settled) detail::GridFallback(out, gap);
+            return std::pair<int, bool>{ passes, settled };
         }
 
-        float scale = lo;
-        for (int i = 0; i < 64; ++i) {
-            if (detail::Fits(detail::PackRows(ordered, scale, regionW, p), p, regionW, regionH))
-                break;
-            scale *= 0.97f;
+        // Grouped: relax each app's windows on their own first, then relax the
+        // resulting clusters against each other and translate each cluster's
+        // windows with it.
+        //
+        // Two levels rather than one pass with an attraction term, because an
+        // attraction term fights the separation term and there is no setting of
+        // the two that is stable for every desktop. Here neither level can
+        // produce an overlap the other has to undo: no two clusters overlap
+        // because the second level says so, and no two windows inside one
+        // cluster overlap because the first level says so.
+        std::vector<int> groups;
+        for (const Window& w : windows)
+            if (std::find(groups.begin(), groups.end(), w.group) == groups.end())
+                groups.push_back(w.group);
+
+        // Clusters are seeded in most-recently-used order so the app you were
+        // just in leads, matching the switcher.
+        std::sort(groups.begin(), groups.end(), [&](int a, int b) {
+            int bestA = 0, bestB = 0;
+            bool haveA = false, haveB = false;
+            for (const Window& w : windows) {
+                if (w.group == a && (!haveA || w.order < bestA)) { bestA = w.order; haveA = true; }
+                if (w.group == b && (!haveB || w.order < bestB)) { bestB = w.order; haveB = true; }
+            }
+            if (bestA != bestB) return bestA < bestB;
+            return a < b;
+        });
+
+        std::vector<detail::Rect> clusters;
+        std::vector<std::vector<size_t>> members;
+        clusters.reserve(groups.size());
+        members.reserve(groups.size());
+
+        for (int group : groups) {
+            std::vector<size_t> indices;
+            std::vector<detail::Rect> local;
+            for (size_t i = 0; i < windows.size(); ++i) {
+                if (windows[i].group != group) continue;
+                indices.push_back(i);
+                local.push_back(detail::Rect{ windows[i].x, windows[i].y,
+                                              windows[i].w, windows[i].h });
+            }
+
+            bool localSettled = true;
+            passes += detail::Shove(local, gap, regionAspect, p.iterations, localSettled);
+            if (!localSettled) {
+                detail::GridFallback(local, gap);
+                settled = false;
+            }
+
+            const detail::Rect bounds = detail::Union(local);
+            for (size_t k = 0; k < local.size(); ++k) {
+                out[indices[k]] = local[k];
+                out[indices[k]].x -= bounds.x;   // cluster-local offsets
+                out[indices[k]].y -= bounds.y;
+            }
+
+            clusters.push_back(bounds);
+            members.push_back(indices);
         }
-        return (std::max)(p.minScale, scale);
+
+        bool clusterSettled = true;
+        passes += detail::Shove(clusters, clusterGap, regionAspect,
+                                p.iterations, clusterSettled);
+        if (!clusterSettled) {
+            detail::GridFallback(clusters, clusterGap);
+            settled = false;
+        }
+
+        for (size_t c = 0; c < clusters.size(); ++c)
+            for (size_t i : members[c]) {
+                out[i].x += clusters[c].x;
+                out[i].y += clusters[c].y;
+            }
+
+        return std::pair<int, bool>{ passes, settled };
     };
 
-    // Pass one exists only to learn how many rows this set wants, so pass two
-    // can band the screen by that count. Ordering by a wrong band count is what
-    // scrambles left and right, and the count is not knowable before packing.
-    std::vector<const Window*> ordered = OrderWindows(windows, 1, p);
-    float scale = search(ordered);
-    const int provisionalRows =
-        static_cast<int>(detail::PackRows(ordered, scale, regionW, p).size());
+    std::vector<detail::Rect> rects;
+    std::pair<int, bool> run = arrange(1.0f, rects);
 
-    if (provisionalRows > 1) {
-        ordered = OrderWindows(windows, provisionalRows, p);
-        scale   = search(ordered);
+    detail::Rect bounds = detail::Union(rects);
+    float scale = (std::min)(p.maxScale,
+                             (std::min)(regionW / bounds.w, regionH / bounds.h));
+    scale = (std::max)(p.minScale, scale);
+
+    if (scale < 0.999f) {
+        run    = arrange(scale, rects);
+        bounds = detail::Union(rects);
+        scale  = (std::max)(p.minScale,
+                            (std::min)(p.maxScale,
+                                       (std::min)(regionW / bounds.w, regionH / bounds.h)));
     }
 
-    const std::vector<detail::Row> rows = detail::PackRows(ordered, scale, regionW, p);
-
-    result.scale    = scale;
-    result.rows     = static_cast<int>(rows.size());
-    result.contentW = detail::WidestRow(rows);
-    result.contentH = detail::TotalHeight(rows, p);
+    result.scale      = scale;
+    result.iterations = run.first;
+    result.relaxed    = run.second;
+    result.contentW   = bounds.w * scale;
+    result.contentH   = bounds.h * scale;
     result.tiles.resize(windows.size());
 
-    // Centre the block vertically, and every row within the block horizontally.
-    float y = (regionH - result.contentH) * 0.5f;
+    // Map into the region, centred. One scale for every window, which is what
+    // keeps the relative sizes and every aspect ratio exact.
+    const float offsetX = (regionW - result.contentW) * 0.5f;
+    const float offsetY = (regionH - result.contentH) * 0.5f;
 
-    for (size_t r = 0; r < rows.size(); ++r) {
-        const detail::Row& row = rows[r];
-        float x = (regionW - row.width) * 0.5f;
-
-        for (size_t i = row.begin; i < row.end; ++i) {
-            const Window* w = ordered[i];
-            const size_t  source = static_cast<size_t>(w - windows.data());
-
-            Placement place;
-            place.w      = w->w * scale;
-            place.h      = w->h * scale;
-            place.x      = x;
-            // Windows in a row are centred on the row rather than sitting on a
-            // shared baseline. A short window between two tall ones floats in
-            // the middle of the gap, which is what the reference does.
-            place.y      = y + (row.height - place.h) * 0.5f;
-            place.row    = static_cast<int>(r);
-            place.source = static_cast<int>(source);
-
-            result.tiles[source] = place;
-            x += place.w + p.gapX;
-        }
-
-        y += row.height + p.gapY;
+    for (size_t i = 0; i < rects.size(); ++i) {
+        Placement place;
+        place.x      = (rects[i].x - bounds.x) * scale + offsetX;
+        place.y      = (rects[i].y - bounds.y) * scale + offsetY;
+        place.w      = rects[i].w * scale;
+        place.h      = rects[i].h * scale;
+        place.source = static_cast<int>(i);
+        result.tiles[i] = place;
     }
 
     return result;
+}
+
+// How well the arrangement kept the desktop's spatial relationships, as a
+// number in -1..1.
+//
+// Every pair of windows votes: if one was left of the other and still is, the
+// pair agrees. Kendall's tau over both axes. This is the property the whole
+// algorithm exists for, and "it looks about right" is not something that can be
+// asserted on or regression-tested, so it gets measured instead.
+//
+// Exposed rather than kept in the harness because it is the one number worth
+// logging from a real machine when an arrangement looks wrong.
+inline float SpatialAgreement(const std::vector<Window>& windows,
+                              const Result& result) {
+    if (windows.size() < 2 || result.tiles.size() != windows.size()) return 1.0f;
+
+    long agree = 0, total = 0;
+    for (size_t i = 0; i < windows.size(); ++i) {
+        for (size_t j = i + 1; j < windows.size(); ++j) {
+            const Placement& a = result.tiles[i];
+            const Placement& b = result.tiles[j];
+
+            const float wasDX = windows[j].CentreX() - windows[i].CentreX();
+            const float nowDX = (b.x + b.w * 0.5f) - (a.x + a.w * 0.5f);
+            if (std::fabs(wasDX) > 1.0f) {
+                ++total;
+                if ((wasDX > 0.0f) == (nowDX > 0.0f)) ++agree;
+            }
+
+            const float wasDY = windows[j].CentreY() - windows[i].CentreY();
+            const float nowDY = (b.y + b.h * 0.5f) - (a.y + a.h * 0.5f);
+            if (std::fabs(wasDY) > 1.0f) {
+                ++total;
+                if ((wasDY > 0.0f) == (nowDY > 0.0f)) ++agree;
+            }
+        }
+    }
+
+    if (total == 0) return 1.0f;
+    return static_cast<float>(2.0 * static_cast<double>(agree) /
+                              static_cast<double>(total) - 1.0);
 }
 
 } // namespace mactab::mission

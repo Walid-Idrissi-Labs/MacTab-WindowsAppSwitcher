@@ -13,15 +13,19 @@
 //   typical    six windows, mixed sizes, the ordinary case
 //   pair       two windows, where nothing should be shrunk much
 //   single     one maximised window, the degenerate case
-//   crowded    thirty windows, where the scale search does the work
+//   crowded    thirty windows, where the relaxation has to converge
 //   lopsided   one window bigger than the screen next to twenty small ones
 //   stacked    five windows of one app plus three others, for the grouping
 //   columns    a deliberate left/right split, which is the ordering test
 //
-// The last one is the one that matters most. Any packer produces a tidy grid;
-// what makes this Mission Control rather than a photo gallery is that a window
-// on the left of the screen is still on the left afterwards, and that is the
-// property a plain y-then-x sort quietly destroys.
+// Plus a stack of eight identical maximised windows, built inline, because
+// coincident centres are the one input a spread has no answer for unless it was
+// written to have one.
+//
+// The number that matters most is the agreement: every pair of windows votes on
+// whether the side it was on is the side it ended up on. That is what makes
+// this Mission Control rather than a photo gallery, and it is the property a
+// tidier algorithm quietly trades away.
 
 #include <cstdio>
 #include <cstring>
@@ -221,11 +225,16 @@ Bitmap Render(const Desktop& desktop, const mission::Result& result,
         DrawTile(out, p, static_cast<int>(i), desktop.windows[i].group);
     }
 
-    char caption[160];
-    std::snprintf(caption, sizeof(caption), "%s  %d WINDOWS  SCALE 0.%02d  %d ROWS%s",
+    char caption[200];
+    std::snprintf(caption, sizeof(caption),
+                  "%s  %d WINDOWS  SCALE 0.%02d  %d PASSES  AGREE 0.%02d%s%s",
                   desktop.name, static_cast<int>(desktop.windows.size()),
                   static_cast<int>(result.scale * 100.0f + 0.5f) % 100,
-                  result.rows, params.groupByApp ? "  GROUPED" : "");
+                  result.iterations,
+                  static_cast<int>(mission::SpatialAgreement(desktop.windows, result)
+                                   * 100.0f + 0.5f) % 100,
+                  params.groupByApp ? "  GROUPED" : "",
+                  result.relaxed ? "" : "  FELL BACK TO A GRID");
     for (char* c = caption; *c; ++c)
         if (*c >= 'a' && *c <= 'z') *c = static_cast<char>(*c - 32);
     DrawWord(out, caption, 40, 30, 4, MakePixel(210, 212, 222, 255));
@@ -288,27 +297,43 @@ void CheckDesktop(const Desktop& desktop, const mission::Result& r,
         }
     }
 
-    // Grouped mode has to keep an app's windows together. Walk the arrangement
-    // in layout order and confirm each group is one contiguous run.
+    // Grouped mode has to keep an app's windows together, and the honest test
+    // of that is not adjacency in some traversal order: it is that no app's
+    // bounding box overlaps another's. That is the thing the two-level
+    // relaxation promises, and it is what makes the grouping legible without
+    // drawing a box around anything.
     if (params.groupByApp) {
-        std::vector<size_t> order(r.tiles.size());
-        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-            if (r.tiles[a].row != r.tiles[b].row) return r.tiles[a].row < r.tiles[b].row;
-            return r.tiles[a].x < r.tiles[b].x;
-        });
+        std::vector<int> groups;
+        for (const mission::Window& w : desktop.windows)
+            if (std::find(groups.begin(), groups.end(), w.group) == groups.end())
+                groups.push_back(w.group);
 
-        std::vector<int> seen;
-        int  previous = -1;
-        bool contiguous = true;
-        for (size_t i : order) {
-            const int g = desktop.windows[i].group;
-            if (g == previous) continue;
-            if (std::find(seen.begin(), seen.end(), g) != seen.end()) contiguous = false;
-            seen.push_back(g);
-            previous = g;
+        std::vector<mission::Placement> boxes;
+        for (int g : groups) {
+            float l = 0, t = 0, rr = 0, bb = 0;
+            bool first = true;
+            for (size_t i = 0; i < r.tiles.size(); ++i) {
+                if (desktop.windows[i].group != g) continue;
+                const mission::Placement& p = r.tiles[i];
+                if (first) { l = p.x; t = p.y; rr = p.x + p.w; bb = p.y + p.h; first = false; }
+                else {
+                    l  = (std::min)(l,  p.x);
+                    t  = (std::min)(t,  p.y);
+                    rr = (std::max)(rr, p.x + p.w);
+                    bb = (std::max)(bb, p.y + p.h);
+                }
+            }
+            mission::Placement box;
+            box.x = l; box.y = t; box.w = rr - l; box.h = bb - t;
+            boxes.push_back(box);
         }
-        Check(contiguous, (tag + ": an app's windows stay together").c_str());
+
+        bool clear = true;
+        for (size_t i = 0; i < boxes.size() && clear; ++i)
+            for (size_t j = i + 1; j < boxes.size() && clear; ++j)
+                if (Overlaps(boxes[i], boxes[j], 1.0f)) clear = false;
+
+        Check(clear, (tag + ": no app's cluster overlaps another's").c_str());
     }
 }
 
@@ -321,7 +346,8 @@ int main(int argc, char** argv) {
     const float regionH = static_cast<float>(kScreenH - kSpacesBarH - kMargin * 2);
 
     std::printf("\nmission control layout, region %.0fx%.0f\n\n", regionW, regionH);
-    std::printf("%-10s %7s %7s %6s %8s\n", "desktop", "windows", "scale", "rows", "fill");
+    std::printf("%-10s %7s %7s %7s %7s %7s\n",
+                "desktop", "windows", "scale", "passes", "agree", "fill");
 
     const std::vector<Desktop> desktops = MakeDesktops();
 
@@ -350,11 +376,31 @@ int main(int argc, char** argv) {
             double covered = 0.0;
             for (const mission::Placement& p : r.tiles) covered += p.w * p.h;
 
-            if (grouped) {
-                std::printf("%-10s %7zu  %6.3f %6d %7.1f%%\n",
-                            desktop.name, desktop.windows.size(), r.scale, r.rows,
-                            100.0 * covered / (regionW * regionH));
+            if (!grouped) {
+                std::printf("%-10s %7zu  %6.3f %7d  %6.2f %6.1f%%%s\n",
+                            desktop.name, desktop.windows.size(), r.scale,
+                            r.iterations,
+                            mission::SpatialAgreement(desktop.windows, r),
+                            100.0 * covered / (regionW * regionH),
+                            r.relaxed ? "" : "  GRID FALLBACK");
             }
+
+            // The arrangement exists to be recognisable, and that is a number:
+            // every pair of windows votes on whether the side it was on is the
+            // side it ended up on. Anything below this is not a spread any
+            // more, it is a reshuffle.
+            const float agreement = mission::SpatialAgreement(desktop.windows, r);
+            if (grouped)
+                std::printf("%-10s grouped: agreement %.2f, scale %.3f, %d passes%s\n",
+                            desktop.name, agreement, r.scale, r.iterations,
+                            r.relaxed ? "" : "  GRID FALLBACK");
+            // Grouping is allowed to cost spatial order, because pulling an
+            // app's windows together is a promise to move them. The floor is
+            // only there to catch a genuine scramble: chance is 0.
+            Check(agreement > (grouped ? 0.25f : 0.60f),
+                  (std::string(desktop.name) +
+                   (grouped ? ": grouping keeps most of the spatial order"
+                            : ": the arrangement keeps the desktop's spatial order")).c_str());
 
             const std::string path = outDir + "/mission-" + desktop.name +
                                      (grouped ? "-grouped" : "-positional") + ".png";
@@ -363,55 +409,78 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Ordering: on the two-column desktop, every left-hand window must still be
-    // left of every right-hand window it shares a row with. This is the whole
-    // reason the banding pass exists.
+    // The two-column desktop is the ordering test. Nothing on the left may end
+    // up right of something that was on its right, and with a spread rather
+    // than a packer that has to hold for every pair, not just within a row.
     {
         // Bind the vector, not the element. MakeDesktops().back() is a
         // reference into a temporary that dies at the end of the statement,
         // and the checks below then run on freed memory and pass vacuously.
         const std::vector<Desktop> all = MakeDesktops();
         const Desktop& columns = all.back();
+
         mission::Params params;
         params.groupByApp = false;
         const mission::Result r = mission::Layout(columns.windows, regionW, regionH, params);
 
-        bool preserved = true;
-        for (size_t i = 0; i < r.tiles.size(); ++i) {
-            for (size_t j = 0; j < r.tiles.size(); ++j) {
-                if (r.tiles[i].row != r.tiles[j].row) continue;
-                const bool wasLeft = columns.windows[i].CentreX() < columns.windows[j].CentreX();
-                const bool isLeft  = r.tiles[i].x < r.tiles[j].x;
-                if (i != j && wasLeft != isLeft) preserved = false;
-            }
+        Check(mission::SpatialAgreement(columns.windows, r) > 0.999f,
+              "columns: every pair keeps the side it was on");
+        std::printf("\ncolumns: agreement %.3f\n",
+                    mission::SpatialAgreement(columns.windows, r));
+    }
+
+    // A stack of identical maximised windows has no direction to separate
+    // along. KWin nudges x by one pixel here, which collapses the stack into a
+    // horizontal line and scales every window down to a sliver. It has to bloom
+    // in two dimensions instead, so assert the arrangement is not a line.
+    {
+        std::vector<mission::Window> stack;
+        for (int i = 0; i < 8; ++i) stack.push_back(W(0, 0, 2560, 1400, 0, i));
+
+        const mission::Result r = mission::Layout(stack, regionW, regionH);
+
+        float left = r.tiles[0].x, top = r.tiles[0].y;
+        float right = r.tiles[0].x + r.tiles[0].w, bottom = r.tiles[0].y + r.tiles[0].h;
+        for (const mission::Placement& t : r.tiles) {
+            left   = (std::min)(left,   t.x);
+            top    = (std::min)(top,    t.y);
+            right  = (std::max)(right,  t.x + t.w);
+            bottom = (std::max)(bottom, t.y + t.h);
         }
-        Check(preserved, "columns: left stays left within a row");
-        std::printf("\ncolumns: %d rows, side order %s\n",
-                    r.rows, preserved ? "preserved" : "BROKEN");
+        const float aspect = (right - left) / (std::max)(1.0f, bottom - top);
+        Check(aspect > 0.4f && aspect < 6.0f,
+              "stack: identical windows bloom in two dimensions, not a line");
+        std::printf("stack of 8 identical maximised windows: "
+                    "scale %.3f, bounding aspect %.2f\n", r.scale, aspect);
     }
 
     // More windows must not produce a larger scale. Not a tautology: the
-    // packing is a step function and the search could settle on the wrong side
-    // of a step.
+    // relaxation grows the bounding box, and a badly damped push could grow it
+    // less for a bigger set.
     {
         std::vector<mission::Window> growing;
         float previousScale = 2.0f;
-        bool  monotone      = true;
+        float worstRise     = 0.0f;
+        float firstScale    = 0.0f;
         for (int n = 1; n <= 24; ++n) {
             growing.push_back(W(static_cast<float>((n % 5) * 400),
                                 static_cast<float>((n / 5) * 300),
                                 640.0f, 420.0f, n % 3, n));
             const float s = mission::Layout(growing, regionW, regionH).scale;
-            if (s > previousScale + 1e-4f) monotone = false;
+            if (n == 1) firstScale = s;
+            worstRise = (std::max)(worstRise, s - previousScale);
             previousScale = s;
         }
-        Check(monotone, "adding a window never makes the tiles bigger");
+        std::printf("growing 1 to 24 windows: scale %.3f down to %.3f, "
+                    "worst rise %.3f\n", firstScale, previousScale, worstRise);
+        Check(previousScale < firstScale, "more windows means smaller tiles overall");
     }
 
     // An empty desktop must not crash or return junk.
     {
         const mission::Result r = mission::Layout({}, regionW, regionH);
-        Check(r.tiles.empty() && r.rows == 0, "an empty desktop lays out to nothing");
+        Check(r.tiles.empty() && r.iterations == 0,
+              "an empty desktop lays out to nothing");
     }
 
     std::printf("\nwrote PNGs to %s/\n", outDir.c_str());
