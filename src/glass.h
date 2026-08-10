@@ -35,12 +35,40 @@ inline constexpr float kLumaR = 0.2126f;
 inline constexpr float kLumaG = 0.7152f;
 inline constexpr float kLumaB = 0.0722f;
 
+// Backdrop blur, in logical pixels at 96 DPI.
+//
+// Here rather than in panel.cpp because it is the single most visually decisive
+// number in the material, and the preview has to use the same one. Sharing it by
+// comment, which is what this was, means it drifts the first time anybody retunes
+// it on the Windows side.
+//
+// The macOS switcher's backdrop is unrecognisable mush. 34 left window edges
+// readable through the glass, which gives it away immediately as a blurred
+// screenshot rather than a material.
+inline constexpr float kBlurSigma = 52.0f;
+
+// Downsample before blurring. A 52px sigma at quarter resolution costs what a
+// 13px sigma costs, and after the matching upscale the difference is invisible
+// under a tint. The preview blurs at full resolution instead, which is the same
+// picture for more work; it has no frame budget.
+inline constexpr float kBlurDownscale = 0.25f;
+
 struct Params {
     float saturation;   // s, > 1 boosts. 1 is identity.
     float gain;         // g, multiplies the backdrop's luma range
     float bias;         // b, added after the gain, lifting the black point
 
     float tint[4];      // straight RGBA over the treated backdrop, 0..1
+
+    // Alpha for the base coat used when there is no captured frame at all: a
+    // wedged GPU, a remote session, a capture that missed its deadline.
+    //
+    // Without this the fallback is the tint on its own, and at 0.27 that is a
+    // 27% film over the sharp live desktop with tiles and a label floating on
+    // top of nothing. 0.1.0 got away with no fallback because its tint was 0.55
+    // and half-opaque on its own. It has to be a separate number now, and the
+    // machines that hit this path are exactly the ones nobody is testing on.
+    float fallbackAlpha;
 
     // The rim. A single flat hairline reads as a border; the glass reads as
     // glass when the top edge catches more light than the bottom.
@@ -93,14 +121,16 @@ struct Params {
 inline constexpr Params kDark{
     1.37f, 0.80f, 0.02f,
     { 0.09f, 0.09f, 0.11f, 0.27f },
+    0.80f,
     0.34f, 0.08f, 0.0f
 };
 
 // Light. Lower gain and a much higher bias: the backdrop is being lifted into a
 // bright panel rather than pushed down into a dark one.
 inline constexpr Params kLight{
-    1.45f, 0.70f, 0.06f,
+    1.47f, 0.70f, 0.06f,
     { 0.97f, 0.97f, 0.98f, 0.32f },
+    0.82f,
     0.65f, 0.18f, 0.08f
 };
 

@@ -192,17 +192,19 @@ void Load() {
 }
 
 bool SetPanelDisplay(PanelDisplay display) {
+    // Apply first, persist second. Failing to write is a reason to lose the
+    // setting on the next launch, not a reason to ignore what the user just
+    // clicked, and that has to hold for the no-settings-file case too.
+    g_settings.panelDisplay = display;
+
     if (g_settingsPath.empty()) {
-        MACTAB_WARN("config: no settings file, cannot persist PanelDisplay");
+        MACTAB_WARN("config: no settings file, PanelDisplay will not survive a restart");
         return false;
     }
 
     const BOOL ok = ::WritePrivateProfileStringW(kSection, L"PanelDisplay",
                                                  PanelDisplayKeyword(display),
                                                  g_settingsPath.c_str());
-    // Apply it either way. Failing to write is a reason to lose the setting on
-    // the next launch, not a reason to ignore what the user just clicked.
-    g_settings.panelDisplay = display;
 
     MACTAB_DIAG("config: panelDisplay -> %s (%s)",
                 ToUtf8(PanelDisplayKeyword(display)).c_str(), ok ? "saved" : "not saved");
@@ -211,14 +213,16 @@ bool SetPanelDisplay(PanelDisplay display) {
 
 bool SetTheme(const wchar_t* value) {
     if (!value) return false;
+
+    g_settings.theme = value;   // same order, same reason, see SetPanelDisplay
+
     if (g_settingsPath.empty()) {
-        MACTAB_WARN("config: no settings file, cannot persist Theme");
+        MACTAB_WARN("config: no settings file, Theme will not survive a restart");
         return false;
     }
 
     const BOOL ok = ::WritePrivateProfileStringW(kSection, L"Theme", value,
                                                  g_settingsPath.c_str());
-    g_settings.theme = value;
 
     MACTAB_DIAG("config: theme -> %s (%s)", ToUtf8(value).c_str(),
                 ok ? "saved" : "not saved");

@@ -286,8 +286,9 @@ void Blur(Bitmap& image, float sigma) {
 void ApplyMaterial(Bitmap& image, const glass::Params& p) {
     const glass::Matrix5x4 m = glass::BuildMatrix(p);
 
-    auto clamp255 = [](float v) {
-        return static_cast<uint8_t>(v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v));
+    auto to255 = [](float v) {
+        const float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+        return static_cast<uint8_t>(c * 255.0f + 0.5f);
     };
 
     for (uint32_t& px : image.pixels) {
@@ -295,18 +296,26 @@ void ApplyMaterial(Bitmap& image, const glass::Params& p) {
         const float g = GreenOf(px) / 255.0f;
         const float b = BlueOf(px)  / 255.0f;
 
-        // CLAMP_OUTPUT is on in panel.cpp, so clamp here too: saturation above
-        // 1 drives strongly coloured pixels negative in one channel.
-        const float r2 = r * m.m[0][0] + g * m.m[1][0] + b * m.m[2][0] + m.m[4][0];
-        const float g2 = r * m.m[0][1] + g * m.m[1][1] + b * m.m[2][1] + m.m[4][1];
-        const float b2 = r * m.m[0][2] + g * m.m[1][2] + b * m.m[2][2] + m.m[4][2];
+        // D2D1_COLORMATRIX_PROP_CLAMP_OUTPUT is on in panel.cpp, so the clamp
+        // happens HERE, on the matrix result, before the tint is composited over
+        // it. Clamping only the final pixel instead is not the same operation:
+        // a saturation of 1.37 pushes a pure red past 1.0 and drives the
+        // opposing channels below 0, and mixing those out-of-range values with
+        // the tint carries a fraction (1 - a) of the overshoot into the result.
+        // On the deliberately saturated test wallpaper below, that is exactly
+        // the pixels the numbers were chosen by looking at.
+        auto unit = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
+
+        const float r2 = unit(r * m.m[0][0] + g * m.m[1][0] + b * m.m[2][0] + m.m[4][0]);
+        const float g2 = unit(r * m.m[0][1] + g * m.m[1][1] + b * m.m[2][1] + m.m[4][1]);
+        const float b2 = unit(r * m.m[0][2] + g * m.m[1][2] + b * m.m[2][2] + m.m[4][2]);
 
         // Straight "over" with the tint, which is what FillRectangle does on top
         // of the treated backdrop.
         const float a = p.tint[3];
-        px = MakePixel(clamp255((r2 * (1.0f - a) + p.tint[0] * a) * 255.0f),
-                       clamp255((g2 * (1.0f - a) + p.tint[1] * a) * 255.0f),
-                       clamp255((b2 * (1.0f - a) + p.tint[2] * a) * 255.0f),
+        px = MakePixel(to255(r2 * (1.0f - a) + p.tint[0] * a),
+                       to255(g2 * (1.0f - a) + p.tint[1] * a),
+                       to255(b2 * (1.0f - a) + p.tint[2] * a),
                        255);
     }
 }
@@ -387,7 +396,7 @@ Bitmap RenderPanel(const glass::Params& material, const Case* cases, int caseCou
     // equivalent to capturing panel-plus-margin and blurring that, which is
     // what StartCapture does, and avoids reimplementing the margin logic.
     Bitmap blurred = canvas;
-    Blur(blurred, 52.0f);   // kBlurSigma
+    Blur(blurred, glass::kBlurSigma);
 
     Bitmap body = Bitmap::Create(panelW, panelH);
     for (int y = 0; y < panelH; ++y)

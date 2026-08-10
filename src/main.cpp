@@ -417,7 +417,9 @@ void ShowTrayMenu(HWND hwnd, POINT screenPt) {
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
     if (HMENU settings = CreateSettingsMenu()) {
-        ::AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(settings), L"Settings");
+        // Ownership only transfers on success; on failure it is still ours.
+        if (!::AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(settings), L"Settings"))
+            ::DestroyMenu(settings);
     }
 
     ::AppendMenuW(menu, MF_STRING | (hotkey::IsRunning() ? 0u : MF_DISABLED),

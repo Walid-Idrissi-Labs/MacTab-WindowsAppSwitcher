@@ -46,15 +46,10 @@ constexpr wchar_t kPanelClass[] = L"MacTabPanelWindow";
 // real geometry natively. Only the rendering-specific constants stay here.
 constexpr float kShadowSigma = 22.0f;
 
-// The macOS switcher's backdrop is unrecognisable mush. 34 left window edges
-// readable through the glass, which immediately gives it away as a blurred
-// screenshot rather than a material.
-constexpr float kBlurSigma = 52.0f;
-
-// Downsample factor before blurring. A 52px sigma at quarter resolution costs
-// what a 13px sigma costs, and after the matching upscale the difference is
-// invisible under a tint.
-constexpr float kBlurDownscale = 0.25f;
+// kBlurSigma and kBlurDownscale live in glass.h with the rest of the material,
+// so tools/preview reads the same numbers instead of a comment claiming it does.
+using glass::kBlurDownscale;
+using glass::kBlurSigma;
 
 // Extra desktop captured around the panel so the blur has real pixels to pull
 // from instead of clamping at the edge under D2D1_BORDER_MODE_HARD.
@@ -151,6 +146,8 @@ struct Panel::Impl {
     WUC::CompositionDrawingSurface backdropSurface{ nullptr };
     WUC::CompositionDrawingSurface labelSurface{ nullptr };
     WUC::CompositionSurfaceBrush   shadowBrush{ nullptr };
+    WUC::CompositionNineGridBrush  shadowNine{ nullptr };
+    float                          shadowCellPx = 0.0f;
 
     std::vector<WUC::SpriteVisual> tileVisuals;
 
@@ -197,7 +194,12 @@ struct Panel::Impl {
     capture::Frame              lastFrame;   // reused when relaying out while visible
 
     void Layout(int count);
-    void BakeShadow();
+
+    // False if it bailed without rebuilding the brush. The caller must NOT then
+    // record it as freshly baked, or Layout's re-bake check will match and the
+    // shadow stays attached to a surface from a device that no longer exists.
+    bool BakeShadow();
+    void FitShadowInsets(float destWidth, float destHeight);
     void BakeSelection();
     void StartCapture();
     void BakeBackdrop();
@@ -490,9 +492,10 @@ bool Panel::Initialize(HINSTANCE instance, HWND notifyWindow,
 
     // Pre-bake at 100% so the common case is warm; Layout re-bakes if the
     // panel lands on a monitor with a different scale.
-    impl.BakeShadow();
-    impl.bakedShadowScale  = impl.dpiScale;
-    impl.bakedShadowRadius = impl.panelRadiusPx;
+    if (impl.BakeShadow()) {
+        impl.bakedShadowScale  = impl.dpiScale;
+        impl.bakedShadowRadius = impl.panelRadiusPx;
+    }
 
     impl.ready = true;
     MACTAB_DIAG("panel: initialised and pre-warmed");
@@ -533,6 +536,7 @@ void Panel::Shutdown() {
         impl.backdropSurface = nullptr;
         impl.labelSurface    = nullptr;
         impl.shadowBrush     = nullptr;
+        impl.shadowNine      = nullptr;
 
         impl.target     = nullptr;
         impl.graphics    = nullptr;
@@ -584,6 +588,7 @@ void Panel::Impl::RecoverDevices() {
     backdropSurface = nullptr;
     labelSurface    = nullptr;
     shadowBrush     = nullptr;
+    shadowNine      = nullptr;
 
     if (!CreateDevices()) {
         MACTAB_FAIL("panel: could not rebuild the graphics device; panel disabled");
@@ -592,9 +597,14 @@ void Panel::Impl::RecoverDevices() {
     }
 
     try {
-        BakeShadow();
-        bakedShadowScale  = dpiScale;
-        bakedShadowRadius = panelRadiusPx;
+        if (BakeShadow()) {
+            bakedShadowScale  = dpiScale;
+            bakedShadowRadius = panelRadiusPx;
+        } else {
+            shadowVisual.Brush(nullptr);
+            bakedShadowScale  = 0.0f;
+            bakedShadowRadius = -1.0f;
+        }
         BakeSelection();
     } catch (const winrt::hresult_error& e) {
         MACTAB_FAIL("panel: re-baking after device loss threw 0x%08lX",
@@ -615,22 +625,24 @@ void Panel::Impl::RecoverDevices() {
 // compositor whenever the shadow's size changes, at a cost we cannot see or
 // bound. This is one textured quad per frame instead.
 //
-// KNOWN, and left alone deliberately for 0.2.
+// The insets have to be scaled to fit, and that is not optional at this radius.
 //
-// A nine-grid cell has to cover the corner plus the blur's reach, radius + 3
-// sigma, which at the new 62px radius is 128 logical pixels. The panel is 200
-// tall in the common case and 112 at the minimum tile size, so two cells no
-// longer fit vertically and Composition scales the insets down to make them,
-// which compresses the shadow's corners. Behind a 42% alpha shape blurred at
-// sigma 22 that is not something you can see, and at radius 24 it did not
-// arise in the common case, only with 30-odd apps open.
+// A cell covers the corner plus the blur's reach, radius + 3 sigma, which at 62
+// is 128 logical pixels, so the two vertical insets come to 256. The shadow
+// visual is panelHeight + sigma tall, which is 222 for the default tile size and
+// 134 at the minimum, and the width is only 194 when a single app is left. In
+// every one of those cases the insets exceed the extent they are dividing, which
+// is the degenerate nine-grid case: the brush does not render, or the corner
+// cells overlap in the middle of the panel.
 //
-// The correct fix is a horizontal-only nine-grid: bake the source at the real
-// panel height and stretch only the width, since width is the only dimension
-// that varies with the number of apps. That is a redesign of a surface nothing
-// on this machine can render, so it is not going in the same release as the
-// radius change that exposed it.
-void Panel::Impl::BakeShadow() {
+// At the old 24px radius the cell was 90 and the insets 180, which fitted, so
+// none of this was reachable. Raising the radius crossed the threshold, and the
+// preview cannot see it because it does not draw the shadow at all.
+//
+// So Layout scales the insets down to whatever does fit. The cost is a shadow
+// corner compressed by up to about 15%, which behind a 42% alpha shape blurred
+// at sigma 22 is nothing.
+bool Panel::Impl::BakeShadow() {
     const float sigma  = Scaled(kShadowSigma);
     const float radius = panelRadiusPx;
     const int   cell   = static_cast<int>(std::ceil(radius + 3.0f * sigma));
@@ -646,7 +658,7 @@ void Panel::Impl::BakeShadow() {
         SurfaceDraw draw(surface);
         if (!draw.ok) {
             MACTAB_WARN("panel: shadow BeginDraw failed");
-            return;
+            return false;
         }
 
         draw.dc->Clear(D2D1::ColorF(0, 0, 0, 0));
@@ -663,7 +675,7 @@ void Panel::Impl::BakeShadow() {
         if (FAILED(d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
                                                   silhouetteDc.Put()))) {
             MACTAB_WARN("panel: could not create a device context for the shadow");
-            return;
+            return false;
         }
 
         ComPtr<ID2D1Bitmap1> silhouette;
@@ -673,7 +685,7 @@ void Panel::Impl::BakeShadow() {
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
 
         if (FAILED(silhouetteDc->CreateBitmap(pixelSize, nullptr, 0, &props, silhouette.Put())))
-            return;
+            return false;
 
         // Same exponent as the backdrop. A shadow traced with a different corner
         // shape than the glass it sits under peeks out at the corners.
@@ -681,7 +693,7 @@ void Panel::Impl::BakeShadow() {
                                                static_cast<float>(size - 4),
                                                static_cast<float>(size - 4), radius,
                                                layout::kPanelCornerExponent);
-        if (!geometry) return;
+        if (!geometry) return false;
 
         silhouetteDc->SetTarget(silhouette.Get());
         silhouetteDc->BeginDraw();
@@ -695,7 +707,7 @@ void Panel::Impl::BakeShadow() {
 
         if (FAILED(silhouetteDc->EndDraw())) {
             MACTAB_WARN("panel: shadow silhouette EndDraw failed");
-            return;
+            return false;
         }
         silhouetteDc->SetTarget(nullptr);
 
@@ -712,10 +724,32 @@ void Panel::Impl::BakeShadow() {
 
     shadowBrush = compositor.CreateSurfaceBrush(surface);
 
-    auto nine = compositor.CreateNineGridBrush();
-    nine.Source(shadowBrush);
-    nine.SetInsets(static_cast<float>(cell));
-    shadowVisual.Brush(nine);
+    shadowNine = compositor.CreateNineGridBrush();
+    shadowNine.Source(shadowBrush);
+    shadowNine.SetInsets(static_cast<float>(cell));
+    shadowCellPx = static_cast<float>(cell);
+    shadowVisual.Brush(shadowNine);
+
+    // Layout owns the inset scale, because only it knows the destination size.
+    return true;
+}
+
+// Shrink the nine-grid's insets until they fit the visual they are dividing.
+//
+// A nine-grid needs a middle. If twice the inset reaches or exceeds the
+// destination extent there is nothing left to stretch, and the brush either
+// fails to render or overlaps its own corner cells across the panel. See the
+// arithmetic above BakeShadow for why that is now the normal case rather than a
+// corner case.
+void Panel::Impl::FitShadowInsets(float destWidth, float destHeight) {
+    if (!shadowNine || shadowCellPx <= 0.0f) return;
+
+    // 0.98 rather than 1.0: leave a sliver of middle rather than landing
+    // exactly on the degenerate boundary.
+    const float room  = (std::min)(destWidth, destHeight) * 0.98f;
+    const float scale = (std::min)(1.0f, room / (2.0f * shadowCellPx));
+
+    shadowNine.SetInsetScales(scale);
 }
 
 // Kick the desktop grab off the UI thread.
@@ -749,8 +783,19 @@ void Panel::Impl::StartCapture() {
 // squircle icons reads immediately as wrong. The highlight needs the same
 // rounded shape, and it has to resize as the tile size changes, so it is baked
 // once as a squircle and stretched with a nine-grid, exactly like the shadow.
+//
+// The radius follows the ACTUAL tile size, not the nominal one. Reading
+// layout::kTileSize meant the highlight kept a 28px corner while the tiles it
+// sits behind shrank to 40, which is the wrong shape and, worse, made the
+// highlight's own nine-grid degenerate: two insets of ~31 will not divide a
+// visual only 45 across. SetItems re-bakes this every gesture, so tracking the
+// real size costs nothing.
+//
+// Exponent stays at the default 5. This belongs to the icons' shape language,
+// not the panel's.
 void Panel::Impl::BakeSelection() {
-    const float radius = Scaled(layout::kTileSize) * 0.22f;
+    const float tile   = (tilePx > 0.0f) ? tilePx : Scaled(layout::kTileSize);
+    const float radius = tile * 0.22f;
     const int   cell   = static_cast<int>(std::ceil(radius)) + 2;
     const int   size   = cell * 2 + 4;
 
@@ -785,6 +830,13 @@ void Panel::Impl::BakeSelection() {
     auto nine = compositor.CreateNineGridBrush();
     nine.Source(compositor.CreateSurfaceBrush(surface));
     nine.SetInsets(static_cast<float>(cell));
+
+    // The highlight is tile * (1 + 2 * kSelectionInset) across, so belt and
+    // braces against the same degenerate case the shadow hits: two insets must
+    // leave a middle.
+    const float destination = tile * (1.0f + 2.0f * layout::kSelectionInset);
+    nine.SetInsetScales((std::min)(1.0f, destination * 0.98f / (2.0f * cell)));
+
     selectionVisual.Brush(nine);
 }
 
@@ -897,6 +949,26 @@ void Panel::Impl::BakeBackdrop() {
         }
         pendingCapture = {};
     }
+
+    // A relayout while the panel is already up reuses the frame captured at
+    // gesture begin, and that frame only covers the panel as it was then.
+    // Expanding an app with more windows than there are apps makes the panel
+    // WIDER, and because the blur runs with D2D1_BORDER_MODE_HARD the effect's
+    // output rect is exactly its input rect: it does not extend. The strips
+    // beyond the old capture would get no backdrop at all, just tint over
+    // nothing, visibly two-toned against the blurred middle.
+    //
+    // Re-capturing is not an option, our own panel is on screen by then, so
+    // drop to the flat fallback instead. Shrinking is fine and stays blurred.
+    if (!lastFrame.pixels.Empty() &&
+        (panelRect.left   < lastFrame.bounds.left  ||
+         panelRect.top    < lastFrame.bounds.top   ||
+         panelRect.right  > lastFrame.bounds.right ||
+         panelRect.bottom > lastFrame.bounds.bottom)) {
+        MACTAB_WARN("panel: relayout grew past the captured region, using the flat fallback");
+        lastFrame = {};
+    }
+
     const capture::Frame& frame = lastFrame;
 
     {
@@ -995,6 +1067,23 @@ void Panel::Impl::BakeBackdrop() {
 
         const D2D1_RECT_F panelArea =
             D2D1::RectF(0, 0, static_cast<float>(width), static_cast<float>(height));
+
+        // No backdrop at all: lay down an opaque base coat first.
+        //
+        // The tint on its own is 27% dark, which over a sharp live desktop
+        // leaves the tiles and the label floating on essentially nothing. 0.1.0
+        // never needed this because its tint was 0.55 and stood up alone. The
+        // machines that reach this path (a wedged GPU, a remote session, a
+        // capture that missed its deadline) are exactly the ones nobody tests.
+        if (frame.pixels.Empty()) {
+            const D2D1_COLOR_F tint = TintColour(theme);
+            ComPtr<ID2D1SolidColorBrush> base;
+            if (SUCCEEDED(draw.dc->CreateSolidColorBrush(
+                    D2D1::ColorF(tint.r, tint.g, tint.b, theme.material.fallbackAlpha),
+                    base.Put()))) {
+                draw.dc->FillRectangle(panelArea, base.Get());
+            }
+        }
 
         ComPtr<ID2D1SolidColorBrush> tintBrush;
         draw.dc->CreateSolidColorBrush(TintColour(theme), tintBrush.Put());
@@ -1268,21 +1357,39 @@ void Panel::Impl::Layout(int count) {
     content.Offset({ shadowMarginPx, shadowMarginPx, 0.0f });
     content.Size({ panelWidth, panelHeight });
 
+    const float shadowWidth  = panelWidth  + Scaled(kShadowSigma);
+    const float shadowHeight = panelHeight + Scaled(kShadowSigma);
+
     shadowVisual.Offset({ shadowMarginPx - Scaled(kShadowSigma) * 0.5f,
                           shadowMarginPx - Scaled(kShadowSigma) * 0.5f + Scaled(8.0f),
                           0.0f });
-    shadowVisual.Size({ panelWidth + Scaled(kShadowSigma), panelHeight + Scaled(kShadowSigma) });
+    shadowVisual.Size({ shadowWidth, shadowHeight });
 
     // The shadow is baked from dpiScale, which is only known once a monitor has
     // been chosen, and from the corner radius, which layout::Compute can clamp
     // without the DPI moving at all. Re-bake when either changes rather than
     // keeping the 96 DPI version baked at startup.
+    //
+    // Only record it as baked if it actually was. BakeShadow has several
+    // non-throwing bail-outs, and recording a failure would make this check
+    // match forever, leaving the shadow pointed at a surface from a device that
+    // no longer exists.
     if (std::fabs(dpiScale - bakedShadowScale) > 0.01f ||
         std::fabs(panelRadiusPx - bakedShadowRadius) > 0.5f) {
-        BakeShadow();
-        bakedShadowScale  = dpiScale;
-        bakedShadowRadius = panelRadiusPx;
+        if (BakeShadow()) {
+            bakedShadowScale  = dpiScale;
+            bakedShadowRadius = panelRadiusPx;
+        } else {
+            // Better no shadow than one drawn from a surface we no longer own.
+            shadowVisual.Brush(nullptr);
+            bakedShadowScale  = 0.0f;
+            bakedShadowRadius = -1.0f;
+        }
     }
+
+    // Every layout, not only after a re-bake: the panel's width changes with the
+    // app count while the baked cell stays put.
+    FitShadowInsets(shadowWidth, shadowHeight);
 
     // Last line on purpose. Everything above can throw (device loss), and
     // recording the count earlier would let SetItems skip the re-layout after a
