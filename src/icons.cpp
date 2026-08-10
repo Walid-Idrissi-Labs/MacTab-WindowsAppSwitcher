@@ -313,10 +313,23 @@ void WorkerMain() {
             }
         }
 
-        if (!tile.Empty()) {
-            Remember(key, std::move(tile));
+        // Record the outcome either way.
+        //
+        // An app whose icon genuinely cannot be extracted caches an empty tile
+        // on purpose: Acquire then reports a cache hit, the panel keeps drawing
+        // its placeholder, and the request is not re-queued on every single
+        // gesture for the rest of the session. Leaving it unrecorded would pin
+        // the in-flight marker forever, which is the same "never retried" result
+        // but arrived at by accident and invisible in the log.
+        const bool produced = !tile.Empty();
+        Remember(key, std::move(tile));
+
+        if (produced) {
             if (g_notifyWindow)
                 ::PostMessageW(g_notifyWindow, g_notifyMessage, 0, 0);
+        } else {
+            MACTAB_WARN("icons: caching empty tile for %s; it will render as a placeholder",
+                        ToUtf8(request.key).c_str());
         }
     }
 }

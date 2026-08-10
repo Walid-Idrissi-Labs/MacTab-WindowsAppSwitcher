@@ -7,6 +7,9 @@
 #include <dxgi1_2.h>
 #include <shellscalingapi.h>
 
+#include <future>
+#include <thread>
+
 #include <DispatcherQueue.h>
 #include <windows.ui.composition.interop.h>
 
@@ -133,8 +136,13 @@ struct Panel::Impl {
     bool CreateWindow();
     bool CreateVisualTree();
 
+    // The captured desktop frame, in flight. Started when the gesture begins and
+    // consumed when the panel is actually revealed.
+    std::future<capture::Frame> pendingCapture;
+
     void Layout();
     void BakeShadow();
+    void StartCapture();
     void BakeBackdrop();
     void BakeLabel();
     void PositionTiles(bool animate);
@@ -437,6 +445,29 @@ void Panel::Impl::BakeShadow() {
     shadowVisual.Brush(nine);
 }
 
+// Kick the desktop grab off the UI thread.
+//
+// This is started at gesture BEGIN and consumed at reveal, which matters for
+// two reasons. Capturing synchronously would put a full screen grab plus a
+// Gaussian blur on the reveal path and blow the one-frame budget outright. Worse,
+// BEGIN fires on the first Tab — before the hold delay has decided whether the
+// panel will appear at all — so a synchronous capture would make every quick
+// Alt+Tab, the single most common operation, pay for a backdrop nobody ever sees.
+//
+// A packaged_task rather than std::async: a future from std::async blocks in its
+// own destructor until the task completes, which would reintroduce exactly the
+// stall this exists to avoid whenever a capture is abandoned.
+void Panel::Impl::StartCapture() {
+    RECT captureRect = panelRect;
+    ::InflateRect(&captureRect, kBlurMarginPx, kBlurMarginPx);
+
+    auto task = std::make_shared<std::packaged_task<capture::Frame()>>(
+        [captureRect] { return capture::GrabRegion(captureRect); });
+
+    pendingCapture = task->get_future();
+    std::thread([task] { (*task)(); }).detach();
+}
+
 // ---------------------------------------------------------------------------
 // Backdrop
 //
@@ -455,11 +486,19 @@ void Panel::Impl::BakeBackdrop() {
         winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
         winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
 
-    // Capture the panel's neighbourhood, inflated so the blur has real pixels
-    // at the edges instead of clamping.
-    RECT captureRect = panelRect;
-    ::InflateRect(&captureRect, kBlurMarginPx, kBlurMarginPx);
-    const capture::Frame frame = capture::GrabRegion(captureRect);
+    // Collect the frame started at gesture begin. It has had the whole hold
+    // delay to finish, so in practice this never waits — but it is bounded
+    // anyway, because a wedged GPU must degrade to a flat tint rather than
+    // stall the reveal.
+    capture::Frame frame;
+    if (pendingCapture.valid()) {
+        if (pendingCapture.wait_for(std::chrono::milliseconds(10)) ==
+            std::future_status::ready) {
+            frame = pendingCapture.get();
+        } else {
+            MACTAB_WARN("panel: capture not ready at reveal, using flat tint");
+        }
+    }
 
     {
         SurfaceDraw draw(backdropSurface);
@@ -799,7 +838,7 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
                     static_cast<uint8_t>(impl.theme.selection.b * 255) }));
 
     impl.PositionTiles(false);
-    impl.BakeBackdrop();
+    impl.StartCapture();
     impl.BakeLabel();
 }
 
@@ -827,6 +866,9 @@ void Panel::UpdateIcon(const std::wstring& key, const Bitmap& icon) {
 void Panel::Show() {
     Impl& impl = *m_impl;
     if (!impl.ready || impl.visible) return;
+
+    // Compose the glass now, from the frame captured when the gesture started.
+    impl.BakeBackdrop();
 
     // SW_SHOWNA: show without activating, so the panel never becomes the
     // foreground window and never competes with the window we are about to
@@ -864,6 +906,12 @@ void Panel::Hide() {
     impl.root.Opacity(0.0f);
     ::ShowWindow(impl.hwnd, SW_HIDE);
     impl.visible = false;
+
+    // Abandon any capture that was still in flight. The detached thread
+    // finishes harmlessly; dropping the future here keeps a stale frame from
+    // being used by the next gesture.
+    if (impl.pendingCapture.valid())
+        impl.pendingCapture = {};
 }
 
 int Panel::HitTest(POINT screenPoint) const {
