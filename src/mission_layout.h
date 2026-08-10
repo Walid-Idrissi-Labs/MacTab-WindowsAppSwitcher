@@ -466,11 +466,11 @@ struct SpaceChip {
 // after the last one, inside the same centred run, so the strip stays centred
 // as desktops come and go rather than shifting every time.
 inline std::vector<SpaceChip> LayoutSpaces(int count, float stripW, float stripH,
-                                           float screenAspect, float gap) {
+                                           float chipH, float screenAspect, float gap) {
     std::vector<SpaceChip> chips;
-    if (count <= 0 || stripW <= 0.0f || stripH <= 0.0f) return chips;
+    if (count <= 0 || stripW <= 0.0f || stripH <= 0.0f || chipH <= 0.0f) return chips;
 
-    const float height = stripH;
+    const float height = chipH;
     const float width  = height * ((screenAspect > 0.1f) ? screenAspect : 1.6f);
 
     const float total = width * static_cast<float>(count) + height +

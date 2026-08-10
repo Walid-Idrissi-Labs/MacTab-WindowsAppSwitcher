@@ -60,7 +60,10 @@ public:
     // an empty desktop, exactly as macOS does with nothing open.
     void Show(HMONITOR monitor, std::vector<MissionItem> items,
               std::vector<MissionSpace> spaces);
-    void Hide();
+    // `restoreFocus` puts foreground back where it was before the overlay took
+    // it. Pass false when the caller is about to activate something itself, so
+    // the old window does not flash up in between.
+    void Hide(bool restoreFocus = true);
     bool Visible() const;
 
     // The window behind tile `index`, or null. Read before Hide(), which throws

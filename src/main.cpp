@@ -487,7 +487,11 @@ void ActivateFromMission(int index) {
     // The items live inside the overlay, which is about to throw them away, so
     // the handle is read before hiding.
     const HWND target = g_app.mission.ItemWindow(index);
-    CloseMission();
+
+    // Hidden without putting focus back where it was, because it is about to go
+    // somewhere else entirely. Restoring first would hand foreground to the old
+    // window for a frame and show as a flash of the wrong app.
+    g_app.mission.Hide(false);
 
     if (target && ::IsWindow(target)) {
         MACTAB_DIAG("mission: activating %p", static_cast<void*>(target));

@@ -53,6 +53,10 @@ constexpr float kTitleGap          = 10.0f;
 // 4K display.
 constexpr float kBackdropDownscale = 0.25f;
 
+// How long the snapshot tier may spend before the rest of the windows become
+// cards instead. Only reached when the shared-visual path is unavailable.
+constexpr double kSnapshotBudgetMs = 400.0;
+
 struct Theme {
     D2D1_COLOR_F backdropTint;
     D2D1_COLOR_F chip;
@@ -466,11 +470,15 @@ bool Mission::Initialize(HINSTANCE instance, HWND notifyWindow,
     impl.spaceMessage    = spaceMessage;
 
     try {
-        // The apartment, the dispatcher queue and the D3D/D2D devices all
-        // already exist: the panel created them at startup on this same thread.
-        // Constructing a second Compositor here would work and would be wrong,
-        // because a thumbnail visual can only be inserted into the tree of the
-        // compositor that produced the device DWM was given.
+        // A compositor of its own, on the thread the panel already put into an
+        // apartment and gave a dispatcher queue.
+        //
+        // Not shared with the panel, which would be the obvious economy, and
+        // the reason is the thumbnails: DWM is handed the DirectComposition
+        // device sitting behind a compositor and returns a visual that belongs
+        // to that compositor's tree. Device and tree have to be the same one,
+        // and the panel does not expose either. Two compositors on one thread
+        // is supported and costs a few hundred kilobytes.
         impl.compositor = WUC::Compositor();
     } catch (const winrt::hresult_error& e) {
         MACTAB_FAIL("mission: Compositor construction failed (0x%08lX)",
@@ -652,11 +660,10 @@ void Mission::Impl::BakeSpaces() {
 
     const float height = static_cast<float>(monitorRect.bottom - monitorRect.top);
     chips = mission::LayoutSpaces(static_cast<int>(spaces.size()), width, strip,
+                                  Scaled(kSpaceChipHeight),
                                   (height > 0.0f) ? width / height : 1.6f,
                                   Scaled(kSpaceChipGap));
 
-    // The chip height comes back from the layout, which may have squeezed it,
-    // so read it rather than assuming Scaled(kSpaceChipHeight).
     spacesSurface = graphics.CreateDrawingSurface(
         { width, strip },
         winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -802,12 +809,21 @@ void Mission::Impl::PositionSelection() {
     const RECT& rect = tiles[static_cast<size_t>(hovered)].screenRect;
     const float inset = Scaled(6.0f);
 
+    // Springing from wherever it was left is right between two tiles and wrong
+    // for the first one, where "wherever it was left" is the top left corner of
+    // the screen and the highlight would fly in from nothing.
+    const bool wasHidden = selectionVisual.Opacity() < 0.5f;
     selectionVisual.Opacity(1.0f);
     selectionVisual.Size({ static_cast<float>(rect.right - rect.left) + inset * 2,
                            static_cast<float>(rect.bottom - rect.top) + inset * 2 });
 
     const WFN::float3 destination{ static_cast<float>(rect.left) - inset,
                                    static_cast<float>(rect.top) - inset, 0.0f };
+
+    if (wasHidden) {
+        selectionVisual.Offset(destination);
+        return;
+    }
 
     auto spring = compositor.CreateSpringVector3Animation();
     spring.DampingRatio(0.85f);
@@ -930,6 +946,9 @@ void Mission::Impl::Build() {
 
     tiles.resize(items.size());
 
+    const double snapshotsStarted = NowMs();
+    int snapshots = 0, skipped = 0;
+
     for (size_t i = 0; i < items.size(); ++i) {
         const mission::Placement& place = result.tiles[i];
         Tile& tile = tiles[i];
@@ -986,11 +1005,21 @@ void Mission::Impl::Build() {
         // goes into the same surface, so the rest of the code does not care
         // which it got.
         if (!haveThumbnail) {
+            // Snapshots are taken on this thread, which is the thread that
+            // owes a frame, and each one is a fifty millisecond ping plus a
+            // full-size readback of somebody else's window. Thirty of those is
+            // seconds, so the tier gets a budget and everything past it gets a
+            // card. A late window is worse than a plain one.
             Bitmap content;
-            if (thumbnail::Current() != thumbnail::Tier::IconOnly)
+            if (thumbnail::Current() != thumbnail::Tier::IconOnly &&
+                NowMs() - snapshotsStarted < kSnapshotBudgetMs) {
                 content = thumbnail::Snapshot(items[i].hwnd,
                                               static_cast<int>(place.w),
                                               static_cast<int>(place.h));
+                ++snapshots;
+            } else if (thumbnail::Current() != thumbnail::Tier::IconOnly) {
+                ++skipped;
+            }
 
             tile.surface = graphics.CreateDrawingSurface(
                 { place.w, place.h },
@@ -1036,6 +1065,10 @@ void Mission::Impl::Build() {
             tile.holder.Children().InsertAtTop(tile.sprite);
         }
     }
+
+    if (skipped > 0)
+        MACTAB_WARN("mission: %d snapshot(s) taken in %.0f ms, %d window(s) fell "
+                    "back to cards", snapshots, NowMs() - snapshotsStarted, skipped);
 
     // The selection outline, sized per hover.
     selectionVisual.Brush(compositor.CreateColorBrush(
@@ -1141,7 +1174,7 @@ void Mission::Show(HMONITOR monitor, std::vector<MissionItem> items,
     }
 }
 
-void Mission::Hide() {
+void Mission::Hide(bool restoreFocus) {
     Impl& impl = *m_impl;
     if (!impl.visible && !impl.hwnd) return;
 
@@ -1163,10 +1196,10 @@ void Mission::Hide() {
     impl.chips.clear();
     impl.hovered = -1;
 
-    if (impl.restoreWindow && ::IsWindow(impl.restoreWindow)) {
+    if (restoreFocus && impl.restoreWindow && ::IsWindow(impl.restoreWindow))
         ::SetForegroundWindow(impl.restoreWindow);
-        impl.restoreWindow = nullptr;
-    }
+
+    impl.restoreWindow = nullptr;
 }
 
 } // namespace mactab
