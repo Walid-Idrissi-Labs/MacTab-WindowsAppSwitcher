@@ -1299,6 +1299,90 @@ void RunSelfChecks() {
         Check(OpaqueCoverage(empty) == 0.0, "fully transparent art has zero coverage");
     }
 
+    // Enlargement. Catmull-Rom has a negative lobe, so the thing to prove is
+    // that its overshoot cannot escape as a colour or an alpha out of range.
+    {
+        Bitmap block = Bitmap::Create(8, 8);
+        for (int y = 2; y < 6; ++y)
+            for (int x = 2; x < 6; ++x)
+                block.At(x, y) = MakePixel(255, 255, 255, 255);
+
+        const Bitmap big = Resize(block, 64, 64);
+        Check(big.width == 64 && big.height == 64, "enlargement returns the requested size");
+
+        // The block is white throughout, so every pixel visible enough to
+        // matter must still be white. Undershoot from the negative lobe
+        // surviving into the unpremultiply is what would show up here, as a
+        // grey or black rim around a white square.
+        int darkest = 255;
+        for (uint32_t p : big.pixels) {
+            if (AlphaOf(p) < 128) continue;
+            darkest = (std::min)(darkest, static_cast<int>(RedOf(p)));
+        }
+        Check(darkest >= 240, "enlarging a hard edge leaves no dark fringe");
+        Check(AlphaOf(big.At(32, 32)) == 255, "the middle of an enlarged block stays opaque");
+        Check(AlphaOf(big.At(0, 0)) == 0, "the outside of an enlarged block stays clear");
+
+        // A single row is a real shape for a wide mark cropped to its bounds,
+        // and the four-tap kernel has to clamp rather than read off the end.
+        Bitmap row = Bitmap::Create(4, 1);
+        for (int x = 0; x < 4; ++x) row.At(x, 0) = MakePixel(10, 20, 30, 255);
+        const Bitmap stretched = Resize(row, 16, 4);
+        Check(stretched.width == 16 && stretched.height == 4, "a 1px row enlarges");
+        Check(RedOf(stretched.At(8, 2)) == 10 && AlphaOf(stretched.At(8, 2)) == 255,
+              "enlarging a flat row changes nothing about it");
+    }
+
+    // Stripping a baked-in background, and the inputs that must come through
+    // untouched.
+    {
+        Bitmap transparent = Bitmap::Create(64, 64);
+        for (int y = 20; y < 44; ++y)
+            for (int x = 20; x < 44; ++x)
+                transparent.At(x, y) = MakePixel(200, 60, 60, 255);
+        const Bitmap before = transparent;
+        Check(!RemoveBorderFill(transparent).found,
+              "an icon that already has transparent borders is left alone");
+        Check(transparent.pixels == before.pixels, "and is not modified");
+
+        Bitmap flat = Bitmap::Create(64, 64);
+        for (uint32_t& p : flat.pixels) p = MakePixel(30, 120, 200, 255);
+        Check(!RemoveBorderFill(flat).found,
+              "an icon that is one flat colour end to end survives");
+        Check(OpaqueCoverage(flat) == 1.0, "and is still there afterwards");
+
+        Bitmap blank = Bitmap::Create(64, 64);
+        Check(!RemoveBorderFill(blank).found, "a fully transparent icon is left alone");
+
+        Bitmap tiny = Bitmap::Create(8, 8);
+        for (uint32_t& p : tiny.pixels) p = MakePixel(0, 0, 0, 255);
+        Check(!RemoveBorderFill(tiny).found, "an icon too small to judge is left alone");
+
+        // A mark that runs to the edge of the canvas is not padding, and a
+        // flood that ate it would leave nothing recognisable behind.
+        Bitmap bleeding = Bitmap::Create(64, 64);
+        for (uint32_t& p : bleeding.pixels) p = MakePixel(240, 240, 240, 255);
+        for (int y = 0; y < 64; ++y)
+            for (int x = 24; x < 40; ++x)
+                bleeding.At(x, y) = MakePixel(20, 20, 20, 255);
+        RemoveBorderFill(bleeding);
+        Check(RedOf(bleeding.At(32, 0)) == 20 && AlphaOf(bleeding.At(32, 0)) == 255,
+              "a mark running off the edge of the canvas is not treated as padding");
+
+        // The case this exists for: a small mark on padding, where almost the
+        // whole canvas has to go.
+        Bitmap padded = Bitmap::Create(64, 64);
+        for (uint32_t& p : padded.pixels) p = MakePixel(0, 0, 0, 255);
+        for (int y = 28; y < 36; ++y)
+            for (int x = 28; x < 36; ++x)
+                padded.At(x, y) = MakePixel(230, 120, 40, 255);
+        const BorderFill fill = RemoveBorderFill(padded);
+        Check(fill.found, "padding around a small mark is stripped");
+        Check(fill.removed > 0.9, "and nearly all of the canvas goes with it");
+        const Bounds left = OpaqueBounds(padded);
+        Check(left.Width() == 8 && left.Height() == 8, "leaving exactly the mark");
+    }
+
     // The squircle mask is symmetric and actually clips the corners.
     {
         const int size = 64;
