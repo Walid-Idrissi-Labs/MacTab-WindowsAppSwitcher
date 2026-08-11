@@ -33,6 +33,7 @@
 #include "glass.h"
 #include "glass_draw.h"
 #include "mission_layout.h"
+#include "panel_layout.h"
 #include "thumbnail.h"
 #include "wallpaper.h"
 
@@ -79,10 +80,24 @@ constexpr float kShadowSpread = 24.0f;
 constexpr float kShadowSigma  = 9.0f;
 constexpr float kShadowAlpha  = 0.45f;
 
-// The wallpaper is blurred at a quarter of the screen's resolution and the
-// visual stretches it back. At this radius the difference is invisible and it is
-// a sixteenth of the pixels, which matters on a 4K display.
-constexpr float kBackdropDownscale = 0.25f;
+// How much of the screen's resolution the backdrop is baked at, before the
+// visual stretches it back.
+//
+// Derived from the blur rather than fixed, because the blur is what made the
+// stretch invisible. macOS Mission Control does not blur the desktop at all: it
+// dims it and lifts the windows off. With the blur gone, a 4x bilinear upscale
+// of a photograph is plainly soft, and there is nothing left to hide it behind.
+//
+// The cost of that is real and worth stating: at native resolution the baked
+// backdrop is a screen-sized surface per display, which on a 4K monitor is about
+// 33 MB. MissionBlurSigma in settings.ini buys it back, at the price of a
+// backdrop that no longer looks like macOS.
+float BackdropScale() {
+    const float sigma = config::Current().missionBlurSigma;
+    if (sigma < 1.0f) return 1.0f;
+    if (sigma < 4.0f) return 0.5f;
+    return 0.25f;
+}
 
 // How long the snapshot tier may spend before the rest of the windows become
 // cards instead. Only reached when the shared-visual path is unavailable.
@@ -90,28 +105,31 @@ constexpr double kSnapshotBudgetMs = 400.0;
 
 struct Theme {
     D2D1_COLOR_F backdropTint;
-    D2D1_COLOR_F bar;
-    D2D1_COLOR_F barLine;
     D2D1_COLOR_F chip;
     D2D1_COLOR_F chipBorder;
     D2D1_COLOR_F text;
     D2D1_COLOR_F plate;
 };
 
+// The material the spaces bar is made of.
+//
+// Read from config rather than from the constants in glass.h, which is what
+// makes "Reload glass from settings.ini" reach Mission Control at all: the same
+// numbers the switcher's panel is tuned with, tuned once.
+glass::Params BarMaterial(bool light) {
+    return light ? config::Current().glassLight : config::Current().glassDark;
+}
+
 Theme MakeTheme(bool light) {
     Theme theme{};
     if (light) {
         theme.backdropTint = { 0.86f, 0.87f, 0.90f, 0.55f };
-        theme.bar          = { 0.97f, 0.97f, 0.99f, 0.55f };
-        theme.barLine      = { 0.10f, 0.10f, 0.12f, 0.14f };
         theme.chip         = { 1.00f, 1.00f, 1.00f, 0.42f };
         theme.chipBorder   = { 0.10f, 0.10f, 0.12f, 0.45f };
         theme.text         = { 0.08f, 0.08f, 0.10f, 1.00f };
         theme.plate        = { 1.00f, 1.00f, 1.00f, 0.78f };
     } else {
         theme.backdropTint = { 0.03f, 0.03f, 0.05f, 0.55f };
-        theme.bar          = { 0.06f, 0.06f, 0.08f, 0.52f };
-        theme.barLine      = { 1.00f, 1.00f, 1.00f, 0.12f };
         theme.chip         = { 1.00f, 1.00f, 1.00f, 0.16f };
         theme.chipBorder   = { 1.00f, 1.00f, 1.00f, 0.62f };
         theme.text         = { 0.96f, 0.96f, 0.98f, 1.00f };
@@ -135,6 +153,28 @@ bool ResolveLightTheme() {
     if (theme == L"light") return true;
     if (theme == L"dark")  return false;
     return SystemUsesLightTheme();
+}
+
+// Composite a flat colour over an opaque bitmap, in place.
+//
+// The dim, applied on the CPU because the strip the spaces bar refracts has to
+// arrive already dimmed: the material adapts to what is behind it, and what is
+// behind it on screen is a dimmed desktop rather than the wallpaper file.
+void Dim(Bitmap& image, const D2D1_COLOR_F& colour, float alpha) {
+    if (image.Empty() || alpha <= 0.0f) return;
+    alpha = (std::min)(1.0f, alpha);
+
+    const float keep = 1.0f - alpha;
+    const auto  mix  = [&](uint8_t channel, float over) {
+        return static_cast<uint32_t>(channel * keep + over * 255.0f * alpha + 0.5f);
+    };
+
+    for (uint32_t& pixel : image.pixels) {
+        pixel = MakePixel(static_cast<uint8_t>((std::min)(255u, mix(RedOf(pixel),   colour.r))),
+                          static_cast<uint8_t>((std::min)(255u, mix(GreenOf(pixel), colour.g))),
+                          static_cast<uint8_t>((std::min)(255u, mix(BlueOf(pixel),  colour.b))),
+                          255);
+    }
 }
 
 struct SurfaceDraw {
@@ -233,10 +273,25 @@ struct Mission::Impl {
         WUC::ContainerVisual tileLayer{ nullptr };
         WUC::ContainerVisual chromeLayer{ nullptr };
         WUC::SpriteVisual    outline{ nullptr };
-        WUC::SpriteVisual    bar{ nullptr };
+
+        // The spaces bar, in two layers.
+        //
+        // The glass is baked once and kept: it depends on the wallpaper and the
+        // monitor and on nothing else, and it is the expensive one, a full-width
+        // displacement map and edge light on the CPU. Redrawing it every time an
+        // arrow key walked to another desktop was several milliseconds per
+        // display for a picture that had not changed.
+        WUC::SpriteVisual    barGlass{ nullptr };
+        WUC::SpriteVisual    bar{ nullptr };   // the miniatures on top of it
 
         WUC::CompositionDrawingSurface backdropSurface{ nullptr };
+        WUC::CompositionDrawingSurface barGlassSurface{ nullptr };
         WUC::CompositionDrawingSurface barSurface{ nullptr };
+
+        // How far the glass runs past the screen on the left, right and top, so
+        // its stroke and lit edge fall off the display instead of drawing a line
+        // down both screen edges. Only the bottom edge of the bar is ever seen.
+        float barOverhang = 0.0f;
 
         std::vector<Tile>               tiles;
         std::vector<mission::SpaceChip> chips;
@@ -279,7 +334,9 @@ struct Mission::Impl {
     bool    IsOwnWindow(HWND hwnd) const;
 
     void BakeBackdrop(Screen& screen);
+    void BakeBarGlass(Screen& screen);
     void BakeBar(Screen& screen);
+    float BarHeight(const Screen& screen) const;
     void BakeChrome(Screen& screen, Tile& tile);
     void BuildTiles(Screen& screen, const std::vector<int>& members, int slide);
     void BuildForDesktop(int desktop, int slide);
@@ -816,6 +873,7 @@ bool Mission::Impl::BuildScreens() {
         screen.outline     = compositor.CreateSpriteVisual();
         screen.tileLayer   = compositor.CreateContainerVisual();
         screen.chromeLayer = compositor.CreateContainerVisual();
+        screen.barGlass    = compositor.CreateSpriteVisual();
         screen.bar         = compositor.CreateSpriteVisual();
 
         // The outline goes ABOVE the windows, not below them. Under them it was
@@ -826,6 +884,7 @@ bool Mission::Impl::BuildScreens() {
         children.InsertAtTop(screen.tileLayer);
         children.InsertAtTop(screen.outline);
         children.InsertAtTop(screen.chromeLayer);
+        children.InsertAtTop(screen.barGlass);
         children.InsertAtTop(screen.bar);
 
         screen.outline.Opacity(0.0f);
@@ -950,24 +1009,42 @@ void Mission::Prewarm() {
     // The wallpapers, on a thread of their own, because they are the one part
     // that touches the disk. Nothing here goes near the compositor or D2D, both
     // of which have thread affinity.
-    struct Job { HMONITOR monitor; int width, height; };
+    const float scale = BackdropScale();
+
+    struct Job { HMONITOR monitor; int width, height; int screenW, screenH, band; };
     std::vector<Job> jobs;
-    for (const Impl::Screen& screen : impl.screens)
-        jobs.push_back(Job{ screen.monitor,
-                            (std::max)(1, static_cast<int>(screen.Width()  * kBackdropDownscale)),
-                            (std::max)(1, static_cast<int>(screen.Height() * kBackdropDownscale)) });
+    for (const Impl::Screen& screen : impl.screens) {
+        Job job;
+        job.monitor = screen.monitor;
+        job.width   = (std::max)(1, static_cast<int>(screen.Width()  * scale));
+        job.height  = (std::max)(1, static_cast<int>(screen.Height() * scale));
+        job.screenW = (std::max)(1, static_cast<int>(screen.Width()));
+        job.screenH = (std::max)(1, static_cast<int>(screen.Height()));
+        job.band    = static_cast<int>(screen.Scaled(kBarHeight) +
+                                       glass::MarginPx(screen.dpiScale) * 2.0f);
+        jobs.push_back(job);
+    }
 
     std::thread([jobs] {
-        for (const Job& job : jobs)
+        for (const Job& job : jobs) {
             wallpaper::ForMonitor(job.monitor, job.width, job.height);
+
+            // And the sharp strip the spaces bar is cut from, which is a
+            // different decode from the backdrop's whenever the backdrop is
+            // downscaled.
+            wallpaper::Region(job.monitor, job.screenW, job.screenH,
+                              RECT{ 0, 0, job.screenW, job.band });
+        }
     }).detach();
 }
 
 void Mission::InvalidateBackdrop() {
     Impl& impl = *m_impl;
     wallpaper::Invalidate();
-    for (Impl::Screen& screen : impl.screens)
+    for (Impl::Screen& screen : impl.screens) {
         screen.backdropSurface = nullptr;
+        screen.barGlassSurface = nullptr;
+    }
     MACTAB_DIAG("mission: backdrops invalidated");
 }
 
@@ -1073,8 +1150,9 @@ void Mission::Impl::BakeBackdrop(Screen& screen) {
         return;
     }
 
-    const int smallW = (std::max)(1, static_cast<int>(screen.Width()  * kBackdropDownscale));
-    const int smallH = (std::max)(1, static_cast<int>(screen.Height() * kBackdropDownscale));
+    const float scale  = BackdropScale();
+    const int   smallW = (std::max)(1, static_cast<int>(screen.Width()  * scale));
+    const int   smallH = (std::max)(1, static_cast<int>(screen.Height() * scale));
 
     screen.backdropSurface = graphics.CreateDrawingSurface(
         { static_cast<float>(smallW), static_cast<float>(smallH) },
@@ -1099,8 +1177,7 @@ void Mission::Impl::BakeBackdrop(Screen& screen) {
         if (SUCCEEDED(dc->CreateEffect(CLSID_D2D1GaussianBlur, blur.Put()))) {
             blur->SetInput(0, source.Get());
             blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
-                           screen.Scaled(config::Current().missionBlurSigma) *
-                               kBackdropDownscale);
+                           screen.Scaled(config::Current().missionBlurSigma) * scale);
             blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
             dc->DrawImage(blur.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
         } else {
@@ -1126,8 +1203,116 @@ void Mission::Impl::BakeBackdrop(Screen& screen) {
     screen.backdrop.Offset({ 0.0f, 0.0f, 0.0f });
 }
 
+float Mission::Impl::BarHeight(const Screen& screen) const {
+    return spaces.empty() ? 0.0f : screen.Scaled(kBarHeight);
+}
+
+// The spaces bar, as a piece of the switcher's glass.
+//
+// Same material, same numbers, same code: glass_draw.cpp. That is the whole
+// point of it. Up to 0.7.2 this was a translucent fill over an already-blurred
+// wallpaper, which is a fair description of frosted plastic and no description
+// at all of Liquid Glass. It could not refract, it did not react to what was
+// behind it, and it shared nothing with the panel it was supposed to match.
+//
+// Three things are particular to this piece rather than to the material.
+//
+// It runs PAST the screen on the left, right and top. The glass has a dark outer
+// stroke and a lit edge all the way round, which is right for a floating panel
+// and wrong for a bar clipped to the top of a display: it would draw a hairline
+// down both screen edges. Pushed out by the overhang, only the bottom edge is
+// ever on screen, which is exactly the profile macOS shows.
+//
+// Its backdrop is the wallpaper, at full resolution, not the overlay's own baked
+// one. The rim tap exists to bend a SHARP image; handing it the quarter-scale
+// backdrop would make the second tap indistinguishable from the first, which is
+// a bug this material has already had once.
+//
+// And the strip is dimmed before it is handed over, by the same amount the
+// backdrop is. The bar sits on a dimmed desktop, so that is the scene it has to
+// refract and adapt to. Feeding it the raw picture would have the material pick
+// an operating point for somewhere brighter than the screen, and a rim reflecting
+// light that is not there is a painted-on border again.
+void Mission::Impl::BakeBarGlass(Screen& screen) {
+    const float height = BarHeight(screen);
+    if (height <= 0.0f) {
+        screen.barGlass.Size({ 0.0f, 0.0f });
+        return;
+    }
+
+    screen.barOverhang = std::ceil(glass::MarginPx(screen.dpiScale));
+
+    const float over  = screen.barOverhang;
+    const float width = screen.Width() + over * 2.0f;
+    const float tall  = height + over;
+
+    if (screen.barGlassSurface) {
+        screen.barGlass.Size({ width, tall });
+        screen.barGlass.Offset({ -over, -over, 0.0f });
+        return;
+    }
+
+    screen.barGlassSurface = graphics.CreateDrawingSurface(
+        { width, tall },
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+
+    SurfaceDraw draw(screen.barGlassSurface);
+    if (!draw.ok) return;
+
+    ID2D1DeviceContext* dc = draw.dc.Get();
+    dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+    // The sharp strip behind it, plus a blur margin below. The left, right and
+    // top margins are off the screen, so wallpaper::Region clips them away and
+    // the material's own edge clamp covers what is missing, exactly as it does
+    // for a panel that reaches a screen edge.
+    const int screenW = (std::max)(1, static_cast<int>(screen.Width()));
+    const int screenH = (std::max)(1, static_cast<int>(screen.Height()));
+    const int band    = (std::min)(screenH,
+                                   static_cast<int>(height + glass::MarginPx(screen.dpiScale)));
+
+    capture::Frame backdrop;
+    backdrop.pixels = wallpaper::Region(screen.monitor, screenW, screenH,
+                                        RECT{ 0, 0, screenW, band });
+
+    if (backdrop.pixels.Empty()) {
+        // No picture, so the desktop colour is what is behind the bar. Filled in
+        // rather than left empty: an empty frame sends the material down its
+        // degraded path, which lays a nearly opaque base coat and would make the
+        // bar the one part of the overlay you cannot see through.
+        backdrop.pixels = Bitmap::Create(screenW, band, wallpaper::SolidColour());
+    }
+
+    Dim(backdrop.pixels, theme.backdropTint, config::Current().missionDim);
+
+    backdrop.bounds = RECT{ screen.rect.left, screen.rect.top,
+                            screen.rect.left + screenW, screen.rect.top + band };
+
+    glass::Piece piece;
+    piece.dc             = dc;
+    piece.factory        = d2dFactory.Get();
+    piece.frame          = &backdrop;
+    piece.base           = BarMaterial(themeIsLight);
+    piece.dpiScale       = screen.dpiScale;
+    piece.cornerExponent = layout::kPanelCornerExponent;
+
+    const RECT area{ screen.rect.left  - static_cast<LONG>(over),
+                     screen.rect.top   - static_cast<LONG>(over),
+                     screen.rect.right + static_cast<LONG>(over),
+                     screen.rect.top   + static_cast<LONG>(height) };
+
+    glass::Draw(piece, draw.offset, area, 0.0f);
+
+    screen.barGlass.Brush(compositor.CreateSurfaceBrush(screen.barGlassSurface));
+    screen.barGlass.Size({ width, tall });
+    screen.barGlass.Offset({ -over, -over, 0.0f });
+}
+
 void Mission::Impl::BakeBar(Screen& screen) {
     screen.chips.clear();
+
+    BakeBarGlass(screen);
 
     if (spaces.empty()) {
         screen.bar.Size({ 0.0f, 0.0f });
@@ -1167,26 +1352,15 @@ void Mission::Impl::BakeBar(Screen& screen) {
     ID2D1DeviceContext* dc = draw.dc.Get();
     dc->Clear(D2D1::ColorF(0, 0, 0, 0));
 
-    // The bar itself: full width, edge to edge, with a hairline along the
-    // bottom. The wallpaper behind it is already blurred, so a translucent fill
-    // over that reads as glass without a second blur pass.
-    ComPtr<ID2D1SolidColorBrush> fill;
-    if (SUCCEEDED(dc->CreateSolidColorBrush(theme.bar, fill.Put())))
-        dc->FillRectangle(D2D1::RectF(0.0f, 0.0f, width, height), fill.Get());
-
-    ComPtr<ID2D1SolidColorBrush> line;
-    if (SUCCEEDED(dc->CreateSolidColorBrush(theme.barLine, line.Put())))
-        dc->FillRectangle(D2D1::RectF(0.0f, height - screen.Scaled(1.0f), width, height),
-                          line.Get());
-
     // The miniatures come from the wallpaper already decoded for the backdrop,
     // resized here rather than read again. Asking the cache for a second size
     // means a second decode of what can be a 4K photograph, and it happened on
     // every single invocation.
     ComPtr<ID2D1BitmapBrush1> paperBrush;
     if (!screen.chips.empty()) {
-        const int backdropW = (std::max)(1, static_cast<int>(screen.Width()  * kBackdropDownscale));
-        const int backdropH = (std::max)(1, static_cast<int>(screen.Height() * kBackdropDownscale));
+        const float scale   = BackdropScale();
+        const int backdropW = (std::max)(1, static_cast<int>(screen.Width()  * scale));
+        const int backdropH = (std::max)(1, static_cast<int>(screen.Height() * scale));
         const int chipW = (std::max)(1, static_cast<int>(screen.chips[0].w));
         const int chipH = (std::max)(1, static_cast<int>(screen.chips[0].h));
 
@@ -1312,10 +1486,31 @@ void Mission::Impl::BakeBar(Screen& screen) {
         if (format && textBrush && chip.index >= 0 &&
             chip.index < static_cast<int>(spaces.size())) {
             const std::wstring& name = spaces[static_cast<size_t>(chip.index)].name;
+            const D2D1_RECT_F where = D2D1::RectF(
+                chip.x, chip.y + chip.h, chip.x + chip.w,
+                chip.y + chip.h + screen.Scaled(kChipLabel));
+
+            // A shadow in the opposite direction to the text, one pixel down.
+            //
+            // The names used to sit on a flat fill of known brightness. They now
+            // sit on glass, which by design takes most of its brightness from
+            // whatever the wallpaper happens to be under it, so there is no
+            // colour that is readable on all of them. This costs one extra
+            // DrawText per desktop and removes the question.
+            ComPtr<ID2D1SolidColorBrush> halo;
+            if (SUCCEEDED(dc->CreateSolidColorBrush(
+                    themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.55f)
+                                 : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.55f),
+                    halo.Put()))) {
+                D2D1_RECT_F under = where;
+                under.top    += screen.Scaled(1.0f);
+                under.bottom += screen.Scaled(1.0f);
+                dc->DrawTextW(name.c_str(), static_cast<UINT32>(name.size()),
+                              format.Get(), under, halo.Get());
+            }
+
             dc->DrawTextW(name.c_str(), static_cast<UINT32>(name.size()), format.Get(),
-                          D2D1::RectF(chip.x, chip.y + chip.h, chip.x + chip.w,
-                                      chip.y + chip.h + screen.Scaled(kChipLabel)),
-                          textBrush.Get());
+                          where, textBrush.Get());
         }
     }
 
@@ -2205,7 +2400,27 @@ void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spa
         if (light != impl.themeIsLight) {
             impl.themeIsLight = light;
             impl.theme        = MakeTheme(light);
-            for (Impl::Screen& screen : impl.screens) screen.backdropSurface = nullptr;
+            for (Impl::Screen& screen : impl.screens) {
+                screen.backdropSurface = nullptr;
+                screen.barGlassSurface = nullptr;
+            }
+        }
+
+        // Move the overlays onto the desktop being shown.
+        //
+        // Not cosmetic, and not obvious. These windows are created once, at
+        // initialisation, and a top-level window keeps whichever virtual desktop
+        // it was created on for life. SetForegroundWindow on a window belonging
+        // to another desktop makes Windows switch to that desktop to show it,
+        // so once the user has left the desktop MacTab started on, opening
+        // Mission Control would drag them back to it.
+        //
+        // The public API refuses this for other processes' windows and permits
+        // it for our own, which is exactly the case here.
+        if (desktop >= 0 && desktop < static_cast<int>(impl.spaces.size())) {
+            const GUID& here = impl.spaces[static_cast<size_t>(desktop)].id;
+            for (Impl::Screen& screen : impl.screens)
+                desktops::MoveWindowTo(screen.hwnd, here);
         }
 
         impl.BuildForDesktop(desktop, 0);

@@ -32,6 +32,19 @@ namespace mactab::wallpaper {
 // without touching the disk. Safe to call from a worker thread.
 Bitmap ForMonitor(HMONITOR monitor, int width, int height);
 
+// Part of the wallpaper as it appears on a `width` by `height` screen, with
+// `region` in screen-local pixels. Clipped to the screen, so a caller may inflate
+// a rectangle by a blur margin without checking whether it runs off the edge.
+//
+// This exists for the spaces bar, which is a piece of the same glass the switcher
+// is made of and therefore needs a SHARP backdrop to blur and bend for itself.
+// The overlay's own backdrop is a quarter-resolution copy, which is right for
+// something about to be dimmed and wrong as the source of a lens.
+//
+// Only the region is decoded. WIC is pull-based, so asking for the top strip of a
+// 4K picture does not scale the rows underneath it.
+Bitmap Region(HMONITOR monitor, int width, int height, RECT region);
+
 // The desktop background colour, which is what shows through when no wallpaper
 // is set or the picture does not cover the screen. Always valid.
 uint32_t SolidColour();

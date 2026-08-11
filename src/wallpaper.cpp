@@ -14,11 +14,17 @@ namespace {
 // size per monitor, so a single entry per monitor is the whole cache.
 struct Entry {
     HMONITOR    monitor = nullptr;
-    int         width   = 0;
+    int         width   = 0;    // the screen the picture was laid out for
     int         height  = 0;
+    RECT        region{};       // the part of it that was kept
     std::wstring path;
     Bitmap      pixels;
 };
+
+bool SameRect(const RECT& a, const RECT& b) {
+    return a.left == b.left && a.top == b.top &&
+           a.right == b.right && a.bottom == b.bottom;
+}
 
 std::mutex         g_mutex;
 std::vector<Entry> g_cache;
@@ -110,8 +116,11 @@ std::wstring TranscodedPath() {
 // every one of the six placement styles exactly right would mean reading
 // WallpaperStyle and TileWallpaper out of the registry and reproducing each
 // one, for a backdrop that is about to be blurred past recognition.
-Bitmap Decode(const std::wstring& path, int width, int height) {
-    if (path.empty() || width <= 0 || height <= 0) return {};
+Bitmap Decode(const std::wstring& path, int width, int height, const RECT& region) {
+    const int keepW = region.right - region.left;
+    const int keepH = region.bottom - region.top;
+    if (path.empty() || width <= 0 || height <= 0 || keepW <= 0 || keepH <= 0)
+        return {};
 
     ComApartment apartment(COINIT_APARTMENTTHREADED);
 
@@ -155,15 +164,24 @@ Bitmap Decode(const std::wstring& path, int width, int height) {
                                      WICBitmapPaletteTypeCustom)))
         return {};
 
+    // The centre crop that turns the covered picture into the screen, plus the
+    // part of the screen the caller actually asked for.
+    //
+    // Only that part is copied out, and WIC is pull-based: the format converter
+    // asks the scaler for the rows it needs and the scaler asks the decoder for
+    // the rows IT needs, so a request for the top strip of a 4K wallpaper does
+    // not scale the other two thousand rows. That is what makes it affordable to
+    // cut the glass under the spaces bar from the full-resolution picture rather
+    // than from the quarter-resolution copy the backdrop uses.
     WICRect crop{};
-    crop.X      = static_cast<INT>((scaledW - static_cast<UINT>(width))  / 2);
-    crop.Y      = static_cast<INT>((scaledH - static_cast<UINT>(height)) / 2);
-    crop.Width  = width;
-    crop.Height = height;
+    crop.X      = static_cast<INT>((scaledW - static_cast<UINT>(width))  / 2) + region.left;
+    crop.Y      = static_cast<INT>((scaledH - static_cast<UINT>(height)) / 2) + region.top;
+    crop.Width  = keepW;
+    crop.Height = keepH;
 
-    Bitmap out = Bitmap::Create(width, height);
-    const UINT stride = static_cast<UINT>(width) * 4;
-    const UINT bytes  = stride * static_cast<UINT>(height);
+    Bitmap out = Bitmap::Create(keepW, keepH);
+    const UINT stride = static_cast<UINT>(keepW) * 4;
+    const UINT bytes  = stride * static_cast<UINT>(keepH);
 
     if (FAILED(converter->CopyPixels(&crop, stride, bytes,
                                      reinterpret_cast<BYTE*>(out.pixels.data()))))
@@ -185,12 +203,26 @@ uint32_t SolidColour() {
 }
 
 Bitmap ForMonitor(HMONITOR monitor, int width, int height) {
+    return Region(monitor, width, height, RECT{ 0, 0, width, height });
+}
+
+Bitmap Region(HMONITOR monitor, int width, int height, RECT region) {
     if (width <= 0 || height <= 0) return {};
+
+    // Clipped rather than trusted. A caller inflating a rect by a blur margin
+    // walks off the top of the screen as a matter of course, and a negative
+    // origin would be read as a crop into the picture rather than as nothing.
+    region.left   = (std::max)(0L, region.left);
+    region.top    = (std::max)(0L, region.top);
+    region.right  = (std::min)(static_cast<LONG>(width),  region.right);
+    region.bottom = (std::min)(static_cast<LONG>(height), region.bottom);
+    if (region.right <= region.left || region.bottom <= region.top) return {};
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         for (const Entry& entry : g_cache)
-            if (entry.monitor == monitor && entry.width == width && entry.height == height)
+            if (entry.monitor == monitor && entry.width == width &&
+                entry.height == height && SameRect(entry.region, region))
                 return entry.pixels;
     }
 
@@ -200,7 +232,7 @@ Bitmap ForMonitor(HMONITOR monitor, int width, int height) {
     std::wstring path = PathForMonitor(monitor);
 
     const double started = NowMs();
-    Bitmap pixels = Decode(path, width, height);
+    Bitmap pixels = Decode(path, width, height, region);
 
     if (pixels.Empty()) {
         // The reported picture could not be read. That is not unusual: it may
@@ -208,7 +240,7 @@ Bitmap ForMonitor(HMONITOR monitor, int width, int height) {
         // have come from a theme, or this may be a slideshow whose reported
         // path is whichever file was current some time ago.
         const std::wstring transcoded = TranscodedPath();
-        pixels = Decode(transcoded, width, height);
+        pixels = Decode(transcoded, width, height, region);
         if (!pixels.Empty()) {
             MACTAB_DIAG("wallpaper: \"%s\" was unreadable, used the shell's own copy",
                         ToUtf8(path).c_str());
@@ -220,7 +252,8 @@ Bitmap ForMonitor(HMONITOR monitor, int width, int height) {
         MACTAB_DIAG("wallpaper: no picture for monitor %p (\"%s\"), using the desktop colour",
                     static_cast<void*>(monitor), ToUtf8(path).c_str());
     } else {
-        MACTAB_DIAG("wallpaper: %dx%d from \"%s\" in %.1f ms",
+        MACTAB_DIAG("wallpaper: %ldx%ld of %dx%d from \"%s\" in %.1f ms",
+                    region.right - region.left, region.bottom - region.top,
                     width, height, ToUtf8(path).c_str(), NowMs() - started);
     }
 
@@ -230,13 +263,15 @@ Bitmap ForMonitor(HMONITOR monitor, int width, int height) {
         // Another thread may have finished the same decode while this one was
         // reading the file. Whichever landed first wins; they are identical.
         for (const Entry& entry : g_cache)
-            if (entry.monitor == monitor && entry.width == width && entry.height == height)
+            if (entry.monitor == monitor && entry.width == width &&
+                entry.height == height && SameRect(entry.region, region))
                 return entry.pixels;
 
         Entry entry;
         entry.monitor = monitor;
         entry.width   = width;
         entry.height  = height;
+        entry.region  = region;
         entry.path    = path;
         entry.pixels  = pixels;
         g_cache.push_back(std::move(entry));
