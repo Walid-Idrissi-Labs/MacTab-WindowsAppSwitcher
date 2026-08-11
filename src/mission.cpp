@@ -1094,8 +1094,12 @@ void Mission::Prewarm() {
         job.height  = (std::max)(1, static_cast<int>(screen.Height() * scale));
         job.screenW = (std::max)(1, static_cast<int>(screen.Width()));
         job.screenH = (std::max)(1, static_cast<int>(screen.Height()));
-        job.band    = static_cast<int>(screen.Scaled(kBarHeight) +
-                                       glass::MarginPx(screen.dpiScale) * 2.0f);
+        // Exactly the band BakeBarGlass will ask for. A different number here
+        // is not a smaller cache hit, it is a second decode of the same 4K
+        // picture, which is precisely what this thread exists to avoid.
+        job.band    = (std::min)(job.screenH,
+                                 static_cast<int>(screen.Scaled(kBarHeight) +
+                                                  glass::MarginPx(screen.dpiScale)));
         jobs.push_back(job);
     }
 

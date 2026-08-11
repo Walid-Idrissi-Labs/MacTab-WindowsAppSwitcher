@@ -220,10 +220,31 @@ Bitmap Region(HMONITOR monitor, int width, int height, RECT region) {
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        for (const Entry& entry : g_cache)
-            if (entry.monitor == monitor && entry.width == width &&
-                entry.height == height && SameRect(entry.region, region))
-                return entry.pixels;
+        for (const Entry& entry : g_cache) {
+            if (entry.monitor != monitor || entry.width != width ||
+                entry.height != height)
+                continue;
+
+            if (SameRect(entry.region, region)) return entry.pixels;
+
+            // A bigger piece of the same picture is already decoded, so cut this
+            // one out of it rather than reading the file again.
+            //
+            // This is the ordinary case rather than a lucky one: with no blur
+            // the backdrop is baked at the screen's own size, and the strip the
+            // spaces bar is cut from is the top of exactly that. Without it,
+            // turning the blur off means decoding a 4K photograph twice and
+            // holding both.
+            if (entry.region.left  <= region.left  && entry.region.top    <= region.top &&
+                entry.region.right >= region.right && entry.region.bottom >= region.bottom) {
+                Bounds within;
+                within.left   = region.left   - entry.region.left;
+                within.top    = region.top    - entry.region.top;
+                within.right  = region.right  - entry.region.left;
+                within.bottom = region.bottom - entry.region.top;
+                return Crop(entry.pixels, within);
+            }
+        }
     }
 
     // Decoding outside the lock. It reads a file and can take tens of
