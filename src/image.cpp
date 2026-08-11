@@ -72,81 +72,92 @@ Bitmap Resize(const Bitmap& source, int width, int height) {
     if (source.width == width && source.height == height)
         return source;
 
-    const std::vector<PremultipliedF> src = ToPremultipliedFloat(source);
-    Bitmap out = Bitmap::Create(width, height);
+    // Two separable passes rather than one two-dimensional filter, because the
+    // two axes do not always want the same filter. Cropping to a mark's bounding
+    // box produces plenty of non-square images, and any resize of one to a
+    // square is shrinking on one axis while growing on the other. A single
+    // filter choice for both then runs a box average over an axis that is
+    // growing, where the footprint of a destination pixel is less than one
+    // source pixel and the average degenerates to point sampling.
+    //
+    // Both filters are separable, so for the ordinary case where both axes go
+    // the same way this produces the identical result for less work: 4 + 4 taps
+    // per pixel instead of 16.
+    std::vector<PremultipliedF> rows = ToPremultipliedFloat(source);
 
-    const double scaleX = static_cast<double>(source.width)  / width;
-    const double scaleY = static_cast<double>(source.height) / height;
+    auto pass = [](const std::vector<PremultipliedF>& in, int inLength,
+                   int outLength, int lines, bool horizontal) {
+        std::vector<PremultipliedF> out(static_cast<size_t>(outLength) * lines);
 
-    const bool downscaling = (width < source.width) || (height < source.height);
+        const double scale = static_cast<double>(inLength) / outLength;
+        const bool shrinking = outLength < inLength;
 
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            PremultipliedF acc;
+        // Row-major either way: `line` walks the axis being left alone.
+        const size_t inStride  = horizontal ? static_cast<size_t>(inLength)  : 1;
+        const size_t inStep    = horizontal ? 1 : static_cast<size_t>(lines);
+        const size_t outStride = horizontal ? static_cast<size_t>(outLength) : 1;
+        const size_t outStep   = horizontal ? 1 : static_cast<size_t>(lines);
 
-            if (downscaling) {
-                // Average every source pixel falling inside this destination
-                // pixel's footprint. Bilinear would point-sample and alias.
-                const int x0 = static_cast<int>(x * scaleX);
-                const int y0 = static_cast<int>(y * scaleY);
-                int x1 = static_cast<int>((x + 1) * scaleX);
-                int y1 = static_cast<int>((y + 1) * scaleY);
-                x1 = (std::max)(x1, x0 + 1);
-                y1 = (std::max)(y1, y0 + 1);
-                x1 = (std::min)(x1, source.width);
-                y1 = (std::min)(y1, source.height);
+        for (int line = 0; line < lines; ++line) {
+            const PremultipliedF* src = in.data() + static_cast<size_t>(line) * inStride;
+            PremultipliedF* dst = out.data() + static_cast<size_t>(line) * outStride;
 
-                float count = 0;
-                for (int sy = y0; sy < y1; ++sy) {
-                    for (int sx = x0; sx < x1; ++sx) {
-                        const PremultipliedF& p =
-                            src[static_cast<size_t>(sy) * source.width + sx];
+            for (int i = 0; i < outLength; ++i) {
+                PremultipliedF acc;
+
+                if (shrinking) {
+                    // Average every source pixel falling inside this destination
+                    // pixel's footprint. Bilinear would point-sample and alias.
+                    const int from = static_cast<int>(i * scale);
+                    int to = static_cast<int>((i + 1) * scale);
+                    to = (std::min)((std::max)(to, from + 1), inLength);
+
+                    float count = 0;
+                    for (int s = from; s < to; ++s) {
+                        const PremultipliedF& p = src[static_cast<size_t>(s) * inStep];
                         acc.r += p.r; acc.g += p.g; acc.b += p.b; acc.a += p.a;
                         count += 1.0f;
                     }
-                }
-                if (count > 0) {
-                    acc.r /= count; acc.g /= count; acc.b /= count; acc.a /= count;
-                }
-            } else {
-                // Catmull-Rom, sampling at pixel centres. Sixteen taps rather
-                // than four, which at icon sizes is nothing and is the whole
-                // difference between a readable 48px mark at 4x and a smear.
-                const double fx = (x + 0.5) * scaleX - 0.5;
-                const double fy = (y + 0.5) * scaleY - 0.5;
+                    if (count > 0) {
+                        acc.r /= count; acc.g /= count; acc.b /= count; acc.a /= count;
+                    }
+                } else {
+                    // Catmull-Rom, sampling at pixel centres.
+                    const double centre = (i + 0.5) * scale - 0.5;
+                    const int base = static_cast<int>(std::floor(centre));
 
-                const int bx = static_cast<int>(std::floor(fx));
-                const int by = static_cast<int>(std::floor(fy));
-
-                float wx[4], wy[4];
-                for (int i = 0; i < 4; ++i) {
-                    wx[i] = CatmullRom(static_cast<float>(fx - (bx + i - 1)));
-                    wy[i] = CatmullRom(static_cast<float>(fy - (by + i - 1)));
-                }
-
-                for (int j = 0; j < 4; ++j) {
-                    const int sy = Clamp(by + j - 1, 0, source.height - 1);
-                    for (int i = 0; i < 4; ++i) {
-                        const int sx = Clamp(bx + i - 1, 0, source.width - 1);
-                        const float w = wx[i] * wy[j];
+                    for (int tap = -1; tap <= 2; ++tap) {
+                        const float w = CatmullRom(static_cast<float>(centre - (base + tap)));
                         if (w == 0.0f) continue;
 
-                        const PremultipliedF& p =
-                            src[static_cast<size_t>(sy) * source.width + sx];
+                        const int s = Clamp(base + tap, 0, inLength - 1);
+                        const PremultipliedF& p = src[static_cast<size_t>(s) * inStep];
                         acc.r += p.r * w; acc.g += p.g * w;
                         acc.b += p.b * w; acc.a += p.a * w;
                     }
+
+                    // The negative lobe can push alpha past either end. Left
+                    // alone, an alpha above 1 divides back out to a colour
+                    // darker than the source, which shows up as a dark rim on a
+                    // light mark.
+                    acc.a = (std::min)((std::max)(acc.a, 0.0f), 1.0f);
                 }
 
-                // The negative lobe can push alpha past either end. Left alone,
-                // an alpha above 1 divides back out to a colour darker than the
-                // source, which shows up as a dark rim on a light mark.
-                acc.a = (std::min)((std::max)(acc.a, 0.0f), 1.0f);
+                dst[static_cast<size_t>(i) * outStep] = acc;
             }
-
-            out.At(x, y) = FromPremultiplied(acc);
         }
-    }
+
+        return out;
+    };
+
+    if (width != source.width)
+        rows = pass(rows, source.width, width, source.height, true);
+    if (height != source.height)
+        rows = pass(rows, source.height, height, width, false);
+
+    Bitmap out = Bitmap::Create(width, height);
+    for (size_t i = 0; i < out.pixels.size(); ++i)
+        out.pixels[i] = FromPremultiplied(rows[i]);
 
     return out;
 }
@@ -371,10 +382,14 @@ BorderFill RemoveBorderFill(Bitmap& bitmap) {
 
         const uint32_t pixel = bitmap.pixels[static_cast<size_t>(index)];
         if (AlphaOf(pixel) < 128) {
-            // Transparent already; it neither blocks the fill nor needs a ramp.
+            // Transparent already: nothing to remove, and nothing to spread
+            // through either. Letting the fill cross transparency would break
+            // the one argument this whole approach rests on, that a background
+            // is what reaches the border. It would jump a transparent gap into
+            // an enclosed region of the same colour and eat artwork that is not
+            // connected to the border at all.
             seen[static_cast<size_t>(index)] = 1;
             alpha[static_cast<size_t>(index)] = AlphaOf(pixel);
-            stack.push_back(index);
             return;
         }
 

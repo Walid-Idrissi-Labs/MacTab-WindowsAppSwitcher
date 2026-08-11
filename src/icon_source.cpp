@@ -74,6 +74,13 @@ Bitmap FromHIcon(HICON icon) {
     if (out.Empty())
         return {};
 
+    // A genuinely monochrome icon has no colour bitmap at all: GetIconInfo
+    // returns hbmColor null and the image lives in a double-height mask. Those
+    // are lost here rather than reconstructed. They only reach this function as
+    // the last resort in the ladder, from an app old enough to ship nothing
+    // else, and drawing one would mean a two-colour 32px mark on a tile that
+    // sits next to 256px artwork.
+
     // A 1-bit icon has no colour alpha; transparency lives in the AND mask,
     // where a set bit means "transparent".
     const Bitmap maskBitmap = FromHBitmap(iconInfo.hbmMask);
@@ -147,8 +154,10 @@ struct ResourceName {
 };
 
 // The first icon group in the module, which is the one the shell draws for
-// index 0 and therefore the one the taskbar shows. Resource directories are
-// stored sorted, so "first enumerated" and "lowest id" are the same thing.
+// index 0 and therefore the one the taskbar shows. Enumeration order is the
+// resource directory's own: named groups first, then numbered ones ascending,
+// which is what makes this agree with ExtractIcon on a Delphi binary whose icon
+// group is called MAINICON rather than 1.
 BOOL CALLBACK FirstGroupProc(HMODULE, LPCWSTR, LPWSTR name, LONG_PTR param) {
     auto& out = *reinterpret_cast<ResourceName*>(param);
     out.found = true;
@@ -161,6 +170,60 @@ BOOL CALLBACK FirstGroupProc(HMODULE, LPCWSTR, LPWSTR name, LONG_PTR param) {
     }
 
     return FALSE;   // stop at the first
+}
+
+// One resource's bytes, still mapped inside the module.
+struct RawResource {
+    const BYTE* data  = nullptr;
+    DWORD       bytes = 0;
+};
+
+bool FetchResource(HMODULE module, LPCWSTR name, LPCWSTR type, RawResource& out) {
+    const HRSRC handle = ::FindResourceW(module, name, type);
+    if (!handle) return false;
+
+    out.bytes = ::SizeofResource(module, handle);
+    const HGLOBAL loaded = ::LoadResource(module, handle);
+    out.data = loaded ? static_cast<const BYTE*>(::LockResource(loaded)) : nullptr;
+
+    return out.data != nullptr && out.bytes > 0;
+}
+
+// The resource functions do not validate what they walk, and the documentation
+// says so: they are for trusted images only. This walks whatever executable
+// happens to own a window, and a truncated or malformed resource directory in
+// somebody else's binary would take this process down with it. Both entry
+// points into the directory go through a structured exception handler so that
+// the worst case is an app without an icon.
+//
+// mingw's compiler has no __try, so the off-Windows syntax check sees the
+// unguarded call. It is only checking that the code type-checks; the guard is
+// there for the build that ships.
+#ifdef _MSC_VER
+#define MACTAB_TRY_RESOURCE      __try
+#define MACTAB_CATCH_RESOURCE    __except (EXCEPTION_EXECUTE_HANDLER)
+#else
+#define MACTAB_TRY_RESOURCE      if (true)
+#define MACTAB_CATCH_RESOURCE    else
+#endif
+
+bool FetchResourceGuarded(HMODULE module, LPCWSTR name, LPCWSTR type, RawResource& out) {
+    MACTAB_TRY_RESOURCE {
+        return FetchResource(module, name, type, out);
+    }
+    MACTAB_CATCH_RESOURCE {
+        return false;
+    }
+}
+
+bool EnumerateGuarded(HMODULE module, ENUMRESNAMEPROCW callback, LONG_PTR param) {
+    MACTAB_TRY_RESOURCE {
+        ::EnumResourceNamesW(module, RT_GROUP_ICON, callback, param);
+        return true;
+    }
+    MACTAB_CATCH_RESOURCE {
+        return false;
+    }
 }
 
 Bitmap DecodeThroughWic(IWICBitmapDecoder* decoder, IWICImagingFactory* factory) {
@@ -256,24 +319,22 @@ Bitmap FromExecutableResource(const std::wstring& path, int* nativePixels) {
     } unload{ module };
 
     ResourceName group;
-    ::EnumResourceNamesW(module, RT_GROUP_ICON, FirstGroupProc,
-                         reinterpret_cast<LONG_PTR>(&group));
+    if (!EnumerateGuarded(module, FirstGroupProc, reinterpret_cast<LONG_PTR>(&group)))
+        return {};
     if (!group.found) return {};   // no icon in the file at all
 
-    const HRSRC groupResource = ::FindResourceW(module, group.Get(), RT_GROUP_ICON);
-    if (!groupResource) return {};
+    RawResource groupBlock;
+    if (!FetchResourceGuarded(module, group.Get(), RT_GROUP_ICON, groupBlock))
+        return {};
+    if (groupBlock.bytes < sizeof(GroupIconDir)) return {};
 
-    const DWORD groupBytes = ::SizeofResource(module, groupResource);
-    const HGLOBAL groupHandle = ::LoadResource(module, groupResource);
-    if (!groupHandle || groupBytes < sizeof(GroupIconDir)) return {};
-
-    const auto* directory = static_cast<const GroupIconDir*>(::LockResource(groupHandle));
-    if (!directory || directory->count == 0) return {};
+    const auto* directory = reinterpret_cast<const GroupIconDir*>(groupBlock.data);
+    if (directory->count == 0) return {};
 
     // Guard against a truncated or hostile resource before indexing into it.
     const size_t needed = sizeof(GroupIconDir) +
                           static_cast<size_t>(directory->count) * sizeof(GroupIconEntry);
-    if (groupBytes < needed) return {};
+    if (groupBlock.bytes < needed) return {};
 
     const auto* entries = reinterpret_cast<const GroupIconEntry*>(directory + 1);
 
@@ -291,25 +352,23 @@ Bitmap FromExecutableResource(const std::wstring& path, int* nativePixels) {
     }
     if (!best) return {};
 
-    const HRSRC iconResource = ::FindResourceW(module, MAKEINTRESOURCEW(best->id), RT_ICON);
-    if (!iconResource) return {};
-
-    const DWORD iconBytes = ::SizeofResource(module, iconResource);
-    const HGLOBAL iconHandle = ::LoadResource(module, iconResource);
-    if (!iconHandle || iconBytes == 0) return {};
-
-    auto* pixels = static_cast<BYTE*>(::LockResource(iconHandle));
-    if (!pixels) return {};
+    RawResource frame;
+    if (!FetchResourceGuarded(module, MAKEINTRESOURCEW(best->id), RT_ICON, frame))
+        return {};
 
     Bitmap out;
-    if (LooksLikePng(pixels, iconBytes)) {
-        // Vista onward a 256 frame is a whole PNG rather than a DIB.
-        out = DecodeImageMemory(pixels, iconBytes);
+    if (LooksLikePng(frame.data, frame.bytes)) {
+        // Vista onward a 256 frame is a whole PNG rather than a DIB. The bytes
+        // stay mapped until Unload runs, which outlives the decode, so WIC's
+        // no-copy memory stream has something to read.
+        out = DecodeImageMemory(frame.data, frame.bytes);
     } else {
         // 0x00030000 is the icon format version, the only value that has ever
-        // been valid. TRUE asks for an icon rather than a cursor.
+        // been valid. TRUE asks for an icon rather than a cursor, and no
+        // LR_DEFAULTSIZE means "whatever size the resource is".
         const HICON icon = ::CreateIconFromResourceEx(
-            pixels, iconBytes, TRUE, 0x00030000, 0, 0, LR_DEFAULTCOLOR);
+            const_cast<PBYTE>(frame.data), frame.bytes, TRUE, 0x00030000,
+            0, 0, LR_DEFAULTCOLOR);
         if (!icon) return {};
 
         out = FromHIcon(icon);

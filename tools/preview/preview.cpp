@@ -172,6 +172,40 @@ Bitmap MakePlatedLogo(int size) {
     return bitmap;
 }
 
+Bitmap MakePaddedPlatedLogo(int size) {
+    // Two layers of background at once, which is what the shell hands back for
+    // a packaged app: the plated logo, padded out to a fixed canvas with
+    // transparency. The transparency is what the border sees, so the plate is
+    // only reachable after the padding has been cropped away.
+    Bitmap bitmap = Bitmap::Create(size, size);
+    const Bitmap plated = MakePlatedLogo(size / 2);
+    CompositeOver(bitmap, plated, size / 4, size / 4);
+    return bitmap;
+}
+
+Bitmap MakeFlatPlate(int size) {
+    // An icon that is a deliberate flat square with a mark on it, the shape
+    // that must NOT lose its colour to the background stripper: taking the
+    // black away leaves a grey tile where the app had a black one.
+    Bitmap bitmap = Bitmap::Create(size, size);
+    for (uint32_t& pixel : bitmap.pixels)
+        pixel = MakePixel(16, 16, 18, 255);
+
+    const int thickness = (std::max)(2, size / 32);
+    for (int i = 0; i < size / 5; ++i) {
+        for (int t = 0; t < thickness; ++t) {
+            const int x = size * 3 / 10 + i;
+            bitmap.At(x, size / 2 - i + t) = MakePixel(240, 240, 240, 255);
+            bitmap.At(x, size / 2 + i + t) = MakePixel(240, 240, 240, 255);
+        }
+    }
+    for (int x = size * 11 / 20; x < size * 7 / 10; ++x)
+        for (int t = 0; t < thickness; ++t)
+            bitmap.At(x, size * 13 / 20 + t) = MakePixel(240, 240, 240, 255);
+
+    return bitmap;
+}
+
 // Composite onto a checkerboard so transparency is visible in the PNG.
 Bitmap OnCheckerboard(const Bitmap& source) {
     Bitmap out = Bitmap::Create(source.width, source.height);
@@ -1331,6 +1365,27 @@ void RunSelfChecks() {
         Check(stretched.width == 16 && stretched.height == 4, "a 1px row enlarges");
         Check(RedOf(stretched.At(8, 2)) == 10 && AlphaOf(stretched.At(8, 2)) == 255,
               "enlarging a flat row changes nothing about it");
+
+        // One axis shrinking while the other grows, which is every resize of a
+        // non-square mark to a square. The growing axis must not fall back to
+        // point sampling, which is what a single filter choice for both axes
+        // would do to it.
+        Bitmap wideRamp = Bitmap::Create(64, 8);
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 64; ++x)
+                wideRamp.At(x, y) = MakePixel(static_cast<uint8_t>(y * 32), 0, 0, 255);
+
+        const Bitmap squared = Resize(wideRamp, 32, 32);
+        Check(squared.width == 32 && squared.height == 32, "mixed-axis resize returns the size");
+
+        bool climbs = true;
+        for (int y = 1; y < 32; ++y) {
+            if (RedOf(squared.At(16, y)) < RedOf(squared.At(16, y - 1)))
+                climbs = false;
+        }
+        Check(climbs, "the growing axis is interpolated, not point sampled");
+        Check(RedOf(squared.At(16, 31)) - RedOf(squared.At(16, 0)) > 180,
+              "and it still spans the range it came from");
     }
 
     // Stripping a baked-in background, and the inputs that must come through
@@ -1656,6 +1711,8 @@ int main(int argc, char** argv) {
         { "wide-art",          MakeWideArt },
         { "black-padding",     MakeOnBlackPadding },
         { "plated-logo",       MakePlatedLogo },
+        { "padded-plate",      MakePaddedPlatedLogo },
+        { "flat-plate",        MakeFlatPlate },
     };
 
     constexpr int kSourceSize = 256;

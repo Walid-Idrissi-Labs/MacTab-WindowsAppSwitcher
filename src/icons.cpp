@@ -374,6 +374,20 @@ void WorkerMain() {
         if (ReadDiskCache(cachePath, tile) &&
             tile.width == request.size && tile.height == request.size) {
             MACTAB_DIAG("icons: disk cache hit for %s", ToUtf8(request.key).c_str());
+
+            // The tile is cached; the name is not. A packaged app's friendly
+            // name lives only in the shell's view of the package, and the
+            // memory cache holding it is gone at every launch. Without this the
+            // name resolves on the first run the tile is built and never again,
+            // which is to say never, since a disk cache hit is the normal case.
+            if (request.packaged) {
+                std::wstring name;
+                ExtractPackaged(request, name, false);
+                if (!name.empty()) {
+                    std::lock_guard<std::mutex> guard(g_lock);
+                    g_displayNames[request.key] = std::move(name);
+                }
+            }
         } else {
             const double started = NowMs();
             tile = ProduceTile(request);

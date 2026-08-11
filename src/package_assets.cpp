@@ -15,6 +15,11 @@ namespace {
 // qualifier into a pixel count: scale-200 of a 44px logo is 88px.
 constexpr int kNominalLogoPixels = 44;
 
+// Bounds on what a qualifier is allowed to claim. The WIC decoder refuses
+// anything over 2048 anyway, and MRT tops out at scale-400.
+constexpr int kMaxAssetPixels = 2048;
+constexpr int kMaxScale       = 400;
+
 std::wstring Lowered(const std::wstring& text) {
     std::wstring out = text;
     for (wchar_t& c : out)
@@ -79,7 +84,13 @@ uint32_t ParseBackgroundColour(const std::wstring& text) {
 
     const size_t digits = text.size() - 1;
     if (digits == 6) return 0xFF000000u | value;
-    if (digits == 8) return value | 0xFF000000u;   // alpha is always ignored here
+
+    // An eight-digit value carries alpha, and a zero one is how some manifests
+    // spell "transparent". Forcing it opaque would promote "no plate at all"
+    // into a plate, and being a declared colour it outranks everything else.
+    if (digits == 8)
+        return (value >> 24) == 0 ? 0 : (value | 0xFF000000u);
+
     return 0;
 }
 
@@ -129,8 +140,12 @@ bool ReadManifest(const std::wstring& packagePath, const std::wstring& appId,
         if (FAILED(reader->GetLocalName(&local, nullptr)) || !local) continue;
 
         if (::wcscmp(local, L"Application") == 0) {
+            // Case-insensitively: an AUMID is case-insensitive everywhere the
+            // shell deals with one, so the string a window reports need not
+            // match the manifest's spelling of the same id.
             std::wstring id;
-            inThisApp = ReadAttribute(reader.Get(), L"Id", id) && id == appId;
+            inThisApp = ReadAttribute(reader.Get(), L"Id", id) &&
+                        ::_wcsicmp(id.c_str(), appId.c_str()) == 0;
             continue;
         }
 
@@ -192,7 +207,8 @@ int ScoreQualifiers(const std::wstring& qualifiers) {
             pixels = ::_wtoi(value.c_str());
         } else if (name == L"scale") {
             const int scale = ::_wtoi(value.c_str());
-            if (scale > 0) pixels = kNominalLogoPixels * scale / 100;
+            if (scale > 0 && scale <= kMaxScale)
+                pixels = kNominalLogoPixels * scale / 100;
         } else if (name == L"altform") {
             if (value == L"unplated")            form = 3;
             else if (value == L"lightunplated")  form = 2;
@@ -206,7 +222,13 @@ int ScoreQualifiers(const std::wstring& qualifiers) {
         }
     }
 
-    if (pixels <= 0) return -1;
+    // The qualifier is a filename, so the number in it is whatever somebody
+    // wrote there. Anything outside the range a real asset could be is rejected
+    // rather than clamped, since a file claiming to be 999999999 pixels is not
+    // a candidate whatever its true size, and multiplying it into a score is
+    // signed overflow.
+    if (pixels <= 0 || pixels > kMaxAssetPixels) return -1;
+
     return pixels * 16 + form * 4 - penalty;
 }
 

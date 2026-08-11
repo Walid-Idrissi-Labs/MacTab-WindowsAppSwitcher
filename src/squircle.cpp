@@ -41,12 +41,6 @@ constexpr double kArtworkAspect = 0.72;
 // that which is not an enlargement.
 constexpr double kMaxEnlargement = 2.5;
 
-// A stripped background is only worth reusing as the tile colour inside this
-// luma range. Outside it the fill was padding rather than a brand colour: the
-// shell pads with black, and a few handlers pad with white.
-constexpr int kPlateMinLuma = 24;
-constexpr int kPlateMaxLuma = 236;
-
 std::vector<uint8_t> BuildMask(int size) {
     std::vector<uint8_t> mask(static_cast<size_t>(size) * static_cast<size_t>(size), 0);
 
@@ -239,9 +233,30 @@ IconPrep PrepareIcon(const Bitmap& source, uint32_t backgroundHint) {
     Bitmap cleaned = source;
     prep.fill = RemoveBorderFill(cleaned);
 
+    const int canvasWidth  = cleaned.width;
+    const int canvasHeight = cleaned.height;
+
     const Bounds bounds = OpaqueBounds(cleaned);
-    prep.content = bounds.Empty() ? std::move(cleaned) : Crop(cleaned, bounds);
-    if (prep.content.Empty()) return prep;
+    Bitmap content = bounds.Empty() ? std::move(cleaned) : Crop(cleaned, bounds);
+    if (content.Empty()) return prep;
+
+    // Two layers of background is a real combination, not a hypothetical: the
+    // shell pads an icon that already has a plate baked into it out to a fixed
+    // canvas with transparency. The transparent padding is what the border ring
+    // sees, so the first pass finds nothing to do, and the plate only becomes
+    // reachable once the padding has been cropped off.
+    if (!prep.fill.found &&
+        (content.width < canvasWidth || content.height < canvasHeight)) {
+        prep.fill = RemoveBorderFill(content);
+
+        if (prep.fill.found) {
+            const Bounds inner = OpaqueBounds(content);
+            if (!inner.Empty()) content = Crop(content, inner);
+            if (content.Empty()) return prep;
+        }
+    }
+
+    prep.content = std::move(content);
 
     const double longest  = (std::max)(prep.content.width, prep.content.height);
     const double shortest = (std::min)(prep.content.width, prep.content.height);
@@ -257,16 +272,18 @@ IconPrep PrepareIcon(const Bitmap& source, uint32_t backgroundHint) {
     // A colour the app declares for itself beats one stripped off its icon,
     // which in turn beats one derived from the mark, because each is a step
     // further from anything the app ever said about how it wants to look.
-    // Padding is not a declaration of anything, and is filtered out by luma.
-    auto usable = [](uint32_t colour) {
-        return AlphaOf(colour) != 0 &&
-               Luma(colour) >= kPlateMinLuma && Luma(colour) <= kPlateMaxLuma;
-    };
-
+    //
+    // Black and white are not filtered out here even though they are what
+    // padding is usually made of. Plenty of real icons are a black or a white
+    // square with a mark on it, and taking that away leaves a grey tile where
+    // the app had a deliberate one. What makes padding harmless instead is that
+    // an icon adrift in padding is a mark on its own, which takes the artwork
+    // path and never uses this colour at all. The separation step below is what
+    // keeps the combination legible either way.
     uint32_t base;
-    if (usable(backgroundHint))                          base = backgroundHint;
-    else if (prep.fill.found && usable(prep.fill.colour)) base = prep.fill.colour;
-    else                                                  base = DominantColour(prep.content);
+    if (AlphaOf(backgroundHint) != 0)  base = backgroundHint;
+    else if (prep.fill.found)          base = prep.fill.colour;
+    else                               base = DominantColour(prep.content);
 
     // Derived from the glyph's own colours, the tile lands at the same luma as
     // the glyph and the glyph disappears into it. Drive it to the opposite side
