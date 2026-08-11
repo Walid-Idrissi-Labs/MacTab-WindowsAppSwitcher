@@ -498,6 +498,16 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     Mission::Impl::Screen* screen = impl->ScreenFor(hwnd);
     if (!screen) return ::DefWindowProcW(hwnd, msg, wParam, lParam);
 
+    // While the windows are settling back onto the desktop the overlay is still
+    // on screen and still on top, so it still receives clicks and keys. Nothing
+    // it could do with them is what the user meant: they have already left, and
+    // a click landing on a tile mid-flight would switch to whichever window
+    // happened to be under the pointer.
+    //
+    // The timer is the exception, since that is what takes it off the screen.
+    if (impl->closing && msg != WM_TIMER && msg != WM_DESTROY)
+        return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+
     switch (msg) {
     // wParam on dismissMessage says whether the user MEANT to leave. Escape and
     // a click on the background are decisions and take you to the desktop you
