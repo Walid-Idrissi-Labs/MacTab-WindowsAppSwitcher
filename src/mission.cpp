@@ -78,6 +78,33 @@ constexpr float kOutlineWidth = 3.0f;
 // The teardown timer, on the first overlay's own window.
 constexpr UINT_PTR kCloseTimerId = 1;
 
+// And the one that sharpens the previews once the flight has landed.
+constexpr UINT_PTR kSharpenTimerId = 2;
+
+// Above this reduction, a live thumbnail is replaced by a still of the same
+// window taken at a sensible resolution and filtered properly.
+//
+// The compositor has exactly one sampling knob, bilinear, and bilinear is only
+// a correct reduction down to about 2:1, where each output pixel averages a
+// 2x2 block. Past that it is skipping source pixels, and a 4K window in a 400
+// pixel tile skips nine out of every ten. No amount of asking DWM for a
+// different destination size changes that: a thumbnail is a live connection to
+// the source's own surfaces, so the sampling happens once, at the end, with
+// whatever the whole tree composes to.
+//
+// So the one good downscaler in this program, the box filter in image.cpp, is
+// pointed at the problem instead.
+constexpr float  kSharpRatio      = 1.8f;
+
+// Rendered at twice the tile so the compositor's own step is exactly 2:1, which
+// bilinear does correctly, and so a spread pile still has pixels to magnify.
+constexpr float  kSharpOversample = 2.0f;
+
+// How long the whole sharpening pass may take. It runs after the reveal, so it
+// costs nothing anybody is waiting on, but a hung application can hold each
+// window for 50 ms and thirty of those is not a pause anybody would forgive.
+constexpr double kSharpBudgetMs   = 500.0;
+
 // The little cross that closes a desktop, as a fraction of a miniature's height,
 // and where its centre sits inside the miniature's top-left corner.
 constexpr float kCloseSize   = 0.26f;
@@ -292,6 +319,7 @@ struct Mission::Impl {
         WUC::ContainerVisual holder{ nullptr };
         WUC::SpriteVisual    shadow{ nullptr };
         WUC::SpriteVisual    content{ nullptr };   // snapshot or icon card
+        WUC::Visual          live{ nullptr };      // the one DWM owns, if any
         WUC::SpriteVisual    chrome{ nullptr };    // badge and name, pile front only
         WUC::CompositionDrawingSurface contentSurface{ nullptr };
         WUC::CompositionDrawingSurface chromeSurface{ nullptr };
@@ -318,6 +346,11 @@ struct Mission::Impl {
         float      pileX = 0.0f;   // the pile's box, for anchoring the chrome
         float      pileW = 0.0f;
         float      pileBottom = 0.0f;
+
+        // How many window pixels each tile pixel has to stand for. Above about
+        // two the compositor cannot reduce them honestly.
+        float      reduction = 1.0f;
+        bool       sharpened = false;
     };
 
     struct Screen {
@@ -404,6 +437,8 @@ struct Mission::Impl {
     void BakeBar(Screen& screen);
     float BarHeight(const Screen& screen) const;
     void BakeChrome(Screen& screen, Tile& tile);
+    void SharpenTiles();
+    void ScheduleSharpen();
     void BuildTiles(Screen& screen, const std::vector<int>& members, int slide);
     void BuildForDesktop(int desktop, int slide);
     void ExpandPile(Screen& screen, int group);
@@ -613,6 +648,10 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     // The collapse has finished playing; take the windows off the screen.
     case WM_TIMER:
         if (wParam == kCloseTimerId) impl->FinishHide();
+        if (wParam == kSharpenTimerId) {
+            ::KillTimer(hwnd, kSharpenTimerId);
+            impl->SharpenTiles();
+        }
         return 0;
 
     // Capture can be taken away, by a system dialog or an alt-tab out. Leaving
@@ -1959,7 +1998,9 @@ void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
                                         0.0f });
 
                     tile.holder.Children().InsertAtTop(visual);
-                    haveThumbnail = true;
+                    tile.live      = visual;
+                    tile.reduction = (place.w > 0.0f) ? frameW / place.w : 1.0f;
+                    haveThumbnail  = true;
                 }
             }
         }
@@ -2258,6 +2299,108 @@ int Mission::Impl::Neighbour(const Screen& screen, int from, int dx, int dy) con
 // `slide` is 0 for the reveal, where each window flies from where it really is,
 // and plus or minus one when a desktop is sliding past, where the outgoing
 // arrangement leaves one way and the incoming arrives from the other.
+// Replace the worst-reduced live previews with a properly filtered still.
+//
+// Run after the flight has landed, so none of it is on the path anybody is
+// waiting on, and only for tiles where the compositor is being asked to do a
+// reduction it cannot do honestly. Below that ratio bilinear is a correct box
+// average and a still would be no better and would stop moving.
+//
+// The still is baked at twice the tile so the compositor's own remaining step is
+// exactly 2:1, and so a pile that spreads out still has pixels to magnify.
+//
+// What this costs is that those previews stop being live. A video keeps playing
+// until the sharpening lands and then holds its last frame. That is the trade,
+// and it is the right way round: Mission Control is a picture of where things
+// are, and the thing people actually complain about is not being able to tell
+// two documents apart.
+void Mission::Impl::SharpenTiles() {
+    if (!visible || closing) return;
+    if (!config::Current().missionSharpPreviews) return;
+
+    const double started = NowMs();
+    int done = 0, skipped = 0;
+
+    for (Screen& screen : screens) {
+        for (Tile& tile : screen.tiles) {
+            if (tile.sharpened || !tile.live) continue;
+            if (tile.reduction <= kSharpRatio) continue;
+            if (tile.item < 0 || tile.item >= static_cast<int>(items.size())) continue;
+
+            if (NowMs() - started >= kSharpBudgetMs) { ++skipped; continue; }
+
+            const MissionItem& item = items[static_cast<size_t>(tile.item)];
+
+            const float w = static_cast<float>(tile.screenRect.right - tile.screenRect.left);
+            const float h = static_cast<float>(tile.screenRect.bottom - tile.screenRect.top);
+            if (w < 8.0f || h < 8.0f) continue;
+
+            // Never above the window's own resolution: there is nothing there to
+            // find, and asking for it would only cost memory.
+            const float over = (std::min)(kSharpOversample, tile.reduction);
+            const int   bakeW = (std::max)(1, static_cast<int>(w * over));
+            const int   bakeH = (std::max)(1, static_cast<int>(h * over));
+
+            Bitmap picture = thumbnail::Snapshot(item.hwnd, bakeW, bakeH);
+            if (picture.Empty()) {
+                // A window that will not be printed keeps its live thumbnail,
+                // which is exactly what it had before and better than nothing.
+                ++skipped;
+                tile.sharpened = true;
+                continue;
+            }
+
+            auto surface = graphics.CreateDrawingSurface(
+                { static_cast<float>(bakeW), static_cast<float>(bakeH) },
+                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+
+            {
+                SurfaceDraw draw(surface);
+                if (!draw.ok) continue;
+
+                ID2D1DeviceContext* dc = draw.dc.Get();
+                dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+                if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(picture)))
+                    dc->DrawBitmap(bitmap.Get(),
+                                   D2D1::RectF(0.0f, 0.0f, static_cast<float>(bakeW),
+                                               static_cast<float>(bakeH)),
+                                   1.0f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                                   nullptr);
+            }
+
+            auto brush = compositor.CreateSurfaceBrush(surface);
+            brush.Stretch(WUC::CompositionStretch::Fill);
+
+            auto still = compositor.CreateSpriteVisual();
+            still.Brush(brush);
+            still.Size({ w, h });
+
+            tile.contentSurface = surface;
+            tile.content        = still;
+            tile.holder.Children().InsertAtTop(still);
+
+            // Swapped rather than cross-faded. It is the same picture, only
+            // honest, so there is nothing to fade between; and hiding the live
+            // one stops DWM composing a window nobody can see.
+            tile.live.IsVisible(false);
+            tile.sharpened = true;
+            ++done;
+        }
+    }
+
+    if (done || skipped)
+        MACTAB_DIAG("mission: sharpened %d preview(s), skipped %d, in %.1f ms",
+                    done, skipped, NowMs() - started);
+}
+
+void Mission::Impl::ScheduleSharpen() {
+    if (screens.empty()) return;
+    ::SetTimer(screens.front().hwnd, kSharpenTimerId,
+               config::Current().missionRevealMs + 40, nullptr);
+}
+
 void Mission::Impl::BuildForDesktop(int desktop, int slide) {
     browsed = desktop;
 
@@ -2678,6 +2821,8 @@ void Mission::Impl::Rearrange(int desktop) {
         StartReveal(compositor, other,
                     std::chrono::milliseconds(config::Current().missionRevealMs), false);
     }
+
+    ScheduleSharpen();
 }
 
 void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spaces,
@@ -2751,6 +2896,7 @@ void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spa
         const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
         for (Impl::Screen& screen : impl.screens)
             StartReveal(impl.compositor, screen, duration, true);
+        impl.ScheduleSharpen();
 
         impl.visible = true;
     });
@@ -2796,6 +2942,8 @@ void Mission::BrowseDesktop(int index) {
             screen.chromeLayer.Opacity(0.0f);
             StartReveal(impl.compositor, screen, duration, false);
         }
+
+        impl.ScheduleSharpen();
 
         MACTAB_DIAG("mission: browsing desktop %d", index);
     });
@@ -2912,10 +3060,11 @@ void Mission::Impl::FinishHide() {
     // exactly when a device is lost. Bailing there left full-screen topmost
     // windows up with nothing able to take them down again, since Visible() was
     // false and every caller checks it. Doing the work twice costs nothing.
-    if (closeTimer && !screens.empty()) {
-        ::KillTimer(screens.front().hwnd, closeTimer);
-        closeTimer = 0;
+    if (!screens.empty()) {
+        if (closeTimer) ::KillTimer(screens.front().hwnd, closeTimer);
+        ::KillTimer(screens.front().hwnd, kSharpenTimerId);
     }
+    closeTimer = 0;
 
     visible = false;
     closing = false;

@@ -118,6 +118,14 @@ struct Settings {
     // How long the windows take to fly from where they are to where they land.
     UINT missionRevealMs = 260;
 
+    // Replace a live preview with a properly filtered still once the windows
+    // have landed, for the ones the compositor cannot reduce honestly.
+    //
+    // On by default, because the complaint this answers is that big windows come
+    // out unreadable and the compositor has exactly one sampling mode. The cost
+    // is that those previews stop moving; 0 keeps them live and soft.
+    bool missionSharpPreviews = true;
+
     // Which thumbnail path to use: "auto", "shared", "snapshot" or "icon".
     //
     // Here for the same reason glassRimTap is. The shared-visual path goes

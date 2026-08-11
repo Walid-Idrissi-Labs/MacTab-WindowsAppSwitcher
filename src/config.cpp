@@ -100,6 +100,12 @@ const wchar_t* kDefaultIni =
     L"; How long the windows take to fly out to their places, in milliseconds.\r\n"
     L"MissionRevealMs=260\r\n"
     L"\r\n"
+    L"; Once the windows have landed, replace the live preview of anything the\r\n"
+    L"; compositor cannot reduce honestly with a still of the same window, taken\r\n"
+    L"; at twice the size it is shown at and filtered properly. Those previews\r\n"
+    L"; stop moving; 0 keeps them live and soft.\r\n"
+    L"MissionSharpPreviews=1\r\n"
+    L"\r\n"
     L"; How window contents are shown.\r\n"
     L";   auto     use the best one this machine supports\r\n"
     L";   shared   live thumbnails, which is the only one that can animate\r\n"
@@ -421,6 +427,7 @@ void Load() {
     g_settings.missionEnabled    = ReadInt(L"MissionEnabled", 0) != 0;
     g_settings.missionGesture    = ReadString(L"MissionGesture", L"wintab");
     g_settings.missionGroupByApp = ReadInt(L"MissionGroupByApp", 1) != 0;
+    g_settings.missionSharpPreviews = ReadInt(L"MissionSharpPreviews", 1) != 0;
     g_settings.missionRevealMs   = static_cast<UINT>(
         (std::max)(0, (std::min)(2000, ReadInt(L"MissionRevealMs", 260))));
     g_settings.missionThumbnails = ReadString(L"MissionThumbnails", L"auto");
