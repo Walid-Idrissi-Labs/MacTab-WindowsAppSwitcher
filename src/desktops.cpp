@@ -256,14 +256,18 @@ bool SwitchTo(const State& state, int targetIndex) {
 }
 
 bool WaitForCurrent(const GUID& target, DWORD timeoutMs) {
-    const DWORD deadline = ::GetTickCount() + timeoutMs;
+    // Elapsed by unsigned subtraction rather than against a deadline. Adding the
+    // timeout to the tick count wraps every 49.7 days, and a wrapped deadline is
+    // already in the past, so the first check would time out at once and the
+    // close would be refused for no reason anybody could work out.
+    const DWORD started = ::GetTickCount();
 
     for (;;) {
         GUID current{};
         if (CurrentFromRegistry(current) && ::IsEqualGUID(current, target))
             return true;
 
-        if (::GetTickCount() >= deadline) return false;
+        if (::GetTickCount() - started >= timeoutMs) return false;
         ::Sleep(10);
     }
 }

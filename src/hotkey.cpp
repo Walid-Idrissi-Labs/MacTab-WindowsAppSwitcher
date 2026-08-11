@@ -393,6 +393,22 @@ DWORD WINAPI HookThreadProc(LPVOID param) {
 
 } // namespace
 
+void QualifyForeground() {
+    // A Ctrl tap, tagged so the hook passes it through instead of feeding it
+    // back into its own state machine. The same pair the Mission Control gesture
+    // uses, and for the same reason: Ctrl on its own does nothing to anybody.
+    INPUT tap[2]{};
+    for (int i = 0; i < 2; ++i) {
+        tap[i].type           = INPUT_KEYBOARD;
+        tap[i].ki.wVk         = VK_LCONTROL;
+        tap[i].ki.wScan       = static_cast<WORD>(
+            ::MapVirtualKeyW(VK_LCONTROL, MAPVK_VK_TO_VSC));
+        tap[i].ki.dwFlags     = (i == 1) ? KEYEVENTF_KEYUP : 0u;
+        tap[i].ki.dwExtraInfo = kInjectionTag;
+    }
+    ::SendInput(2, tap, sizeof(INPUT));
+}
+
 bool IsOwnInjection(ULONG_PTR extraInfo) {
     return extraInfo == kInjectionTag;
 }

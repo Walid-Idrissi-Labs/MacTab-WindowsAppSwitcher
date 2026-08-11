@@ -89,6 +89,10 @@ public:
     // Which desktop is being looked at, or -1.
     int  BrowsedDesktop() const;
 
+    // About to add or close a desktop: stop treating a loss of activation as the
+    // user leaving, until FollowDesktop has put things right.
+    void BeginDesktopChurn();
+
     // Move the overlays onto `desktop` and put them back in front.
     //
     // For the two things that change the machine from inside: adding a desktop

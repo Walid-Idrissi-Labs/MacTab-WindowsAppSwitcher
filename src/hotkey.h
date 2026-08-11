@@ -195,6 +195,16 @@ WORD GestureAltKey();
 // the accepted way to qualify. Call this immediately before activating.
 void NeutralizeAlt(WORD altVirtualKey);
 
+// Produce a tagged keystroke that goes nowhere, purely to qualify this process
+// to take the foreground.
+//
+// A process may call SetForegroundWindow if it produced the last input event.
+// Mission Control earns that on the way in, from the Ctrl tap the hook injects
+// alongside swallowing the gesture; it has to earn it again after the shell has
+// switched desktops out from under it, or coming back is a taskbar flash rather
+// than a window.
+void QualifyForeground();
+
 // True if the key event currently being processed was injected by us. Exposed
 // for the activation path, which must not treat its own synthetic input as a
 // user gesture.

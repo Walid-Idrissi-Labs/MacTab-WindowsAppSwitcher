@@ -26,6 +26,7 @@
 #include "mission.h"
 #include "com.h"
 #include "desktops.h"
+#include "hotkey.h"
 #include "common.h"
 #include "config.h"
 #include "diag.h"
@@ -298,6 +299,7 @@ struct Mission::Impl {
         RECT       homeRect{};
         float      baseW = 1.0f;   // the holder's own size, which Scale multiplies
         float      baseH = 1.0f;
+        HWND       window = nullptr;   // the window it is showing
         int        item  = -1;     // index into Impl::items
         int        group = 0;
         int        depth = 0;      // 0 is the front of its pile
@@ -1855,6 +1857,7 @@ void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
         tile.baseW    = place.w;
         tile.baseH    = place.h;
 
+        tile.window   = item.hwnd;
         tile.homeRect = RECT{ item.bounds.left   - screen.rect.left,
                               item.bounds.top    - screen.rect.top,
                               item.bounds.right  - screen.rect.left,
@@ -2573,11 +2576,17 @@ bool Mission::Impl::FinishDrag(Screen& screen, POINT client) {
 // it, and every window past the gap would then fly in from the position of its
 // neighbour.
 void Mission::Impl::Rearrange(int desktop) {
+    // Keyed on the handle each tile carries, not on its index into `items`.
+    //
+    // The index is the obvious thing to reach for and it is wrong wherever this
+    // is worth having: a removed window shifts every index after it, and a
+    // rebuild replaces the list outright, so looking the old tile's index up in
+    // the new list pairs each surviving window with its neighbour's position.
+    // Every window past the gap would then fly in from next door.
     std::map<HWND, RECT> current;
     for (const Screen& other : screens)
         for (const Tile& tile : other.tiles)
-            if (tile.item >= 0 && tile.item < static_cast<int>(items.size()))
-                current.emplace(items[static_cast<size_t>(tile.item)].hwnd, tile.liveRect);
+            if (tile.window) current.emplace(tile.window, tile.liveRect);
 
     BuildForDesktop(desktop, 0);
 
@@ -2586,8 +2595,7 @@ void Mission::Impl::Rearrange(int desktop) {
             tile.holder.Opacity(1.0f);
             if (tile.chrome) tile.chrome.Opacity(1.0f);
 
-            if (tile.item < 0 || tile.item >= static_cast<int>(items.size())) continue;
-            const auto was = current.find(items[static_cast<size_t>(tile.item)].hwnd);
+            const auto was = current.find(tile.window);
             if (was != current.end()) tile.sourceRect = was->second;
         }
         StartReveal(compositor, other,
@@ -2689,7 +2697,7 @@ int Mission::BrowsedDesktop() const { return m_impl->browsed; }
 // somewhere instead of looking somewhere.
 void Mission::BrowseDesktop(int index) {
     Impl& impl = *m_impl;
-    if (!impl.visible) return;
+    if (!impl.visible || impl.closing) return;
     if (index < 0 || index >= static_cast<int>(impl.spaces.size())) return;
     if (index == impl.browsed) return;
 
@@ -2716,6 +2724,17 @@ void Mission::BrowseDesktop(int index) {
     });
 }
 
+void Mission::BeginDesktopChurn() {
+    // Set BEFORE the shortcut is injected, not only after.
+    //
+    // The message loop does not run while we wait for the shell, so the
+    // deactivations the switch produces queue up and are delivered in a batch
+    // afterwards. Squelching only on the way back out works by that argument
+    // alone, which is a thin thing to rely on for the difference between the
+    // overlay staying up and it closing the moment a desktop is added.
+    m_impl->ignoreFocusUntil = ::GetTickCount() + 3000;
+}
+
 void Mission::FollowDesktop(const GUID& desktop) {
     Impl& impl = *m_impl;
     if (!impl.visible) return;
@@ -2727,7 +2746,7 @@ void Mission::FollowDesktop(const GUID& desktop) {
     // Everything the switch made Windows say about our activation is now stale,
     // and it has been queued rather than delivered, because the message loop was
     // not running while we waited for the shell.
-    impl.ignoreFocusUntil = ::GetTickCount() + 600;
+    impl.ignoreFocusUntil = ::GetTickCount() + 800;
 
     for (Impl::Screen& screen : impl.screens) {
         desktops::MoveWindowTo(screen.hwnd, desktop);
@@ -2735,9 +2754,13 @@ void Mission::FollowDesktop(const GUID& desktop) {
                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 
-    // Allowed, and not by luck: the desktop was changed by injecting the same
-    // keystrokes a user would press, so this process produced the last input
-    // event, which is one of the conditions under which foreground may be taken.
+    // Allowed because this process produced the last input event, which is one
+    // of the conditions under which foreground may be taken. That was true of
+    // the chord that changed the desktop, but the shell has taken foreground
+    // since, so it is made true again rather than assumed. Without it, coming
+    // back is a taskbar flash and the overlay is on screen with no keyboard.
+    hotkey::QualifyForeground();
+
     if (!impl.screens.empty()) {
         ::SetForegroundWindow(impl.screens.front().hwnd);
         ::SetFocus(impl.screens.front().hwnd);
@@ -2747,7 +2770,7 @@ void Mission::FollowDesktop(const GUID& desktop) {
 void Mission::Rebuild(std::vector<MissionItem> items, std::vector<MissionSpace> spaces,
                       int desktop) {
     Impl& impl = *m_impl;
-    if (!impl.visible) return;
+    if (!impl.visible || impl.closing) return;
 
     GuardMission(impl, "Rebuild", [&] {
         impl.items  = std::move(items);
@@ -2769,7 +2792,7 @@ void Mission::Rebuild(std::vector<MissionItem> items, std::vector<MissionSpace> 
 
 bool Mission::ForgetWindow(HWND hwnd) {
     Impl& impl = *m_impl;
-    if (!impl.visible || !hwnd) return false;
+    if (!impl.visible || impl.closing || !hwnd) return false;
 
     const auto gone = std::find_if(impl.items.begin(), impl.items.end(),
                                    [hwnd](const MissionItem& item) {
@@ -2805,8 +2828,13 @@ std::vector<HWND> Mission::Windows() const {
 // Split out of Hide because the windows fly back to where they came from first,
 // and that takes as long as the reveal did. Safe to call twice.
 void Mission::Impl::FinishHide() {
-    if (!visible && !closing) return;
-
+    // No early return on "not visible".
+    //
+    // The path that needs this most is the one where Show threw after the
+    // windows were already on screen but before `visible` was set, which is
+    // exactly when a device is lost. Bailing there left full-screen topmost
+    // windows up with nothing able to take them down again, since Visible() was
+    // false and every caller checks it. Doing the work twice costs nothing.
     if (closeTimer && !screens.empty()) {
         ::KillTimer(screens.front().hwnd, closeTimer);
         closeTimer = 0;

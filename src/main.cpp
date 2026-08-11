@@ -636,11 +636,13 @@ void ActivateFromMission(int index) {
 // list of desktops changing length. Bounded, and a timeout means the rest of the
 // work is skipped rather than done on a stale picture.
 bool WaitForDesktopCount(size_t before, DWORD timeoutMs = 800) {
-    const DWORD deadline = ::GetTickCount() + timeoutMs;
+    // Elapsed by unsigned subtraction, not against a deadline: adding to the
+    // tick count wraps every 49.7 days, and a wrapped deadline is already past.
+    const DWORD started = ::GetTickCount();
     for (;;) {
         const desktops::State state = desktops::Query(g_app.host);
         if (state.known && state.all.size() != before) return true;
-        if (::GetTickCount() >= deadline) return false;
+        if (::GetTickCount() - started >= timeoutMs) return false;
         ::Sleep(10);
     }
 }
@@ -653,10 +655,25 @@ bool WaitForDesktopCount(size_t before, DWORD timeoutMs = 800) {
 // and rebuild in place. macOS stays open through both, and closing and reopening
 // would throw away the thing the user was in the middle of.
 void ChangeSpaces(bool add, int index) {
+    // A click can be sitting in the queue behind a dismissal. Acting on it then
+    // would create or destroy a real desktop with the overlay already gone, and
+    // re-install watchers that nothing would ever take down again.
+    if (!g_app.mission.Visible()) return;
+
     const desktops::State before = desktops::Query(g_app.host);
-    if (!before.known) return;
+    if (!before.known || before.current < 0) return;
 
     const size_t was = before.all.size();
+
+    // Where the user actually is, so closing a desktop does not move them.
+    //
+    // Closing one you are not on means going there, and the shell then lands you
+    // on a neighbour of the desktop it just removed. Deleting desktop 4 while
+    // standing on desktop 1 should not put you on desktop 3.
+    const GUID home = before.all[static_cast<size_t>(before.current)].id;
+    const bool closingCurrent = !add && index == before.current;
+
+    g_app.mission.BeginDesktopChurn();
 
     if (add) {
         if (!desktops::Create()) return;
@@ -670,6 +687,17 @@ void ChangeSpaces(bool add, int index) {
     if (!WaitForDesktopCount(was)) {
         MACTAB_WARN("mission: the desktop list never changed; leaving the strip alone");
         return;
+    }
+
+    // Back to where the user was, unless that is the desktop they just closed,
+    // in which case wherever the shell put them is the only answer there is.
+    if (!add && !closingCurrent) {
+        const desktops::State now = desktops::Query(g_app.host);
+        const int back = now.known ? desktops::IndexOf(now, home) : -1;
+        if (back >= 0 && back != now.current) {
+            desktops::SwitchTo(now, back);
+            desktops::WaitForCurrent(home);
+        }
     }
 
     MissionPayload payload = BuildMissionPayload();
@@ -779,6 +807,14 @@ void StartWatchingWindows() {
     // only way to notice one appearing is to look. Twice a second, two registry
     // reads each time, and only while the overlay is on screen.
     ::SetTimer(g_app.host, kMissionWatchTimer, 500, nullptr);
+
+    // Anything that died between the list being built and the hooks going in.
+    // That gap covers the whole of Show, which is where the thumbnails are
+    // registered and the reveal starts, so it is not a narrow one.
+    for (HWND hwnd : g_missionWindows)
+        if (!::IsWindow(hwnd))
+            ::PostMessageW(g_app.host, WM_MACTAB_MC_GONE,
+                           reinterpret_cast<WPARAM>(hwnd), 0);
 }
 
 // A window the overlay was showing has gone.
@@ -800,9 +836,8 @@ void ForgetMissionWindow(HWND hwnd) {
 // closest fire for every menu, tooltip and splash screen in the session. So
 // arrivals are noticed by looking, which is affordable at twice a second and
 // only while the overlay is up.
-std::vector<HWND> EligibleWindows() {
+std::vector<HWND> EligibleWindows(const desktops::State& state) {
     std::vector<HWND> handles;
-    const desktops::State state = desktops::Query(g_app.host);
 
     for (const SwitcherApp& app : BuildWindowList(state.known && state.all.size() > 1))
         for (const SwitcherWindow& window : app.windows)
@@ -826,7 +861,7 @@ void SyncMission() {
     if (!desktopsChanged) {
         std::vector<HWND> showing = g_app.mission.Windows();
         std::sort(showing.begin(), showing.end());
-        windowsChanged = (showing != EligibleWindows());
+        windowsChanged = (showing != EligibleWindows(state));
     }
 
     if (!desktopsChanged && !windowsChanged) return;
@@ -1196,8 +1231,12 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             //
             // The panel picks them up at the next gesture, because it copies the
             // theme's material when it lays out rather than caching one at
-            // startup.
+            // startup. Mission Control's bar does not: it is baked once and kept,
+            // precisely so that walking the desktops does not re-run a full-width
+            // displacement map, so it has to be thrown away by hand or a reload
+            // would reach everything except the piece most likely to be tuned.
             config::ReloadGlass();
+            g_app.mission.InvalidateBackdrop();
             g_app.tray.ShowBalloon(L"MacTab",
                                    L"Glass reloaded. Alt+Tab to see it.");
             return 0;
@@ -1273,6 +1312,17 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // A monitor came or went, so the overlays are sized and positioned for
         // a desktop that no longer exists. Dropping the wallpapers is not
         // enough; the windows themselves have to be made again.
+        //
+        // The rest of the state that says Mission Control is open has to come
+        // down with them. Without this the hook goes on swallowing Ctrl+Win+Left
+        // and Ctrl+Win+Right and posting them at an overlay that no longer
+        // exists, so the user's desktop-switch keys are dead until the next time
+        // Mission Control is opened and closed properly, and both window watchers
+        // are left installed for the rest of the session.
+        if (g_app.mission.Visible()) {
+            StopWatchingWindows();
+            hotkey::SetMissionOpen(false);
+        }
         g_app.mission.DisplaysChanged();
         return 0;
 
