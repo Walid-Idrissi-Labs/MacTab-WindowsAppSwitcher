@@ -182,7 +182,7 @@ target_link_libraries(MacTab PRIVATE
     dxgi
     dwrite
     shcore         # GetDpiForMonitor
-    windowscodecs  # PNG decoding for icon theme packs
+    windowscodecs  # PNG decoding: icon theme packs, and 256px icon frames
     version        # FileDescription from executables' version resources
 )
 

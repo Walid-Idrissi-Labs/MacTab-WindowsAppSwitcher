@@ -29,7 +29,10 @@ constexpr int kSourceIconSize = 256;
 constexpr size_t kMaxCachedTiles = 96;
 
 constexpr uint32_t kDiskCacheMagic   = 0x4D544943;   // 'MTIC'
-constexpr uint32_t kDiskCacheVersion = 1;
+// Bumped whenever the pipeline changes what it would produce from the same
+// source. Cached tiles are the finished pixels, so without this a user who has
+// ever launched an older build keeps its output forever.
+constexpr uint32_t kDiskCacheVersion = 2;
 
 struct CacheKey {
     std::wstring appKey;
@@ -154,7 +157,7 @@ void WriteDiskCache(const std::wstring& path, const Bitmap& bitmap) {
 
 // --- shell extraction (worker thread only) ----------------------------------
 
-Bitmap ImageFromShellItem(IShellItem* item, int size) {
+Bitmap ImageFromShellItem(IShellItem* item, int size, bool* alphaMissing = nullptr) {
     ComPtr<IShellItemImageFactory> factory;
     if (FAILED(item->QueryInterface(IID_PPV_ARGS(factory.Put()))))
         return {};
@@ -164,12 +167,17 @@ Bitmap ImageFromShellItem(IShellItem* item, int size) {
 
     // ICONONLY: never substitute a document thumbnail for the app's icon.
     // BIGGERSIZEOK: prefer a larger cached entry over an upscaled small one.
+    //
+    // Deliberately not SIIGBF_SCALEUP. It would make the shell stretch a small
+    // icon to fill the request, which trades a shell-quality enlargement for
+    // the ability to tell that the icon was small in the first place, and that
+    // is the one fact the rest of the pipeline needs.
     const HRESULT hr = factory->GetImage(
         requested, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, &bitmap);
     if (FAILED(hr) || !bitmap)
         return {};
 
-    Bitmap result = FromHBitmap(bitmap);
+    Bitmap result = FromHBitmap(bitmap, alphaMissing);
     ::DeleteObject(bitmap);
     return result;
 }
@@ -206,12 +214,31 @@ Bitmap ExtractPackaged(const Request& request, std::wstring& displayName) {
 Bitmap ExtractExecutable(const Request& request) {
     if (request.exePath.empty()) return {};
 
+    // The file's own icon group first, and the shell only if that misses.
+    //
+    // Both routes end at the same icon, but they arrive in different condition.
+    // The file gives the frames as they were authored, with their alpha, and
+    // says how big the largest one is. The shell gives a fixed-size canvas with
+    // the icon somewhere in it, and regularly gives it with the alpha already
+    // flattened onto black. What the shell has that the file does not is
+    // coverage of apps whose icon is not in the exe at all: a custom icon
+    // handler, or a DefaultIcon pointing at some other file.
+    Bitmap direct = FromExecutableResource(request.exePath);
+    if (!direct.Empty())
+        return direct;
+
     ComPtr<IShellItem> item;
     if (FAILED(::SHCreateItemFromParsingName(request.exePath.c_str(), nullptr,
                                              IID_PPV_ARGS(item.Put()))))
         return {};
 
-    return ImageFromShellItem(item.Get(), kSourceIconSize);
+    bool alphaMissing = false;
+    Bitmap image = ImageFromShellItem(item.Get(), kSourceIconSize, &alphaMissing);
+    if (alphaMissing)
+        MACTAB_DIAG("icons: shell lost the alpha channel for %s",
+                    ToUtf8(request.exePath).c_str());
+
+    return image;
 }
 
 // Last resort. WM_GETICON is a send, so it can hang on a wedged app; use the

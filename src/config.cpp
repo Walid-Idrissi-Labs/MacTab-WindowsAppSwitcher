@@ -1,11 +1,11 @@
 #include "pch.h"
-#include <wincodec.h>
 
 #include "config.h"
 #include "glass_tune.h"
 #include "com.h"
 #include "common.h"
 #include "diag.h"
+#include "icon_source.h"
 
 namespace mactab::config {
 namespace {
@@ -298,57 +298,6 @@ std::wstring ThemeName(const std::wstring& exePath, const std::wstring& aumid) {
     if (dot != std::wstring::npos && dot > 0)
         name.erase(dot);
     return name;
-}
-
-// Decode a PNG through WIC, which is in the OS and handles colour profiles and
-// interlacing properly, worth far more than the few lines a minimal decoder
-// would save.
-Bitmap DecodeImageFile(const std::wstring& path) {
-    ComApartment apartment(COINIT_APARTMENTTHREADED);
-
-    ComPtr<IWICImagingFactory> factory;
-    if (FAILED(::CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                  IID_PPV_ARGS(factory.Put()))))
-        return {};
-
-    ComPtr<IWICBitmapDecoder> decoder;
-    if (FAILED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-                                                  WICDecodeMetadataCacheOnLoad,
-                                                  decoder.Put())))
-        return {};
-
-    ComPtr<IWICBitmapFrameDecode> frame;
-    if (FAILED(decoder->GetFrame(0, frame.Put())))
-        return {};
-
-    // Convert to straight-alpha BGRA to match our Bitmap contract; the pipeline
-    // premultiplies only at upload.
-    ComPtr<IWICFormatConverter> converter;
-    if (FAILED(factory->CreateFormatConverter(converter.Put())) ||
-        FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
-                                     WICBitmapDitherTypeNone, nullptr, 0.0,
-                                     WICBitmapPaletteTypeCustom)))
-        return {};
-
-    UINT width = 0, height = 0;
-    if (FAILED(converter->GetSize(&width, &height)) || width == 0 || height == 0)
-        return {};
-
-    if (width > 2048 || height > 2048) {
-        MACTAB_WARN("config: theme image %s is %ux%u, refusing",
-                    ToUtf8(path).c_str(), width, height);
-        return {};
-    }
-
-    Bitmap out = Bitmap::Create(static_cast<int>(width), static_cast<int>(height));
-    const UINT stride = width * 4;
-    const UINT bytes  = stride * height;
-
-    if (FAILED(converter->CopyPixels(nullptr, stride, bytes,
-                                     reinterpret_cast<BYTE*>(out.pixels.data()))))
-        return {};
-
-    return out;
 }
 
 void Migrate() {
