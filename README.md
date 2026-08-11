@@ -251,6 +251,61 @@ reference's 2.02. That is the only honest definition of "1:1" available to a
 project that cannot run its own output: the script that measured Apple returns
 the same numbers on ours.
 
+## Where the icons come from
+
+An app icon is the one thing on the panel that MacTab does not draw, so all the
+quality is in picking the right source. The obvious route, asking the shell for
+a 256px image, is the worst of the four for reasons that are not obvious at all.
+
+**An executable's icon is read out of the file.** `RT_GROUP_ICON` is the same
+icon group Explorer and the taskbar draw from, and taking it directly gives the
+frames as they were authored, the largest one picked deliberately, and the true
+native size. Since Vista a 256px frame is a whole PNG rather than a bitmap, so it
+goes through WIC with its alpha intact.
+
+The shell will not enlarge an icon past the largest frame an app actually ships.
+Ask it for 256 from an app whose best frame is 48 and you get a 48px mark adrift
+in a 256 canvas, with nothing in the result to tell you that is what happened. It
+also hands the icon over as a GDI bitmap, which regularly arrives 32-bit with
+every alpha byte zero, because the icon's transparency lived in an AND mask or
+the handler drew through plain GDI. Read literally that is an invisible icon, so
+it has to be forced opaque, which turns the padding around a small mark into
+black. The shell stays as the fallback, because it is the only thing that covers
+apps whose icon is not in the exe at all: a custom icon handler, or a
+`DefaultIcon` pointing somewhere else.
+
+**A packaged app's icon is read out of its package.** Binding
+`shell:AppsFolder\<AUMID>` returns the logo already composited onto the
+background colour from the app's manifest. Windows does not draw it that way
+anywhere the user sees it; the taskbar and the built-in switcher use the unplated
+asset. So MacTab resolves the AUMID to a package family, reads `Square44x44Logo`
+and `BackgroundColor` out of `AppxManifest.xml`, and picks the best variant on
+disk. Resolution decides, since not being able to get a big enough icon is the
+whole reason for going there; between two of the same size the unplated design
+wins. Every package in the family is searched, not just the main one, because
+Store apps are split into a main package plus resource packages and the larger
+assets often live in one of the latter. `BackgroundColor` becomes the colour of
+the tile behind the mark, which is what Windows plates the same app with.
+
+**Whatever arrives, anything painted behind the mark comes off.** Both of the
+bad sources above hand over an icon with its background baked in, and both look
+like the same defect: a small mark adrift in a big coloured square. A flood fill
+runs inward from the border and takes out whatever flat colour it finds there. A
+flood rather than a colour key, because a key would also punch out any part of
+the artwork that matched, which for black padding means every dark pixel in the
+icon. Padding reaches the border; the dark half of a logo does not.
+
+**Then the mark is measured, not the canvas it came in.** How full the mark's own
+bounding box is decides whether it stands on its own or gets a tile generated
+behind it: a circle fills 79% of its box, a rounded square nearly all of it, a
+letterform about a third. Measuring the canvas instead means a small but
+genuinely full-bleed icon reads as a sparse glyph and gets a synthesised plate
+behind artwork that already had its own background.
+
+Enlargement is Catmull-Rom rather than bilinear, and stops at 2.5x. Past that a
+mark is drawn smaller instead. A small sharp icon reads as an icon; a large soft
+one reads as a mistake.
+
 ## Building
 
 Requires **Visual Studio 2022** (or Build Tools 2022) with the *Desktop
@@ -651,7 +706,12 @@ shared; the plumbing is what CI and a real machine are for.
 This is the only part of the project that gets looked at before it ships, and it
 has already earned its keep; it caught icons being scaled by canvas instead of
 content, generated tiles landing at the same brightness as the glyph on them,
-and a square selection highlight sitting next to squircle icons.
+and a square selection highlight sitting next to squircle icons. Two of its
+cases are not shapes at all but reproductions of how a real icon arrives
+damaged: a mark flattened onto black padding, and a logo composited onto its
+manifest's background colour. Both used to come out as a dot in the middle of a
+coloured square, which is exactly what they look like on Windows, and now both
+are visibly fixed in a PNG before anything is tagged.
 
 `src/panel.cpp` is the one file neither tool reaches, because C++/WinRT ships
 only with the Windows SDK. Every review round so far has found that defects
