@@ -362,6 +362,7 @@ struct Mission::Impl {
 
     void BakeBackdrop(Screen& screen);
     void BakeBarGlass(Screen& screen);
+    void RestBar(Screen& screen);
     void BakeBar(Screen& screen);
     float BarHeight(const Screen& screen) const;
     void BakeChrome(Screen& screen, Tile& tile);
@@ -1370,6 +1371,22 @@ void Mission::Impl::BakeBarGlass(Screen& screen) {
     screen.barGlass.Offset({ -over, -over, 0.0f });
 }
 
+// Put the strip back where it rests.
+//
+// The collapse leaves it above the top of the screen, and a Composition offset
+// animation does not reset itself. Without this the second invocation would open
+// with no strip at all.
+void Mission::Impl::RestBar(Screen& screen) {
+    if (screen.barGlass) {
+        screen.barGlass.StopAnimation(L"Offset");
+        screen.barGlass.Offset({ -screen.barOverhang, -screen.barOverhang, 0.0f });
+    }
+    if (screen.bar) {
+        screen.bar.StopAnimation(L"Offset");
+        screen.bar.Offset({ 0.0f, 0.0f, 0.0f });
+    }
+}
+
 void Mission::Impl::BakeBar(Screen& screen) {
     screen.chips.clear();
 
@@ -2201,6 +2218,27 @@ void StartReveal(WUC::Compositor compositor, Mission::Impl::Screen& screen,
 
     if (!fadeRoot) return;
 
+    // The strip comes down from the top edge rather than fading in place, which
+    // is what macOS does with it and what makes it read as a thing arriving
+    // rather than as part of the same wash as everything else.
+    //
+    // Only on the way in. Walking from one desktop to another rebuilds the
+    // arrangement under a strip that has not moved, and re-running this would
+    // have the desktops jump every time an arrow was pressed.
+    const float barH = screen.Scaled(kBarHeight);
+    if (barH > 0.0f) {
+        auto slide = [&](WUC::SpriteVisual& visual, float restX, float restY) {
+            if (!visual) return;
+            auto drop = compositor.CreateVector3KeyFrameAnimation();
+            drop.InsertKeyFrame(0.0f, { restX, restY - barH, 0.0f });
+            drop.InsertKeyFrame(1.0f, { restX, restY, 0.0f }, easing);
+            drop.Duration(duration);
+            visual.StartAnimation(L"Offset", drop);
+        };
+        slide(screen.barGlass, -screen.barOverhang, -screen.barOverhang);
+        slide(screen.bar, 0.0f, 0.0f);
+    }
+
     auto fade = compositor.CreateScalarKeyFrameAnimation();
     fade.InsertKeyFrame(0.0f, 0.0f);
     fade.InsertKeyFrame(1.0f, 1.0f, easing);
@@ -2736,6 +2774,7 @@ void Mission::Impl::FinishHide() {
         GuardMission(*this, "Hide", [&] {
             screen.root.Opacity(0.0f);
             screen.outline.Opacity(0.0f);
+            RestBar(screen);
         });
         ::ShowWindow(screen.hwnd, SW_HIDE);
 
@@ -2782,7 +2821,20 @@ void Mission::Hide(bool restoreFocus, bool immediate) {
             auto easing = impl.compositor.CreateCubicBezierEasingFunction(
                 { 0.4f, 0.0f }, { 0.2f, 1.0f });
 
+            const auto lift = [&](WUC::SpriteVisual& visual, float restX, float restY,
+                                  float barH) {
+                if (!visual || barH <= 0.0f) return;
+                auto up = impl.compositor.CreateVector3KeyFrameAnimation();
+                up.InsertKeyFrame(1.0f, { restX, restY - barH, 0.0f }, easing);
+                up.Duration(duration);
+                visual.StartAnimation(L"Offset", up);
+            };
+
             for (Impl::Screen& screen : impl.screens) {
+                const float barH = screen.Scaled(kBarHeight);
+                lift(screen.barGlass, -screen.barOverhang, -screen.barOverhang, barH);
+                lift(screen.bar, 0.0f, 0.0f, barH);
+
                 screen.outline.Opacity(0.0f);
                 screen.chromeLayer.StartAnimation(
                     L"Opacity", [&] {
