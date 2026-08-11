@@ -293,7 +293,19 @@ like the same defect: a small mark adrift in a big coloured square. A flood fill
 runs inward from the border and takes out whatever flat colour it finds there. A
 flood rather than a colour key, because a key would also punch out any part of
 the artwork that matched, which for black padding means every dark pixel in the
-icon. Padding reaches the border; the dark half of a logo does not.
+icon. Padding reaches the border; the dark half of a logo does not, and the
+flood will not cross transparency to get to it.
+
+It runs twice, because two layers of background is a real combination rather
+than a hypothetical: the shell pads an icon that already has a plate baked into
+it out to a fixed canvas with transparency. The transparency is what the border
+sees, so the first pass finds nothing to do and the plate only becomes reachable
+once the padding has been cropped off.
+
+What is *not* stripped is a plate the app meant to have. An icon that is a black
+square with a white mark on it keeps its black, because an icon adrift in
+padding is a mark on its own and takes the artwork path, where there is no tile
+to colour in the first place.
 
 **Then the mark is measured, not the canvas it came in.** How full the mark's own
 bounding box is decides whether it stands on its own or gets a tile generated
