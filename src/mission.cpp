@@ -1980,8 +1980,22 @@ void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
                 dc->Clear(D2D1::ColorF(0, 0, 0, 0));
 
                 if (!content.Empty()) {
-                    if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(content)))
-                        dc->DrawBitmap(bitmap.Get(), D2D1::RectF(0.0f, 0.0f, place.w, place.h));
+                    if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(content))) {
+                        // Cubic rather than the linear DrawBitmap defaults to.
+                        //
+                        // The snapshot has already been reduced to fit the tile
+                        // by a box filter, which is the right way to do the big
+                        // reduction, but aspect ratio is preserved so it lands a
+                        // pixel or two short in one axis and this last step is a
+                        // small stretch. Linear on a small stretch is visibly
+                        // soft, and this is drawn once per window per gesture,
+                        // so the better filter costs nothing worth counting.
+                        dc->DrawBitmap(bitmap.Get(),
+                                       D2D1::RectF(0.0f, 0.0f, place.w, place.h),
+                                       1.0f,
+                                       D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                                       nullptr);
+                    }
                 } else {
                     // A window-shaped plate with the app's icon on it, which is
                     // a design rather than a hole.

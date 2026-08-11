@@ -94,6 +94,16 @@ void CheckBitmapBrush(ID2D1DeviceContext* dc, ID2D1Bitmap1* bitmap) {
 
 // The rounded capsule behind the window title, and the geometry stroke around
 // a space chip.
+// The five-argument DrawBitmap on ID2D1DeviceContext, which is the one that
+// takes an interpolation mode. The four-argument ID2D1RenderTarget overload
+// takes a BITMAP_INTERPOLATION_MODE instead, and the two enums are not the same
+// type, so picking the wrong overload is a compile error on Windows and nothing
+// at all here unless something checks it.
+void CheckDrawBitmapCubic(ID2D1DeviceContext* dc, ID2D1Bitmap1* bitmap) {
+    dc->DrawBitmap(bitmap, D2D1::RectF(0.0f, 0.0f, 100.0f, 100.0f), 1.0f,
+                   D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
+}
+
 void CheckMissionChrome(ID2D1DeviceContext* dc, ID2D1PathGeometry* geometry,
                         ID2D1SolidColorBrush* brush) {
     const D2D1_ROUNDED_RECT capsule{ D2D1::RectF(0.0f, 0.0f, 200.0f, 30.0f),
