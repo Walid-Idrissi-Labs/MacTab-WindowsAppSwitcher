@@ -57,8 +57,16 @@ constexpr float kChipLabel    = 24.0f;    // the name under a miniature
 constexpr float kBarInset     = 40.0f;    // how far the add button sits from the edge
 constexpr float kOuterMargin  = 56.0f;
 constexpr float kBadgeSize    = 46.0f;    // the app icon over a window
-constexpr float kTitleHeight  = 26.0f;
-constexpr float kTitleGap     = 8.0f;
+constexpr float kTitleHeight  = 22.0f;
+constexpr float kTitleGap     = 1.0f;     // the name sits right under the icon
+
+// How far the name's shadow is offset and how far it is spread.
+//
+// The name has no plate behind it any more, so this is the only thing keeping it
+// legible, and it has to work over a photograph. Drawn as the same text several
+// times in black at low alpha, offset around the glyphs, which is a cheap
+// approximation of a blur and the one macOS uses on desktop icon labels.
+constexpr float kTitleShadow  = 1.6f;
 constexpr float kTileRadius   = 8.0f;
 constexpr float kOutlineWidth = 3.0f;
 
@@ -122,7 +130,13 @@ struct Theme {
     D2D1_COLOR_F chip;
     D2D1_COLOR_F chipBorder;
     D2D1_COLOR_F text;
-    D2D1_COLOR_F plate;
+
+    // The window name under an icon, which sits on the wallpaper rather than on
+    // anything of ours. Near-white in both appearances, because what is behind it
+    // is a photograph and not the theme: it is legible over a bright wallpaper
+    // from its shadow rather than from its own colour, exactly as macOS does with
+    // desktop icon labels.
+    D2D1_COLOR_F tileName;
 };
 
 // The material the spaces bar is made of.
@@ -141,13 +155,13 @@ Theme MakeTheme(bool light) {
         theme.chip         = { 1.00f, 1.00f, 1.00f, 0.42f };
         theme.chipBorder   = { 0.10f, 0.10f, 0.12f, 0.45f };
         theme.text         = { 0.08f, 0.08f, 0.10f, 1.00f };
-        theme.plate        = { 1.00f, 1.00f, 1.00f, 0.78f };
+        theme.tileName     = { 1.00f, 1.00f, 1.00f, 1.00f };
     } else {
         theme.backdropTint = { 0.03f, 0.03f, 0.05f, 0.55f };
         theme.chip         = { 1.00f, 1.00f, 1.00f, 0.16f };
         theme.chipBorder   = { 1.00f, 1.00f, 1.00f, 0.62f };
         theme.text         = { 0.96f, 0.96f, 0.98f, 1.00f };
-        theme.plate        = { 0.00f, 0.00f, 0.00f, 0.52f };
+        theme.tileName     = { 1.00f, 1.00f, 1.00f, 1.00f };
     }
     return theme;
 }
@@ -271,11 +285,8 @@ struct Mission::Impl {
     // Baked once and reused for the life of the process. Both are stretched by
     // a nine-grid brush, so one small texture serves every window at every size.
     WUC::CompositionDrawingSurface shadowSurface{ nullptr };
-    WUC::CompositionDrawingSurface outlineSurface{ nullptr };
     WUC::CompositionNineGridBrush  shadowBrush{ nullptr };
-    WUC::CompositionNineGridBrush  outlineBrush{ nullptr };
     float                          textureSpread = 0.0f;   // the shadow's
-    float                          outlinePad    = 0.0f;   // the outline's
 
     struct Tile {
         WUC::ContainerVisual holder{ nullptr };
@@ -333,7 +344,13 @@ struct Mission::Impl {
         WUC::SpriteVisual    bar{ nullptr };   // the miniatures on top of it
 
         WUC::CompositionDrawingSurface backdropSurface{ nullptr };
+        WUC::CompositionDrawingSurface outlineSurface{ nullptr };
         WUC::CompositionDrawingSurface barGlassSurface{ nullptr };
+
+        // What the outline surface was last drawn for, so moving between two
+        // windows of the same size does not redraw it.
+        float outlineW = 0.0f;
+        float outlineH = 0.0f;
         WUC::CompositionDrawingSurface barSurface{ nullptr };
 
         // How far the glass runs past the screen on the left, right and top, so
@@ -837,51 +854,10 @@ bool Mission::Impl::BakeTextures() {
         }
     }
 
-    // The outline gets its own, much smaller, padding.
-    //
-    // The sprite is sized to the window plus twice this and offset back by it,
-    // so the stroke lands exactly on the window's edge whatever size that
-    // window is. Sharing the shadow's padding was the bug: it made the
-    // nine-grid's fixed corners 24 plus the radius, which on anything under
-    // about seventy pixels leaves no stretchable middle and the outline comes
-    // out crushed and offset.
-    outlinePad = kOutlinePad * dpi;
-
-    const float outlineSide = outlinePad * 2 + radius * 2 + 4.0f;
-
-    outlineSurface = graphics.CreateDrawingSurface(
-        { outlineSide, outlineSide },
-        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
-
-    {
-        SurfaceDraw draw(outlineSurface);
-        if (!draw.ok) return false;
-
-        ID2D1DeviceContext* dc = draw.dc.Get();
-        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-
-        ComPtr<ID2D1SolidColorBrush> brush;
-        if (SUCCEEDED(dc->CreateSolidColorBrush(accent, brush.Put()))) {
-            const float width = kOutlineWidth * dpi;
-
-            // Centred half a stroke outside the window's edge, so the line sits
-            // against the window rather than over its contents.
-            const float inset = outlinePad - width * 0.5f;
-            const D2D1_ROUNDED_RECT shape{
-                D2D1::RectF(inset, inset, outlineSide - inset, outlineSide - inset),
-                radius + width * 0.5f, radius + width * 0.5f };
-            dc->DrawRoundedRectangle(shape, brush.Get(), width);
-        }
-    }
-
     shadowBrush = compositor.CreateNineGridBrush();
     shadowBrush.Source(compositor.CreateSurfaceBrush(shadowSurface));
     shadowBrush.SetInsets(spread + radius);
 
-    outlineBrush = compositor.CreateNineGridBrush();
-    outlineBrush.Source(compositor.CreateSurfaceBrush(outlineSurface));
-    outlineBrush.SetInsets(outlinePad + radius);
     return true;
 }
 
@@ -1159,6 +1135,7 @@ void Mission::DisplaysChanged() {
         screen.barGlass        = nullptr;
         screen.bar             = nullptr;
         screen.backdropSurface = nullptr;
+        screen.outlineSurface  = nullptr;
         screen.barGlassSurface = nullptr;
         screen.barSurface      = nullptr;
         screen.target          = nullptr;
@@ -1199,6 +1176,7 @@ void Mission::Shutdown() {
         screen.barGlass        = nullptr;
         screen.bar             = nullptr;
         screen.backdropSurface = nullptr;
+        screen.outlineSurface  = nullptr;
         screen.barGlassSurface = nullptr;
         screen.barSurface      = nullptr;
         screen.target          = nullptr;
@@ -1208,9 +1186,7 @@ void Mission::Shutdown() {
 
     impl.iconBitmaps.clear();
     impl.shadowBrush    = nullptr;
-    impl.outlineBrush   = nullptr;
     impl.shadowSurface  = nullptr;
-    impl.outlineSurface = nullptr;
     impl.graphics       = nullptr;
     impl.compositor     = nullptr;
     impl.dcompDevice    = nullptr;
@@ -1728,7 +1704,7 @@ void Mission::Impl::BakeChrome(Screen& screen, Tile& tile) {
     }
 
     ComPtr<IDWriteTextFormat> format =
-        MakeFormat(dwriteFactory.Get(), screen.Scaled(12.5f), DWRITE_FONT_WEIGHT_NORMAL);
+        MakeFormat(dwriteFactory.Get(), screen.Scaled(12.5f), DWRITE_FONT_WEIGHT_SEMI_BOLD);
     if (!format) return;
 
     ComPtr<IDWriteInlineObject> ellipsis;
@@ -1738,23 +1714,47 @@ void Mission::Impl::BakeChrome(Screen& screen, Tile& tile) {
     }
 
     const float top = badge + screen.Scaled(kTitleGap);
+    const D2D1_RECT_F where = D2D1::RectF(screen.Scaled(6.0f), top,
+                                          width - screen.Scaled(6.0f), top + titleH);
 
-    // A capsule behind the name. It sits over the wallpaper, which can be any
-    // colour at all, so bare text is unreadable on roughly half of all desktops.
-    ComPtr<ID2D1SolidColorBrush> plate;
-    if (SUCCEEDED(dc->CreateSolidColorBrush(theme.plate, plate.Put()))) {
-        const D2D1_ROUNDED_RECT capsule{
-            D2D1::RectF(screen.Scaled(8.0f), top, width - screen.Scaled(8.0f), top + titleH),
-            titleH * 0.5f, titleH * 0.5f };
-        dc->FillRoundedRectangle(capsule, plate.Get());
+    // No plate behind the name.
+    //
+    // It had one, because the name sits over the wallpaper and bare text is
+    // unreadable on some fraction of all desktops. A capsule solves that and
+    // costs the thing the label is for: macOS puts a name under an icon, not a
+    // pill under an icon, and the pill was the first thing anyone noticed.
+    //
+    // A shadow does the same job without drawing anything of its own. Eight
+    // offsets of black at low alpha around the glyphs, which is a cheap
+    // approximation of a blur, plus a heavier one straight down for weight. Over
+    // a white wallpaper the shadow is what separates the letters; over a dark one
+    // it costs nothing, because black on dark is invisible.
+    const float spread = screen.Scaled(kTitleShadow);
+
+    ComPtr<ID2D1SolidColorBrush> shadow;
+    if (SUCCEEDED(dc->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.42f),
+                                            shadow.Put()))) {
+        static const float kRing[8][2] = {
+            { -1.0f, -1.0f }, { 0.0f, -1.0f }, { 1.0f, -1.0f },
+            { -1.0f,  0.0f },                  { 1.0f,  0.0f },
+            { -1.0f,  1.0f }, { 0.0f,  1.0f }, { 1.0f,  1.0f },
+        };
+
+        for (const auto& offset : kRing) {
+            D2D1_RECT_F at = where;
+            at.left   += offset[0] * spread;
+            at.right  += offset[0] * spread;
+            at.top    += offset[1] * spread;
+            at.bottom += offset[1] * spread;
+            dc->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format.Get(),
+                          at, shadow.Get());
+        }
     }
 
     ComPtr<ID2D1SolidColorBrush> brush;
-    if (SUCCEEDED(dc->CreateSolidColorBrush(theme.text, brush.Put())))
+    if (SUCCEEDED(dc->CreateSolidColorBrush(theme.tileName, brush.Put())))
         dc->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format.Get(),
-                      D2D1::RectF(screen.Scaled(18.0f), top,
-                                  width - screen.Scaled(18.0f), top + titleH),
-                      brush.Get());
+                      where, brush.Get());
 
     tile.chrome.Brush(compositor.CreateSurfaceBrush(tile.chromeSurface));
     tile.chrome.Size({ width, height });
@@ -2023,27 +2023,80 @@ void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
                     snapshots, NowMs() - snapshotsStarted, skipped);
 }
 
+// The hover outline, drawn for the window it is actually going round.
+//
+// It used to be one small texture baked at startup and stretched to every window
+// by a nine-grid brush. That is the cheap way and it was never right. A nine-grid
+// keeps its corners at a fixed size in SOURCE pixels, so the corner radius was
+// whatever the largest display's scale said at startup, on every display; the
+// stroke width was baked in the same way; and on any window narrower than twice
+// the corner there is no stretchable middle left at all, so the outline came out
+// crushed. None of that can be fixed while one texture has to serve every size.
+//
+// So it is drawn per hover, at that window's exact size, on that window's own
+// display at that display's scale, with the same corner the tiles have. One
+// small surface and one stroked geometry, and only when the size actually
+// changes: moving along a row of windows that are all the same size redraws
+// nothing.
 void Mission::Impl::PositionOutline(Screen& screen) {
-    if (screen.hovered < 0 || screen.hovered >= static_cast<int>(screen.tiles.size()) ||
-        !outlineBrush) {
+    if (screen.hovered < 0 || screen.hovered >= static_cast<int>(screen.tiles.size())) {
         screen.outline.Opacity(0.0f);
         return;
     }
 
     const RECT& rect = screen.tiles[static_cast<size_t>(screen.hovered)].liveRect;
+
+    const float stroke = screen.Scaled(kOutlineWidth);
+    const float pad    = std::ceil(stroke);
+    const float w      = static_cast<float>(rect.right - rect.left);
+    const float h      = static_cast<float>(rect.bottom - rect.top);
+    if (w <= 1.0f || h <= 1.0f) {
+        screen.outline.Opacity(0.0f);
+        return;
+    }
+
+    const float surfaceW = w + pad * 2.0f;
+    const float surfaceH = h + pad * 2.0f;
+
+    if (!screen.outlineSurface ||
+        screen.outlineW != surfaceW || screen.outlineH != surfaceH) {
+        screen.outlineSurface = graphics.CreateDrawingSurface(
+            { surfaceW, surfaceH },
+            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+        screen.outlineW = surfaceW;
+        screen.outlineH = surfaceH;
+
+        SurfaceDraw draw(screen.outlineSurface);
+        if (!draw.ok) {
+            screen.outline.Opacity(0.0f);
+            return;
+        }
+
+        ID2D1DeviceContext* dc = draw.dc.Get();
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+        // Centred on the window's own edge, so half the stroke sits outside it
+        // and half over its border. Sitting entirely outside leaves a hairline
+        // of desktop between the line and the window at fractional scales.
+        StrokeSquircle(dc, d2dFactory.Get(), pad, pad, w, h,
+                       screen.Scaled(kTileRadius), stroke, accent);
+
+        screen.outline.Brush(compositor.CreateSurfaceBrush(screen.outlineSurface));
+    }
+
     const bool wasHidden = screen.outline.Opacity() < 0.5f;
 
-    screen.outline.Brush(outlineBrush);
     screen.outline.Opacity(1.0f);
-    screen.outline.Size({ static_cast<float>(rect.right - rect.left) + outlinePad * 2,
-                          static_cast<float>(rect.bottom - rect.top) + outlinePad * 2 });
+    screen.outline.Size({ surfaceW, surfaceH });
 
-    const WFN::float3 destination{ static_cast<float>(rect.left) - outlinePad,
-                                   static_cast<float>(rect.top)  - outlinePad, 0.0f };
+    const WFN::float3 destination{ static_cast<float>(rect.left) - pad,
+                                   static_cast<float>(rect.top)  - pad, 0.0f };
 
     // Springing from wherever it was left is right between two windows and
     // wrong for the first one, where "wherever it was left" is the corner.
     if (wasHidden) {
+        screen.outline.StopAnimation(L"Offset");
         screen.outline.Offset(destination);
         return;
     }
