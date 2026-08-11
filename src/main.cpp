@@ -792,18 +792,51 @@ void ForgetMissionWindow(HWND hwnd) {
     std::sort(g_missionWindows.begin(), g_missionWindows.end());
 }
 
-// Somebody else changed the desktops while we were looking at them.
-void SyncMissionDesktops() {
+// The windows the overlay OUGHT to be showing, as a set.
+//
+// A window going away is caught by the hook and acted on within a frame, which
+// is what it deserves; a window arriving cannot be, because there is no event
+// for "a window has become eligible for the switcher" and the ones that come
+// closest fire for every menu, tooltip and splash screen in the session. So
+// arrivals are noticed by looking, which is affordable at twice a second and
+// only while the overlay is up.
+std::vector<HWND> EligibleWindows() {
+    std::vector<HWND> handles;
+    const desktops::State state = desktops::Query(g_app.host);
+
+    for (const SwitcherApp& app : BuildWindowList(state.known && state.all.size() > 1))
+        for (const SwitcherWindow& window : app.windows)
+            if (!window.minimized) handles.push_back(window.hwnd);
+
+    std::sort(handles.begin(), handles.end());
+    return handles;
+}
+
+// Anything that changed underneath us while we were looking at it.
+void SyncMission() {
     if (!g_app.mission.Visible()) return;
 
     const desktops::State state = desktops::Query(g_app.host);
     if (!state.known) return;
-    if (state.all.size() == g_missionDesktopCount && state.current == g_missionDesktopIndex)
-        return;
 
-    MACTAB_DIAG("mission: the desktops changed underneath us (%zu -> %zu, current %d -> %d)",
-                g_missionDesktopCount, state.all.size(),
-                g_missionDesktopIndex, state.current);
+    const bool desktopsChanged = state.all.size() != g_missionDesktopCount ||
+                                 state.current != g_missionDesktopIndex;
+
+    bool windowsChanged = false;
+    if (!desktopsChanged) {
+        std::vector<HWND> showing = g_app.mission.Windows();
+        std::sort(showing.begin(), showing.end());
+        windowsChanged = (showing != EligibleWindows());
+    }
+
+    if (!desktopsChanged && !windowsChanged) return;
+
+    if (desktopsChanged)
+        MACTAB_DIAG("mission: the desktops changed underneath us (%zu -> %zu, current %d -> %d)",
+                    g_missionDesktopCount, state.all.size(),
+                    g_missionDesktopIndex, state.current);
+    else
+        MACTAB_DIAG("mission: the window list changed underneath us");
 
     const bool moved = state.current != g_missionDesktopIndex;
 
@@ -1017,7 +1050,7 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_TIMER:
-        if (wParam == kMissionWatchTimer) SyncMissionDesktops();
+        if (wParam == kMissionWatchTimer) SyncMission();
         return 0;
 
     case WM_MACTAB_MC_GONE:

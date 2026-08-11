@@ -360,10 +360,13 @@ confirmation never comes, nothing is closed at all. Closing the wrong desktop is
 not something you can undo.
 
 **It stays honest while it is open.** A window that closes or minimises disappears
-and everything else relaxes into the space it left; a desktop created or removed
-by anything else shows up within half a second. Both watchers are installed when
-it opens and removed when it closes, because the idle budget for this process is
-zero.
+within a frame and everything else relaxes into the space it left. A window that
+opens, and a desktop created or removed by anything else, show up within half a
+second, because there is no event for "a window has become eligible for the
+switcher" and the ones that come closest fire for every menu and splash screen in
+the session, so arrivals are noticed by looking rather than by listening. Both
+watchers are installed when it opens and removed when it closes; the idle budget
+for this process is still zero.
 
 **The arrangement.** One scale for every window, so a large window still looks
 large next to a small one and every aspect ratio is exact. Windows start where
