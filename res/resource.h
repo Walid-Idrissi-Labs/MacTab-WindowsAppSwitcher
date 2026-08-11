@@ -13,6 +13,7 @@
 #define IDM_TRAY_RELOAD_GLASS   206
 #define IDM_TRAY_DUMP_DESKTOPS  207
 #define IDM_TRAY_MISSION        208
+#define IDM_TRAY_OPEN_SETTINGS  209
 
 // Settings > Panel appears on. Contiguous, and CheckMenuRadioItem is given the
 // first and last of them as its range, so keep them adjacent and in this order.

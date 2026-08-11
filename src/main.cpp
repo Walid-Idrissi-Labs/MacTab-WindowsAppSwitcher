@@ -975,6 +975,7 @@ void ShowTrayMenu(HWND hwnd, POINT screenPt) {
     ::AppendMenuW(menu, MF_STRING | (hotkey::IsRunning() ? 0u : MF_DISABLED),
                   IDM_TRAY_RELOAD_HOOK, L"Reload keyboard hook");
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    ::AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_SETTINGS, L"Open settings.ini");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_RELOAD_GLASS, L"Reload glass from settings.ini");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_LIST, L"Log current switcher list");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_DESKTOPS, L"Log virtual desktops");
@@ -1006,6 +1007,23 @@ void OpenDiagnosticsLog(HWND owner) {
         return;
     }
     ::ShellExecuteW(owner, L"open", diag::LogPath().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// Opens settings.ini in whatever the shell has associated with .ini, which on
+// a machine with no override is Notepad. This is the tuning loop the glass
+// material was built around: type a number, save, "Reload glass from
+// settings.ini" from this same menu, look. No editor bundled or shelled out to
+// by name, so it also respects whatever the user has actually set .ini to open
+// in.
+void OpenSettingsFile(HWND owner) {
+    if (config::SettingsPath().empty()) {
+        ::MessageBoxW(owner,
+                      L"settings.ini has not been created yet.\n\n"
+                      L"It is written on first run; relaunch MacTab and try again.",
+                      L"MacTab", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    ::ShellExecuteW(owner, L"open", config::SettingsPath().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 // --- Shutdown --------------------------------------------------------------
@@ -1220,6 +1238,10 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         case IDM_TRAY_THEME_AUTO:  config::SetTheme(L"auto");  return 0;
         case IDM_TRAY_THEME_LIGHT: config::SetTheme(L"light"); return 0;
         case IDM_TRAY_THEME_DARK:  config::SetTheme(L"dark");  return 0;
+
+        case IDM_TRAY_OPEN_SETTINGS:
+            OpenSettingsFile(hwnd);
+            return 0;
 
         case IDM_TRAY_RELOAD_GLASS:
             // The whole material, re-read, without a restart.

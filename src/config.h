@@ -217,6 +217,12 @@ bool SetAutostart(bool enabled);
 
 const std::wstring& ThemesDir();
 
+// --- Settings file -----------------------------------------------------------
+
+// Full path to settings.ini, for the tray item that opens it directly. Empty
+// until Load() has run.
+const std::wstring& SettingsPath();
+
 // Returns an empty bitmap when there is no override for this app.
 Bitmap LoadThemeOverride(const std::wstring& exePath, const std::wstring& aumid);
 

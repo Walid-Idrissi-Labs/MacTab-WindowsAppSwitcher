@@ -561,6 +561,8 @@ bool SetAutostart(bool enabled) {
 
 const std::wstring& ThemesDir() { return g_themesDir; }
 
+const std::wstring& SettingsPath() { return g_settingsPath; }
+
 Bitmap LoadThemeOverride(const std::wstring& exePath, const std::wstring& aumid) {
     if (g_themesDir.empty()) return {};
 
