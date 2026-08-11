@@ -97,14 +97,16 @@ hotkey::Gesture MissionGesture() {
     return hotkey::Gesture::WinTab;
 }
 
-// How to describe it in the tray balloon.
+// How to describe the chord, whether or not the feature is currently on. Reads
+// the setting rather than MissionGesture(), which reports None while Mission
+// Control is switched off and would have the menu offer to turn on a key it then
+// refused to name.
 const wchar_t* MissionGestureName() {
-    switch (MissionGesture()) {
-    case hotkey::Gesture::WinUp: return L"Win+Up";
-    case hotkey::Gesture::Both:  return L"Win+Tab and Win+Up";
-    case hotkey::Gesture::None:  return L"the tray menu";
-    default:                     return L"Win+Tab";
-    }
+    const std::wstring& choice = config::Current().missionGesture;
+    if (choice == L"winup") return L"Win+Up";
+    if (choice == L"both")  return L"Win+Tab and Win+Up";
+    if (choice == L"none")  return L"the tray menu";
+    return L"Win+Tab";
 }
 
 void CloseMission(bool commitDesktop = false);
@@ -876,8 +878,13 @@ HMENU CreateSettingsMenu() {
                          checkedTheme, MF_BYCOMMAND);
 
     ::AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
+    // Named after the chord that is actually configured, so somebody who has set
+    // MissionGesture is not told about a key that no longer opens anything.
+    std::wstring missionLabel = L"Mission Control on ";
+    missionLabel += MissionGestureName();
+
     ::AppendMenuW(settings, MF_STRING | (config::Current().missionEnabled ? MF_CHECKED : 0u),
-                  IDM_TRAY_MISSION, L"Mission Control on Win+Tab");
+                  IDM_TRAY_MISSION, missionLabel.c_str());
     ::AppendMenuW(settings, MF_STRING | (config::AutostartEnabled() ? MF_CHECKED : 0u),
                   IDM_TRAY_AUTOSTART, L"Start when I sign in");
 
@@ -1113,11 +1120,9 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                                                         : hotkey::Gesture::None);
             if (!enabled) CloseMission();
 
-            std::wstring message = L"Win+Tab left to Windows.";
-            if (enabled && ready) {
-                message = MissionGestureName();
-                message += L" now opens Mission Control.";
-            }
+            std::wstring message = MissionGestureName();
+            message += (enabled && ready) ? L" now opens Mission Control."
+                                          : L" left to Windows.";
             g_app.tray.ShowBalloon(L"MacTab", message.c_str());
             return 0;
         }

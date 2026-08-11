@@ -97,6 +97,13 @@ inline void FillRect(Bitmap& b, int x0, int y0, int w, int h, uint32_t colour) {
             b.At(x, y) = colour;
 }
 
+inline void StrokeRect(Bitmap& b, int x, int y, int w, int h, int thickness, uint32_t colour) {
+    FillRect(b, x, y, w, thickness, colour);
+    FillRect(b, x, y + h - thickness, w, thickness, colour);
+    FillRect(b, x, y, thickness, h, colour);
+    FillRect(b, x + w - thickness, y, thickness, h, colour);
+}
+
 inline void FillDisc(Bitmap& b, float cx, float cy, float r, uint32_t colour) {
     const int x0 = (std::max)(0, static_cast<int>(cx - r) - 1);
     const int x1 = (std::min)(b.width,  static_cast<int>(cx + r) + 2);

@@ -171,12 +171,6 @@ std::vector<Desktop> MakeDesktops() {
 
 // --- rendering --------------------------------------------------------------
 
-void StrokeRect(Bitmap& b, int x, int y, int w, int h, int thickness, uint32_t colour) {
-    FillRect(b, x, y, w, thickness, colour);
-    FillRect(b, x, y + h - thickness, w, thickness, colour);
-    FillRect(b, x, y, thickness, h, colour);
-    FillRect(b, x + w - thickness, y, thickness, h, colour);
-}
 
 // The app icon badge and the window's name, under the tile.
 //

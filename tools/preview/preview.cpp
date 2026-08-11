@@ -835,6 +835,134 @@ float MeanChroma(const Bitmap& image) {
     return static_cast<float>(sum / (static_cast<double>(image.width) * image.height));
 }
 
+
+// --- Mission Control's spaces bar -------------------------------------------
+//
+// The same material as the panel above, cut to a different shape, which is
+// exactly the claim this render exists to check.
+//
+// Three things are particular to it and all three are visible here: it runs past
+// the screen on the left, right and top so only the bottom edge of the glass is
+// ever seen, it is cut from the SHARP wallpaper rather than from the overlay's
+// own blurred backdrop, and the strip is dimmed by the same amount as the
+// backdrop before the material sees it, so the glass adapts to the scene the eye
+// is actually looking at.
+Bitmap RenderSpacesBar(const glass::Params& base, Wallpaper wallpaper,
+                       bool light, float dim) {
+    constexpr int kScreenW = 1600;
+    constexpr int kScreenH = 900;
+    constexpr int kBarH    = 168;
+    constexpr int kChipH   = 90;
+    constexpr int kGap     = 18;
+    constexpr int kLabel   = 24;
+
+    // How far past the screen the glass runs. The same rule mission.cpp uses.
+    const int over = static_cast<int>(std::ceil(
+        std::max(glass::g_tuning.blurSigma * 1.5f,
+                 glass::g_tuning.maxDisplacement + 4.0f)));
+
+    Bitmap screen = MakeWallpaper(kScreenW, kScreenH, wallpaper);
+
+    // The backdrop: dimmed, not blurred, which is what macOS does here.
+    Bitmap canvas = screen;
+    for (uint32_t& px : canvas.pixels) {
+        const float keep = 1.0f - dim;
+        const float over3 = light ? 0.88f : 0.04f;
+        px = MakePixel(static_cast<uint8_t>(RedOf(px)   * keep + over3 * 255.0f * dim),
+                       static_cast<uint8_t>(GreenOf(px) * keep + over3 * 255.0f * dim),
+                       static_cast<uint8_t>(BlueOf(px)  * keep + over3 * 255.0f * dim),
+                       255);
+    }
+
+    // The glass is cut from the dimmed strip, extended past three edges. Beyond
+    // the screen there are no pixels, so the edge is repeated, which is what the
+    // clamp in the real effect graph does.
+    const int bandW = kScreenW + over * 2;
+    const int bandH = kBarH + over;
+
+    Bitmap band = Bitmap::Create(bandW, bandH);
+    for (int y = 0; y < bandH; ++y)
+        for (int x = 0; x < bandW; ++x) {
+            const int sx = std::clamp(x - over, 0, kScreenW - 1);
+            const int sy = std::clamp(y - over, 0, kScreenH - 1);
+            band.At(x, y) = canvas.At(sx, sy);
+        }
+
+    Bitmap frosted = band;
+    Bitmap clear   = band;
+    Blur(frosted, glass::g_tuning.blurSigma);
+    Blur(clear,   glass::g_tuning.rimBlurSigma);
+
+    const glass::Surface surface{ static_cast<float>(bandW),
+                                  static_cast<float>(bandH), 0.0f, 1.0f };
+
+    Bitmap body = frosted;
+    const glass::Params material = glass::Adapt(base, MeanLuma(body));
+    body = RefractTwoTap(frosted, clear, surface, material, 0, 0, nullptr);
+
+    ApplyOuterStroke(body, material);
+    {
+        const glass::LumaField env = glass::BuildLumaField(band, 0, 0, bandW, bandH);
+        ApplyEdgeLight(body, surface, material, &env);
+    }
+
+    CompositeOver(canvas, body, -over, -over);
+
+    // The miniatures, at the screen's own aspect, centred, with the add button
+    // out to the right. Geometry only; there is no DirectWrite here, so the
+    // names are bars of the width a name occupies.
+    const int chipW = kChipH * kScreenW / kScreenH;
+    const int count = 3;
+    const int run   = chipW * count + kGap * count + kChipH;
+    int x = (kScreenW - run) / 2;
+    const int y = (kBarH - kLabel - kChipH) / 2;
+
+    for (int i = 0; i < count; ++i) {
+        const bool current = (i == 1);
+
+        for (int py = 0; py < kChipH; ++py)
+            for (int px = 0; px < chipW; ++px) {
+                const int sx = px * kScreenW / chipW;
+                const int sy = py * kScreenH / kChipH;
+                uint32_t c = screen.At(std::min(sx, kScreenW - 1),
+                                       std::min(sy, kScreenH - 1));
+                if (!current) {
+                    const float a = 0.42f;
+                    const uint8_t v = light ? 255 : 0;
+                    c = MakePixel(static_cast<uint8_t>(RedOf(c)   * (1 - a) + v * a),
+                                  static_cast<uint8_t>(GreenOf(c) * (1 - a) + v * a),
+                                  static_cast<uint8_t>(BlueOf(c)  * (1 - a) + v * a), 255);
+                }
+                canvas.At(x + px, y + py) = c;
+            }
+
+        StrokeRect(canvas, x, y, chipW, kChipH, current ? 3 : 1,
+                   current ? MakePixel(0, 120, 212, 255)
+                           : MakePixel(255, 255, 255, 70));
+
+        // The close cross, at the same fraction of the miniature the real one
+        // uses.
+        {
+            const int cx = x + static_cast<int>(kChipH * 0.16f);
+            const int cy = y + static_cast<int>(kChipH * 0.16f);
+            const int r  = static_cast<int>(kChipH * 0.26f * 0.5f);
+            FillDisc(canvas, cx, cy, r, MakePixel(15, 15, 20, 184));
+        }
+
+        DrawWord(canvas, "DESKTOP", x + chipW / 2 - WordWidth("DESKTOP", 2) / 2,
+                 y + kChipH + 6, 2,
+                 light ? MakePixel(20, 20, 24, 255) : MakePixel(226, 228, 236, 255));
+
+        x += chipW + kGap;
+    }
+
+    FillDisc(canvas, kScreenW - 40 - kChipH * 21 / 100, y + kChipH / 2,
+             kChipH * 21 / 100,
+             light ? MakePixel(255, 255, 255, 110) : MakePixel(255, 255, 255, 42));
+
+    return canvas;
+}
+
 // The whole panel at the real layout metrics, over a real blurred wallpaper,
 // with the real material applied.
 //
@@ -1429,6 +1557,30 @@ int main(int argc, char** argv) {
         const Bitmap tile = MakeIconTile(cases[i].make(kSourceSize), kTileSize);
         CompositeOver(strip, tile, kGap + i * (kTileSize + kGap), kGap);
     }
+    // Mission Control's spaces bar, in both appearances and over two wallpapers.
+    // Same material, different shape; whether that claim holds is a thing to
+    // look at rather than to assert.
+    {
+        struct BarShot { const char* file; const glass::Params& base; bool light;
+                         Wallpaper paper; };
+        const BarShot shots[] = {
+            { "/mission-bar-dark.png",  g_dark,  false, Wallpaper::Photo },
+            { "/mission-bar-light.png", g_light, true,  Wallpaper::Photo },
+            { "/mission-bar-bright.png", g_dark, false, Wallpaper::White },
+        };
+        for (const BarShot& shot : shots) {
+            const Bitmap bar = RenderSpacesBar(shot.base, shot.paper, shot.light,
+                                               0.45f);
+            if (!WritePng(outDir + shot.file, bar) ||
+                !WritePng(outDir + std::string(shot.file).replace(
+                              std::string(shot.file).size() - 4, 4, "-4x.png"),
+                          Zoom(bar, 560, 120, 220, 80, 4))) {
+                std::fprintf(stderr, "failed to write %s\n", shot.file);
+                ++failures;
+            }
+        }
+    }
+
     if (!WritePng(outDir + "/strip.png", strip)) {
         std::fprintf(stderr, "failed to write strip.png\n");
         ++failures;
