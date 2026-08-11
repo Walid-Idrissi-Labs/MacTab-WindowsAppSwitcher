@@ -411,6 +411,27 @@ it is first: that flight is most of what makes the gesture read as Mission
 Control rather than as a dialog. If it misbehaves on your driver, set
 `MissionThumbnails=snapshot` and everything else stays as it is.
 
+**The previews are sharpened once the windows have landed.** The compositor has
+exactly one sampling mode, bilinear, and bilinear is only a correct reduction down
+to about 2:1, where each output pixel averages a 2x2 block. Past that it skips
+source pixels, and a 4K window in a 400-pixel tile skips nine out of every ten.
+Asking DWM for a different destination size does not help: a thumbnail is a live
+connection to the source's own surfaces, so the sampling happens once, at the end,
+with whatever the whole visual tree composes to.
+
+There is one more thing that has to be said out loud, because it is documented and
+it is easy to miss: if no visual in a composition tree sets an interpolation mode,
+the default for the entire tree is **nearest neighbour**. That is not a soft
+downscale, it is decimation. Every thumbnail is now explicitly asked to sample
+bilinearly, which reaches the visuals DWM builds inside its own because the mode
+inherits down the subtree.
+
+Above roughly a 2:1 reduction the live preview is then replaced with a still of
+the same window, taken at twice the size it is shown at and reduced by the box
+filter in `image.cpp`, which is the one honest downscaler here. Those previews
+stop being live: a video plays until the sharpening lands and then holds its last
+frame. `MissionSharpPreviews=0` keeps them live and soft.
+
 **The bar is the same glass the switcher is made of.** Not a similar one: the same
 code, in `src/glass_draw.cpp`, with the same measured numbers, so tuning the
 material tunes both. Three things about this piece are its own. It runs past the
@@ -488,6 +509,7 @@ defaults and comments on first run:
 | `MissionBlurSigma` | 0 | How soft the wallpaper behind the arrangement goes. Also decides what resolution it is baked at: raise it if Mission Control costs more memory than you want |
 | `MissionDim` | 0.45 | How far back the wallpaper is pushed, 0 to 1 |
 | `MissionRevealMs` | 260 | How long the windows take to fly to their places |
+| `MissionSharpPreviews` | 1 | Replace a live preview with a properly filtered still once the windows have landed, for anything the compositor cannot reduce honestly. 0 keeps them live and soft |
 | `MissionThumbnails` | auto | `auto`, `shared`, `snapshot` or `icon`. Drop to `snapshot` if the windows come out blank or misplaced |
 
 ### Tuning the glass yourself
