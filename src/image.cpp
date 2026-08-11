@@ -1,5 +1,7 @@
 #include "image.h"
 
+#include <unordered_map>
+
 namespace mactab {
 namespace {
 
@@ -37,6 +39,28 @@ uint32_t FromPremultiplied(const PremultipliedF& p) {
                      ToByte((std::min)(p.g * inv, 1.0f)),
                      ToByte((std::min)(p.b * inv, 1.0f)),
                      ToByte(p.a));
+}
+
+int Clamp(int v, int low, int high) {
+    return v < low ? low : (v > high ? high : v);
+}
+
+// Catmull-Rom, the Mitchell-Netravali family at B = 0, C = 0.5. Interpolating,
+// so an unscaled pixel comes back exactly, with a small negative lobe either
+// side of the peak that keeps edges from washing out.
+float CatmullRom(float t) {
+    t = std::fabs(t);
+    if (t < 1.0f) return ((1.5f * t - 2.5f) * t) * t + 1.0f;
+    if (t < 2.0f) return ((-0.5f * t + 2.5f) * t - 4.0f) * t + 2.0f;
+    return 0.0f;
+}
+
+// Largest per-channel difference between two colours, alpha ignored.
+int ColourDistance(uint32_t a, uint32_t b) {
+    const int dr = std::abs(static_cast<int>(RedOf(a))   - static_cast<int>(RedOf(b)));
+    const int dg = std::abs(static_cast<int>(GreenOf(a)) - static_cast<int>(GreenOf(b)));
+    const int db = std::abs(static_cast<int>(BlueOf(a))  - static_cast<int>(BlueOf(b)));
+    return (std::max)(dr, (std::max)(dg, db));
 }
 
 } // namespace
@@ -85,33 +109,39 @@ Bitmap Resize(const Bitmap& source, int width, int height) {
                     acc.r /= count; acc.g /= count; acc.b /= count; acc.a /= count;
                 }
             } else {
-                // Bilinear, sampling at pixel centres.
+                // Catmull-Rom, sampling at pixel centres. Sixteen taps rather
+                // than four, which at icon sizes is nothing and is the whole
+                // difference between a readable 48px mark at 4x and a smear.
                 const double fx = (x + 0.5) * scaleX - 0.5;
                 const double fy = (y + 0.5) * scaleY - 0.5;
 
-                int x0 = static_cast<int>(std::floor(fx));
-                int y0 = static_cast<int>(std::floor(fy));
-                const float tx = static_cast<float>(fx - x0);
-                const float ty = static_cast<float>(fy - y0);
+                const int bx = static_cast<int>(std::floor(fx));
+                const int by = static_cast<int>(std::floor(fy));
 
-                const int x1 = (std::min)(x0 + 1, source.width  - 1);
-                const int y1 = (std::min)(y0 + 1, source.height - 1);
-                x0 = (std::max)(x0, 0);
-                y0 = (std::max)(y0, 0);
+                float wx[4], wy[4];
+                for (int i = 0; i < 4; ++i) {
+                    wx[i] = CatmullRom(static_cast<float>(fx - (bx + i - 1)));
+                    wy[i] = CatmullRom(static_cast<float>(fy - (by + i - 1)));
+                }
 
-                const PremultipliedF& p00 = src[static_cast<size_t>(y0) * source.width + x0];
-                const PremultipliedF& p10 = src[static_cast<size_t>(y0) * source.width + x1];
-                const PremultipliedF& p01 = src[static_cast<size_t>(y1) * source.width + x0];
-                const PremultipliedF& p11 = src[static_cast<size_t>(y1) * source.width + x1];
+                for (int j = 0; j < 4; ++j) {
+                    const int sy = Clamp(by + j - 1, 0, source.height - 1);
+                    for (int i = 0; i < 4; ++i) {
+                        const int sx = Clamp(bx + i - 1, 0, source.width - 1);
+                        const float w = wx[i] * wy[j];
+                        if (w == 0.0f) continue;
 
-                auto mix = [&](float a, float b, float c, float d) {
-                    return (a * (1 - tx) + b * tx) * (1 - ty) +
-                           (c * (1 - tx) + d * tx) * ty;
-                };
-                acc.r = mix(p00.r, p10.r, p01.r, p11.r);
-                acc.g = mix(p00.g, p10.g, p01.g, p11.g);
-                acc.b = mix(p00.b, p10.b, p01.b, p11.b);
-                acc.a = mix(p00.a, p10.a, p01.a, p11.a);
+                        const PremultipliedF& p =
+                            src[static_cast<size_t>(sy) * source.width + sx];
+                        acc.r += p.r * w; acc.g += p.g * w;
+                        acc.b += p.b * w; acc.a += p.a * w;
+                    }
+                }
+
+                // The negative lobe can push alpha past either end. Left alone,
+                // an alpha above 1 divides back out to a colour darker than the
+                // source, which shows up as a dark rim on a light mark.
+                acc.a = (std::min)((std::max)(acc.a, 0.0f), 1.0f);
             }
 
             out.At(x, y) = FromPremultiplied(acc);
@@ -255,6 +285,152 @@ Bitmap FitInto(const Bitmap& source, int boxWidth, int boxHeight) {
     Bitmap out = Bitmap::Create(boxWidth, boxHeight);
     CompositeOver(out, scaled, (boxWidth - scaledWidth) / 2, (boxHeight - scaledHeight) / 2);
     return out;
+}
+
+BorderFill RemoveBorderFill(Bitmap& bitmap) {
+    BorderFill result;
+
+    // Below this there is not enough border to judge anything from, and the
+    // icon is too small for a plate to be the problem anyway.
+    if (bitmap.width < 16 || bitmap.height < 16) return result;
+
+    // Two pixels are the same flat colour within this. Nominally-flat fills
+    // are not always exactly flat: a plate that has been through a resize, or
+    // a gradient shallow enough to read as flat, both land a few levels apart.
+    constexpr int kFlat = 10;
+
+    // ...and this far out they are unrelated. Between the two, alpha ramps,
+    // which is what keeps an antialiased mark from coming out with a hard
+    // stair-stepped edge where it met the background.
+    constexpr int kSoft = 48;
+
+    constexpr double kMinRingAgreement = 0.90;   // of the border, one colour
+    constexpr double kMaxRingAlphaHoles = 0.10;  // above this it already has alpha
+    constexpr double kMinRemoved = 0.06;         // below this there was no plate
+
+    // A mark can legitimately be a very small part of a very padded canvas, so
+    // there is no upper bound on how much may go. What there is a bound on is
+    // how little may be left: an icon that is one flat colour end to end floods
+    // completely, and an empty tile is worse than the flat one it replaced.
+    constexpr double kMinSurviving = 0.001;      // 8x8 out of 256x256
+
+    const int w = bitmap.width, h = bitmap.height;
+
+    // --- the border ring ----------------------------------------------------
+    std::vector<int> ring;
+    ring.reserve(static_cast<size_t>(2 * (w + h)));
+    for (int x = 0; x < w; ++x) {
+        ring.push_back(x);
+        ring.push_back((h - 1) * w + x);
+    }
+    for (int y = 1; y < h - 1; ++y) {
+        ring.push_back(y * w);
+        ring.push_back(y * w + w - 1);
+    }
+
+    size_t holes = 0;
+    std::unordered_map<uint32_t, size_t> tally;
+    for (int index : ring) {
+        const uint32_t pixel = bitmap.pixels[static_cast<size_t>(index)];
+        if (AlphaOf(pixel) < 128) { ++holes; continue; }
+        ++tally[pixel & 0x00FFFFFFu];
+    }
+
+    // Already transparent at the edges, so the alpha channel is doing its job
+    // and there is nothing baked in to take out.
+    if (static_cast<double>(holes) / ring.size() > kMaxRingAlphaHoles)
+        return result;
+    if (tally.empty()) return result;
+
+    const auto modal = std::max_element(
+        tally.begin(), tally.end(),
+        [](const auto& a, const auto& b) { return a.second < b.second; });
+
+    const uint32_t key = modal->first | 0xFF000000u;
+
+    size_t agreeing = 0;
+    for (int index : ring) {
+        const uint32_t pixel = bitmap.pixels[static_cast<size_t>(index)];
+        if (AlphaOf(pixel) >= 128 && ColourDistance(pixel, key) <= kFlat)
+            ++agreeing;
+    }
+    if (static_cast<double>(agreeing) / ring.size() < kMinRingAgreement)
+        return result;
+
+    // --- flood inward -------------------------------------------------------
+    //
+    // Alpha is written to a side buffer so the whole thing can be abandoned if
+    // the result turns out not to be a background after all.
+    std::vector<uint8_t> alpha(bitmap.pixels.size(), 0xFF);
+    std::vector<uint8_t> seen(bitmap.pixels.size(), 0);
+    std::vector<int> stack;
+    stack.reserve(bitmap.pixels.size() / 4);
+
+    auto consider = [&](int index) {
+        if (seen[static_cast<size_t>(index)]) return;
+
+        const uint32_t pixel = bitmap.pixels[static_cast<size_t>(index)];
+        if (AlphaOf(pixel) < 128) {
+            // Transparent already; it neither blocks the fill nor needs a ramp.
+            seen[static_cast<size_t>(index)] = 1;
+            alpha[static_cast<size_t>(index)] = AlphaOf(pixel);
+            stack.push_back(index);
+            return;
+        }
+
+        const int distance = ColourDistance(pixel, key);
+        if (distance >= kSoft) return;   // artwork, stop here
+
+        const double ramp = (distance <= kFlat)
+            ? 0.0
+            : static_cast<double>(distance - kFlat) / (kSoft - kFlat);
+
+        seen[static_cast<size_t>(index)] = 1;
+        alpha[static_cast<size_t>(index)] =
+            static_cast<uint8_t>(AlphaOf(pixel) * ramp + 0.5);
+        stack.push_back(index);
+    };
+
+    for (int index : ring) consider(index);
+
+    double removedWeight = 0.0;
+    while (!stack.empty()) {
+        const int index = stack.back();
+        stack.pop_back();
+
+        const uint32_t original = bitmap.pixels[static_cast<size_t>(index)];
+        if (AlphaOf(original) >= 128)
+            removedWeight += 1.0 - alpha[static_cast<size_t>(index)] / 255.0;
+
+        const int x = index % w, y = index / w;
+        if (x > 0)     consider(index - 1);
+        if (x < w - 1) consider(index + 1);
+        if (y > 0)     consider(index - w);
+        if (y < h - 1) consider(index + w);
+    }
+
+    const double total = static_cast<double>(bitmap.pixels.size());
+    const double removed = removedWeight / total;
+    if (removed < kMinRemoved) return result;
+
+    size_t surviving = 0;
+    for (size_t i = 0; i < bitmap.pixels.size(); ++i) {
+        const uint8_t left = seen[i] ? alpha[i] : AlphaOf(bitmap.pixels[i]);
+        if (left >= 128) ++surviving;
+    }
+    if (static_cast<double>(surviving) / total < kMinSurviving)
+        return result;
+
+    for (size_t i = 0; i < bitmap.pixels.size(); ++i) {
+        if (!seen[i]) continue;
+        bitmap.pixels[i] = (bitmap.pixels[i] & 0x00FFFFFFu) |
+                           (static_cast<uint32_t>(alpha[i]) << 24);
+    }
+
+    result.found   = true;
+    result.colour  = key;
+    result.removed = removed;
+    return result;
 }
 
 double OpaqueCoverage(const Bitmap& bitmap, uint8_t threshold) {

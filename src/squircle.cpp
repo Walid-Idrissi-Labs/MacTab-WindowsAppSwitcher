@@ -14,16 +14,38 @@ constexpr double kShapeRatio = 824.0 / 1024.0;
 
 // How much of the shape a synthesised glyph occupies, leaving a margin so the
 // glyph does not crowd the tile's edges.
-constexpr double kGlyphRatio = 0.62;
+constexpr double kGlyphRatio = 0.70;
 
 // Supersampling for the mask edge. 4x4 = 16 samples per pixel, which is past
 // the point of visible improvement at icon sizes.
 constexpr int kSupersample = 4;
 
-// Below this fraction of opaque canvas an icon is treated as a glyph rather
-// than as artwork. A circular icon covers ~0.79 and stays artwork; a small
-// centred logo covers ~0.2 and gets a tile.
-constexpr double kArtworkCoverage = 0.5;
+// How full the mark's own bounding box has to be, and how square that box has
+// to be, for the mark to stand on its own without a tile behind it.
+//
+// A circle fills 0.785 of its box, a rounded square nearly all of it, a
+// letterform or a thin logo mark around a third. The aspect test is what keeps
+// a wide banner-shaped mark off the artwork path: it would fill its box
+// completely and then float in the middle of the tile with empty air above and
+// below it, which reads worse than a tile does.
+constexpr double kArtworkFill   = 0.62;
+constexpr double kArtworkAspect = 0.72;
+
+// How far a mark may be enlarged before enlarging it stops helping.
+//
+// Plenty of apps ship nothing above a 48px frame, and blown up to fill a 206px
+// shape on a 200% display that is a smear whatever the filter. Past this the
+// mark is drawn smaller instead: a small sharp icon on a tile reads as an icon,
+// a large soft one reads as a mistake. It also demotes such an icon off the
+// artwork path, since artwork has to fill the shape and there is no version of
+// that which is not an enlargement.
+constexpr double kMaxEnlargement = 2.5;
+
+// A stripped background is only worth reusing as the tile colour inside this
+// luma range. Outside it the fill was padding rather than a brand colour: the
+// shell pads with black, and a few handlers pad with white.
+constexpr int kPlateMinLuma = 24;
+constexpr int kPlateMaxLuma = 236;
 
 std::vector<uint8_t> BuildMask(int size) {
     std::vector<uint8_t> mask(static_cast<size_t>(size) * static_cast<size_t>(size), 0);
@@ -206,32 +228,57 @@ const std::vector<uint8_t>& SquircleMask(int size) {
     return inserted->second;
 }
 
-IconAnalysis AnalyzeIcon(const Bitmap& icon) {
-    IconAnalysis analysis;
-    if (icon.Empty()) return analysis;
+IconPrep PrepareIcon(const Bitmap& source) {
+    IconPrep prep;
+    if (source.Empty()) return prep;
 
-    analysis.artwork = OpaqueCoverage(icon) >= kArtworkCoverage;
+    // Take out anything painted behind the mark before measuring it. Left in,
+    // it is opaque everywhere and the icon measures as full-bleed artwork, so
+    // the tile ends up being the background with the real icon small in the
+    // middle of it.
+    Bitmap cleaned = source;
+    prep.fill = RemoveBorderFill(cleaned);
 
-    if (!analysis.artwork) {
-        uint32_t base = DominantColour(icon);
+    const Bounds bounds = OpaqueBounds(cleaned);
+    prep.content = bounds.Empty() ? std::move(cleaned) : Crop(cleaned, bounds);
+    if (prep.content.Empty()) return prep;
 
-        // The tile is derived from the glyph's own colours, so left alone it
-        // lands at the same luma as the glyph and the glyph disappears into it.
-        // Drive the tile to the opposite side of the glyph's brightness, so a
-        // light mark gets a dark tile and vice versa, which is also what
-        // macOS-style icons do.
-        const int glyphLuma = Luma(MeanOpaqueColour(icon));
-        constexpr int kMinLumaSeparation = 70;
+    const double longest  = (std::max)(prep.content.width, prep.content.height);
+    const double shortest = (std::min)(prep.content.width, prep.content.height);
+    const double aspect   = (longest > 0.0) ? shortest / longest : 0.0;
 
-        const int target = (glyphLuma > 140) ? 52 : 196;
-        if (std::abs(Luma(base) - glyphLuma) < kMinLumaSeparation)
-            base = AdjustToLuma(base, target);
+    prep.analysis.artwork = OpaqueCoverage(prep.content) >= kArtworkFill &&
+                            aspect >= kArtworkAspect;
 
-        analysis.tintTop    = Lighten(base, 0.12);
-        analysis.tintBottom = Darken(base, 0.12);
-    }
+    // The tint is worked out either way. MakeIconTile can still demote a mark
+    // off the artwork path once it knows the tile size, and it has no way to
+    // derive these itself.
+    //
+    // A background we stripped is the app's own colour and is exactly what
+    // Windows shows behind the same mark, so it makes a better tile than
+    // anything we could derive from the mark. Padding is not, and is filtered
+    // out by luma.
+    const bool usePlate = prep.fill.found &&
+                          Luma(prep.fill.colour) >= kPlateMinLuma &&
+                          Luma(prep.fill.colour) <= kPlateMaxLuma;
 
-    return analysis;
+    uint32_t base = usePlate ? prep.fill.colour : DominantColour(prep.content);
+
+    // Derived from the glyph's own colours, the tile lands at the same luma as
+    // the glyph and the glyph disappears into it. Drive it to the opposite side
+    // of the glyph's brightness, so a light mark gets a dark tile and vice
+    // versa, which is also what macOS-style icons do.
+    const int glyphLuma = Luma(MeanOpaqueColour(prep.content));
+    constexpr int kMinLumaSeparation = 70;
+
+    const int target = (glyphLuma > 140) ? 52 : 196;
+    if (std::abs(Luma(base) - glyphLuma) < kMinLumaSeparation)
+        base = AdjustToLuma(base, target);
+
+    prep.analysis.tintTop    = Lighten(base, 0.12);
+    prep.analysis.tintBottom = Darken(base, 0.12);
+
+    return prep;
 }
 
 Bitmap MakeIconTile(const Bitmap& source, int size) {
@@ -240,26 +287,27 @@ Bitmap MakeIconTile(const Bitmap& source, int size) {
     const int shapeSize = (std::max)(1, static_cast<int>(std::lround(size * kShapeRatio)));
     const std::vector<uint8_t>& mask = SquircleMask(shapeSize);
 
-    // Work from the artwork's own bounding box, not the source canvas.
-    //
-    // Windows icons are frequently a small mark floating in a mostly empty
-    // 256x256 bitmap. Scaling the canvas would faithfully reproduce all that
-    // padding and leave a dot in the middle of the tile; scaling the content is
-    // what makes it read as an app icon. Aspect ratio is preserved throughout,
-    // so wide or tall marks are never stretched.
-    const Bounds bounds = OpaqueBounds(source);
-    const Bitmap content = bounds.Empty() ? source : Crop(source, bounds);
+    const IconPrep prep = PrepareIcon(source);
+    const Bitmap& content = prep.content;
+    if (content.Empty()) return {};
 
-    const IconAnalysis analysis = AnalyzeIcon(source);
+    const int longest = (std::max)(content.width, content.height);
+
+    // Filling the shape with a mark this small would be an enlargement past the
+    // point where it buys anything, so put it on a tile at its own scale.
+    const bool artwork = prep.analysis.artwork &&
+                         longest * kMaxEnlargement >= shapeSize;
 
     Bitmap shape;
-    if (analysis.artwork) {
+    if (artwork) {
         // Fit the artwork to the macOS shape size and clip it. Icons already
         // inside the squircle (circles, for instance) come through untouched.
         shape = FitInto(content, shapeSize, shapeSize);
         ApplyMask(shape, mask);
     } else {
         // Build a tile from the icon's own colours, then sit the glyph on it.
+        const IconAnalysis& analysis = prep.analysis;
+
         shape = Bitmap::Create(shapeSize, shapeSize);
         for (int y = 0; y < shapeSize; ++y) {
             const double t = (shapeSize > 1) ? static_cast<double>(y) / (shapeSize - 1) : 0.0;
@@ -276,7 +324,13 @@ Bitmap MakeIconTile(const Bitmap& source, int size) {
         }
         ApplyMask(shape, mask);
 
-        const int glyphSize = (std::max)(1, static_cast<int>(std::lround(shapeSize * kGlyphRatio)));
+        int glyphSize = (std::max)(1, static_cast<int>(std::lround(shapeSize * kGlyphRatio)));
+
+        // Same cap as above: a 32px mark drawn at 144px is mush, and a mark
+        // that is merely smaller than its neighbours is not.
+        glyphSize = (std::min)(glyphSize,
+                              (std::max)(1, static_cast<int>(std::lround(longest * kMaxEnlargement))));
+
         const Bitmap glyph = FitInto(content, glyphSize, glyphSize);
         const int glyphOffset = (shapeSize - glyphSize) / 2;
         CompositeOver(shape, glyph, glyphOffset, glyphOffset);

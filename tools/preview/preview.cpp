@@ -115,6 +115,63 @@ Bitmap MakeWideArt(int size) {
     return bitmap;
 }
 
+// The two ways a real Windows icon arrives with its background already painted
+// in, which is the defect this harness exists to show: a small mark adrift in a
+// big coloured square.
+
+Bitmap MakeOnBlackPadding(int size) {
+    // What the shell hands back when the icon's transparency lived in an AND
+    // mask: a 32-bit bitmap with every alpha byte zero, which icon_source.cpp
+    // has to force opaque or the icon would be invisible. The mark is small
+    // because the app ships nothing above a 48px frame.
+    Bitmap bitmap = Bitmap::Create(size, size);
+    for (uint32_t& pixel : bitmap.pixels)
+        pixel = MakePixel(0, 0, 0, 255);
+
+    const int markSize = size * 48 / 256;
+    const int offset   = (size - markSize) / 2;
+    const double radius = markSize * 0.45;
+
+    for (int y = 0; y < markSize; ++y) {
+        for (int x = 0; x < markSize; ++x) {
+            const double dx = x + 0.5 - markSize / 2.0, dy = y + 0.5 - markSize / 2.0;
+            const double d  = std::sqrt(dx * dx + dy * dy);
+            const double coverage = std::clamp(radius - d + 0.5, 0.0, 1.0);
+            if (coverage <= 0.0) continue;
+
+            // Composited onto the black, alpha discarded, which is what makes
+            // this hard to undo: the edge pixels are genuinely dark orange now,
+            // not orange at partial alpha.
+            bitmap.At(offset + x, offset + y) =
+                MakePixel(static_cast<uint8_t>(240 * coverage),
+                          static_cast<uint8_t>(96  * coverage),
+                          static_cast<uint8_t>(40  * coverage), 255);
+        }
+    }
+    return bitmap;
+}
+
+Bitmap MakePlatedLogo(int size) {
+    // A packaged app out of the Apps folder: the manifest's 44px logo
+    // composited onto the manifest's background colour. Windows' own taskbar
+    // uses the unplated asset and never shows it like this.
+    Bitmap bitmap = Bitmap::Create(size, size);
+    for (uint32_t& pixel : bitmap.pixels)
+        pixel = MakePixel(0x0A, 0x63, 0xC9, 255);
+
+    const int markSize = size * 88 / 256;
+    const int x0 = (size - markSize) / 2, y0 = (size - markSize) / 2;
+    for (int y = 0; y < markSize; ++y) {
+        for (int x = 0; x < markSize; ++x) {
+            const bool stem = (x > markSize * 2 / 5 && x < markSize * 3 / 5);
+            const bool bar  = (y > markSize / 5 && y < markSize * 2 / 5);
+            if (stem || bar)
+                bitmap.At(x0 + x, y0 + y) = MakePixel(255, 255, 255, 255);
+        }
+    }
+    return bitmap;
+}
+
 // Composite onto a checkerboard so transparency is visible in the PNG.
 Bitmap OnCheckerboard(const Bitmap& source) {
     Bitmap out = Bitmap::Create(source.width, source.height);
@@ -1438,7 +1495,7 @@ void RunSelfChecks() {
     // with the mark sitting on it. This is the bug the preview caught by eye.
     {
         const Bitmap glyph = MakeSmallGlyph(256);
-        const IconAnalysis analysis = AnalyzeIcon(glyph);
+        const IconAnalysis analysis = PrepareIcon(glyph).analysis;
         Check(!analysis.artwork, "a small mark is treated as a glyph");
 
         auto luma = [](uint32_t c) {
@@ -1513,6 +1570,8 @@ int main(int argc, char** argv) {
         { "circle",            MakeCircle },
         { "small-glyph",       MakeSmallGlyph },
         { "wide-art",          MakeWideArt },
+        { "black-padding",     MakeOnBlackPadding },
+        { "plated-logo",       MakePlatedLogo },
     };
 
     constexpr int kSourceSize = 256;
@@ -1527,13 +1586,14 @@ int main(int argc, char** argv) {
 
     for (const Case& testCase : cases) {
         const Bitmap source = testCase.make(kSourceSize);
-        const double coverage = OpaqueCoverage(source);
-        const IconAnalysis analysis = AnalyzeIcon(source);
+        const IconPrep prep = PrepareIcon(source);
         const Bitmap tile = MakeIconTile(source, kTileSize);
 
-        std::printf("%-18s coverage %.3f  -> %s\n",
-                    testCase.name, coverage,
-                    analysis.artwork ? "artwork (mask only)" : "glyph (generated tile)");
+        std::printf("%-18s mark %3dx%-3d fill %.2f  background %-9s -> %s\n",
+                    testCase.name, prep.content.width, prep.content.height,
+                    OpaqueCoverage(prep.content),
+                    prep.fill.found ? "stripped" : "none",
+                    prep.analysis.artwork ? "artwork (mask only)" : "glyph (generated tile)");
 
         const std::string base = outDir + "/" + testCase.name;
         if (!WritePng(base + "-in.png",  OnCheckerboard(source)) ||
@@ -1547,13 +1607,14 @@ int main(int argc, char** argv) {
     // be seen in the panel and the only way to judge whether they look
     // consistent with each other.
     constexpr int kGap = 16;
-    const int stripWidth = kTileSize * 4 + kGap * 5;
+    const int caseCount  = static_cast<int>(std::size(cases));
+    const int stripWidth = kTileSize * caseCount + kGap * (caseCount + 1);
     Bitmap strip = Bitmap::Create(stripWidth, kTileSize + kGap * 2);
     for (int y = 0; y < strip.height; ++y) {
         for (int x = 0; x < strip.width; ++x)
             strip.At(x, y) = MakePixel(0x2A, 0x2A, 0x2E, 255);   // dark panel-ish
     }
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < caseCount; ++i) {
         const Bitmap tile = MakeIconTile(cases[i].make(kSourceSize), kTileSize);
         CompositeOver(strip, tile, kGap + i * (kTileSize + kGap), kGap);
     }

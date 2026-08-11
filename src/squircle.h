@@ -35,17 +35,37 @@ namespace mactab {
 const std::vector<uint8_t>& SquircleMask(int size);
 
 struct IconAnalysis {
-    // True when the icon covers enough of its canvas to stand on its own.
-    // False means it is a glyph and needs a tile generated behind it.
+    // True when the mark is a solid shape that can stand on its own. False
+    // means it is a sparse glyph and needs a tile generated behind it.
     bool artwork = false;
 
-    // Vertical gradient for the synthesised tile, derived from the icon's own
+    // Vertical gradient for the synthesised tile: the background colour that
+    // was stripped off the source when there was one, otherwise the icon's own
     // dominant colour. Unused when `artwork` is true.
     uint32_t tintTop    = 0;
     uint32_t tintBottom = 0;
 };
 
-IconAnalysis AnalyzeIcon(const Bitmap& icon);
+// An icon reduced to the part of it that is actually artwork.
+struct IconPrep {
+    Bitmap       content;    // background removed, cropped to the mark
+    BorderFill   fill;       // the background that was removed, if any
+    IconAnalysis analysis;
+};
+
+// Strip any baked-in background, crop to the mark, and decide how to present it.
+//
+// The cropping matters more than it sounds. A Windows icon is very often a
+// small mark adrift in a mostly empty 256x256 canvas, either because the app
+// ships nothing bigger than a 48px frame and the shell centred it, or because
+// the background was painted in. Scaling that canvas as a whole reproduces all
+// the emptiness and leaves a dot in the middle of the tile.
+//
+// The classification looks at how full the mark's OWN bounding box is, not how
+// much of the canvas it covers, because the canvas is mostly an artifact of
+// wherever the icon came from. A circle fills 79% of its box, a rounded square
+// most of it, a letterform around a third.
+IconPrep PrepareIcon(const Bitmap& source);
 
 // The finished tile, `size` x `size`, straight alpha, transparent padding
 // around the shape.

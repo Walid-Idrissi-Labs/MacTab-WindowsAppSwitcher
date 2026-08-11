@@ -69,6 +69,13 @@ constexpr uint32_t MakePixel(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 //
 // Downscaling uses a box filter (area average) rather than bilinear: icons are
 // frequently reduced 256 -> 64, where bilinear point-samples and aliases badly.
+//
+// Upscaling uses Catmull-Rom rather than bilinear. Plenty of apps ship nothing
+// larger than a 48px icon, so a 4x enlargement is a normal case rather than an
+// unlucky one, and bilinear at 4x is visibly mushy: it interpolates linearly
+// between two samples and reproduces none of the edge that was there. A cubic
+// with a slight negative lobe keeps the edge crisp. It can overshoot around a
+// hard boundary, which is clamped away on the way out.
 Bitmap Resize(const Bitmap& source, int width, int height);
 
 // In-place conversion for upload to Direct2D / Composition surfaces, which
@@ -108,6 +115,41 @@ Bounds OpaqueBounds(const Bitmap& bitmap, uint8_t threshold = 8);
 uint32_t MeanColourIn(const Bitmap& bitmap, int left, int top, int right, int bottom);
 
 Bitmap Crop(const Bitmap& source, const Bounds& bounds);
+
+// A flat background colour that reaches the edge of the image.
+struct BorderFill {
+    bool     found   = false;
+    uint32_t colour  = 0;     // opaque; meaningless when !found
+    double   removed = 0.0;   // fraction of the canvas it covered
+};
+
+// Turn a flat background that touches the border into transparency, and report
+// the colour that was taken out.
+//
+// Two different sources hand us an icon with its background baked in, and both
+// end up looking like the same defect: a small mark adrift in a big coloured
+// square.
+//
+//   The shell regularly returns a 32-bit icon bitmap with every alpha byte
+//   zero. Read literally that is an invisible icon, so icon_source.cpp forces
+//   it opaque, which also makes the black padding around a small icon opaque.
+//
+//   A packaged app's icon comes out of the Apps folder already composited onto
+//   the background colour from its manifest. Windows' own taskbar does not show
+//   it that way; it uses the unplated asset.
+//
+// The removal is a flood fill inward from the border rather than a colour key
+// over the whole image, because a colour key would also punch out any part of
+// the artwork that happens to match, which for the common case of black padding
+// means every dark pixel in the icon. Padding reaches the border; the dark half
+// of a logo does not. Pixels near the tolerance edge come out part-transparent,
+// so an antialiased mark keeps its antialiasing.
+//
+// Leaves the bitmap untouched, and reports `found = false`, when the border is
+// not one flat colour, when the border is already transparent (the icon has a
+// working alpha channel and there is nothing to do), or when the fill would
+// swallow almost the entire image.
+BorderFill RemoveBorderFill(Bitmap& bitmap);
 
 // Scale to fit inside boxWidth x boxHeight PRESERVING ASPECT RATIO, then centre
 // the result on a transparent canvas of exactly that size. Non-square artwork
