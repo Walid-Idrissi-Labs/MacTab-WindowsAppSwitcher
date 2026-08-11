@@ -1916,6 +1916,11 @@ void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
             const bool haveGeometry =
                 thumbnail::SourceGeometry(item.hwnd, sourceWindow, sourceFrame);
 
+            // Deliberately GetWindowRect rather than DWM's own idea of the
+            // thumbnail's size, which the two can disagree about on a cloaked
+            // UWP window. Everything below scales and offsets in this same
+            // space, and a size from one space with an offset from another is
+            // how the window ends up not filling its tile.
             const SIZE render{
                 haveGeometry ? sourceWindow.right - sourceWindow.left
                              : tile.sourceRect.right - tile.sourceRect.left,

@@ -93,12 +93,40 @@ bool SourceGeometry(HWND source, RECT& window, RECT& frame);
 // window, which happens for windows that are cloaked onto another desktop.
 // `render` is the size DWM is asked to produce the thumbnail at.
 //
-// It is not optional in practice. Without a destination rectangle DWM picks the
-// resolution itself, and what it picks is not the window's own, so every
-// preview comes back soft. Ask for the source's full size and scale the visual
-// down from there: downscaling is always sharp, and upscaling never is.
+// `render` is what DWM is asked to map the thumbnail into. Every public user of
+// this export passes the source's own size, from ordinal 162, and displays at
+// roughly 1:1, so that is what is passed here.
+//
+// It is NOT a quality control, whatever an earlier version of this comment
+// claimed. A thumbnail is a live connection to the source's surfaces rather than
+// a render into an intermediate, so the destination rectangle is a mapping and
+// the sampling still happens once, at the leaf, with whatever scale the whole
+// visual tree composes to. That is why asking for a smaller destination and
+// asking for a larger one both looked the same.
+//
+// What actually decides how a downscaled thumbnail looks is the interpolation
+// mode below.
 bool CreateSharedVisual(void* device, HWND destination, HWND source, SIZE render,
                         void** outVisual, HTHUMBNAIL* outHandle);
+
+// Ask the compositor to sample this visual's subtree bilinearly.
+//
+// Worth more than everything else in this file put together, because of one
+// sentence in the documentation for IDCompositionVisual::SetBitmapInterpolationMode:
+// if no visual sets the mode, the default for the ENTIRE visual tree is nearest
+// neighbour. A 4K window mapped into a 400 pixel tile with nearest-neighbour
+// sampling is not a downscale, it is every tenth pixel of the window and nothing
+// else, which is exactly what "the previews look terrible" describes.
+//
+// The mode inherits down the subtree, so setting it on the visual DWM hands back
+// reaches the children DWM built inside it, which we do not own and could not
+// reach otherwise.
+//
+// Reached by QueryInterface, because the WinRT projection exposes no such
+// property at any SDK version: the object handed back by an interop compositor
+// is dual-natured and answers to IDCompositionVisual as well. False means it did
+// not, which is worth knowing and not worth failing over.
+bool SetSmoothScaling(void* visual);
 
 void ReleaseSharedVisual(HTHUMBNAIL handle);
 

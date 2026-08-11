@@ -1,6 +1,9 @@
 #include "pch.h"
 
+#include <dcomp.h>
+
 #include "thumbnail.h"
+#include "com.h"
 #include "common.h"
 #include "diag.h"
 
@@ -206,14 +209,14 @@ bool CreateSharedVisual(void* device, HWND destination, HWND source, SIZE render
     DWM_THUMBNAIL_PROPERTIES properties{};
     properties.dwFlags               = DWM_TNP_VISIBLE | DWM_TNP_OPACITY |
                                        DWM_TNP_SOURCECLIENTAREAONLY |
-                                       DWM_TNP_RECTDESTINATION;
+                                       DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE;
     properties.fVisible              = TRUE;
     properties.opacity               = 255;
     properties.fSourceClientAreaOnly = FALSE;
 
-    // The destination is what DWM sizes its render to. Asked for the source's
-    // own size, so the thumbnail carries every pixel the window has and the
-    // only scaling that ever happens is downward, in the compositor.
+    // Source and destination both at the window's own size, which is what every
+    // public user of this export does. The caller scales the visual afterwards.
+    properties.rcSource      = RECT{ 0, 0, render.cx, render.cy };
     properties.rcDestination = RECT{ 0, 0, render.cx, render.cy };
 
     const HRESULT hr = g_createShared(destination, source, 2, &properties,
@@ -227,7 +230,27 @@ bool CreateSharedVisual(void* device, HWND destination, HWND source, SIZE render
         if (*outHandle) { ::DwmUnregisterThumbnail(*outHandle); *outHandle = nullptr; }
         return false;
     }
+
+    // Before anybody scales it. See the note in the header: without this the
+    // whole tree may be sampling nearest-neighbour, which turns every reduction
+    // into decimation.
+    SetSmoothScaling(*outVisual);
     return true;
+}
+
+bool SetSmoothScaling(void* visual) {
+    if (!visual) return false;
+
+    ComPtr<IDCompositionVisual> composition;
+    if (FAILED(reinterpret_cast<IUnknown*>(visual)->QueryInterface(
+            IID_PPV_ARGS(composition.Put()))) || !composition.Get()) {
+        MACTAB_DIAG("thumbnail: the shared visual is not an IDCompositionVisual, "
+                    "so its sampling is whatever the tree defaults to");
+        return false;
+    }
+
+    return SUCCEEDED(composition->SetBitmapInterpolationMode(
+        DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR));
 }
 
 void ReleaseSharedVisual(HTHUMBNAIL handle) {
