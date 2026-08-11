@@ -118,6 +118,7 @@ add_executable(MacTab WIN32
     src/image.cpp
     src/mission.cpp
     src/package_assets.cpp
+    src/settings_watch.cpp
     src/squircle.cpp
     src/thumbnail.cpp
     src/tray.cpp

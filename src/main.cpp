@@ -14,6 +14,7 @@
 #include "icons.h"
 #include "mission.h"
 #include "panel.h"
+#include "settings_watch.h"
 #include "thumbnail.h"
 #include "wallpaper.h"
 #include "tray.h"
@@ -41,6 +42,16 @@ constexpr UINT WM_MACTAB_MC_GONE     = WM_APP + 8;   // wParam: the dead HWND
 
 // Ticks only while Mission Control is on screen.
 constexpr UINT_PTR kMissionWatchTimer = 1;
+
+// Armed when settings.ini changes, and re-armed by every further change, so the
+// reload happens once the file has stopped moving rather than once per
+// notification. A save is several notifications: the editor writes a temporary
+// file, renames it over the target, and the metadata update lands separately.
+//
+// 250 ms is well under the time it takes to look back at the screen, and well
+// over the gap between the events of one save.
+constexpr UINT_PTR kSettingsReloadTimer  = 2;
+constexpr UINT     kSettingsReloadDelayMs = 250;
 
 UINT g_msgRequestQuit    = 0;   // RegisterWindowMessage(kQuitMessageName)
 UINT g_msgTaskbarCreated = 0;   // RegisterWindowMessage(L"TaskbarCreated")
@@ -1026,6 +1037,26 @@ void OpenSettingsFile(HWND owner) {
     ::ShellExecuteW(owner, L"open", config::SettingsPath().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+// The whole material, re-read, without a restart.
+//
+// Not config::Load(), which reassigns the themes directory string the icon
+// worker reads on its own thread. This touches only the two Params and the
+// shared optics, and nothing off this thread reads either.
+//
+// The panel picks them up at the next gesture, because it copies the theme's
+// material when it lays out rather than caching one at startup. Mission
+// Control's bar does not: it is baked once and kept, precisely so that walking
+// the desktops does not re-run a full-width displacement map, so it has to be
+// thrown away by hand or a reload would reach everything except the piece most
+// likely to be tuned.
+//
+// UI thread only, which is the reason the file watcher posts a message instead
+// of calling this itself.
+void ReloadGlassFromSettings() {
+    config::ReloadGlass();
+    g_app.mission.InvalidateBackdrop();
+}
+
 // --- Shutdown --------------------------------------------------------------
 
 // Teardown must be idempotent: it can be reached through the tray menu, a
@@ -1035,6 +1066,7 @@ void ShutdownSubsystems() {
     g_app.shuttingDown = true;
 
     hotkey::Stop();
+    settings_watch::Stop();
     foreground::Stop();
     icons::Stop();
     g_app.mission.Shutdown();
@@ -1102,8 +1134,22 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         CloseMission(wParam != 0);
         return 0;
 
+    case settings_watch::WM_MACTAB_SETTINGS_CHANGED:
+        // Arming a timer that is already armed restarts it, which is the whole
+        // debounce: a burst of notifications from one save collapses into a
+        // single reload once the file has been still for the delay.
+        ::SetTimer(hwnd, kSettingsReloadTimer, kSettingsReloadDelayMs, nullptr);
+        return 0;
+
     case WM_TIMER:
         if (wParam == kMissionWatchTimer) SyncMission();
+        if (wParam == kSettingsReloadTimer) {
+            // One-shot: Win32 timers repeat, and this one has nothing to do
+            // until the file changes again.
+            ::KillTimer(hwnd, kSettingsReloadTimer);
+            MACTAB_DIAG("host: settings.ini changed, reloading the glass");
+            ReloadGlassFromSettings();
+        }
         return 0;
 
     case WM_MACTAB_MC_GONE:
@@ -1244,21 +1290,11 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             return 0;
 
         case IDM_TRAY_RELOAD_GLASS:
-            // The whole material, re-read, without a restart.
-            //
-            // Not config::Load(), which reassigns the themes directory string
-            // the icon worker reads on its own thread. This touches only the two
-            // Params and the shared optics, and nothing off this thread reads
-            // either.
-            //
-            // The panel picks them up at the next gesture, because it copies the
-            // theme's material when it lays out rather than caching one at
-            // startup. Mission Control's bar does not: it is baked once and kept,
-            // precisely so that walking the desktops does not re-run a full-width
-            // displacement map, so it has to be thrown away by hand or a reload
-            // would reach everything except the piece most likely to be tuned.
-            config::ReloadGlass();
-            g_app.mission.InvalidateBackdrop();
+            // Kept even though saving the file now does this on its own. It is
+            // the way to re-read a file that was edited while the watcher was
+            // not running, and it is the only one of the two that says out loud
+            // that it worked.
+            ReloadGlassFromSettings();
             g_app.tray.ShowBalloon(L"MacTab",
                                    L"Glass reloaded. Alt+Tab to see it.");
             return 0;
@@ -1519,6 +1555,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
     if (config::Current().missionEnabled) EnsureMission();
 
     icons::Start(g_app.host, WM_MACTAB_ICON_READY);
+
+    // Not fatal. Without it the glass only reloads from the tray item, which is
+    // exactly what shipped before this, so there is nothing here worth refusing
+    // to start over.
+    if (!settings_watch::Start(g_app.host))
+        MACTAB_WARN("boot: settings.ini is not being watched; reload the glass from the tray");
 
     // Lock/unlock notifications, so a gesture interrupted by the secure desktop
     // does not leave the state machine stuck.
