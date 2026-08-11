@@ -385,8 +385,17 @@ lot of room: thirty windows in six apps come out at a scale of 0.77 as piles
 against 0.27 when each window has to have its own space. The app's icon and name
 sit under the pile. `MissionGroupByApp=0` arranges purely by position instead.
 
-Each window carries a soft shadow that travels with it, and hovering one
-outlines it in your Windows accent colour.
+Each window carries a soft shadow that travels with it, and hovering one outlines
+it in your Windows accent colour. The outline is drawn for the window it is going
+round, at that window's size on that window's display, rather than being one
+texture stretched to fit: a stretched one keeps its corners at a fixed size in
+source pixels, so it carried the wrong corner and the wrong stroke width on every
+display but one, and came out crushed on anything narrower than twice its corner.
+
+The application's name sits under its icon with a shadow and nothing behind it.
+It had a capsule, because a name over a wallpaper is unreadable on some fraction
+of all desktops, and a capsule costs the thing the label is for: macOS puts a name
+under an icon, not a pill under an icon.
 
 **What you see in each tile** depends on what the machine supports, and the log
 names the tier that won:
