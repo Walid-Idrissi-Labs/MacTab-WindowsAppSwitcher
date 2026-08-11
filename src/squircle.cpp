@@ -228,7 +228,7 @@ const std::vector<uint8_t>& SquircleMask(int size) {
     return inserted->second;
 }
 
-IconPrep PrepareIcon(const Bitmap& source) {
+IconPrep PrepareIcon(const Bitmap& source, uint32_t backgroundHint) {
     IconPrep prep;
     if (source.Empty()) return prep;
 
@@ -254,15 +254,19 @@ IconPrep PrepareIcon(const Bitmap& source) {
     // off the artwork path once it knows the tile size, and it has no way to
     // derive these itself.
     //
-    // A background we stripped is the app's own colour and is exactly what
-    // Windows shows behind the same mark, so it makes a better tile than
-    // anything we could derive from the mark. Padding is not, and is filtered
-    // out by luma.
-    const bool usePlate = prep.fill.found &&
-                          Luma(prep.fill.colour) >= kPlateMinLuma &&
-                          Luma(prep.fill.colour) <= kPlateMaxLuma;
+    // A colour the app declares for itself beats one stripped off its icon,
+    // which in turn beats one derived from the mark, because each is a step
+    // further from anything the app ever said about how it wants to look.
+    // Padding is not a declaration of anything, and is filtered out by luma.
+    auto usable = [](uint32_t colour) {
+        return AlphaOf(colour) != 0 &&
+               Luma(colour) >= kPlateMinLuma && Luma(colour) <= kPlateMaxLuma;
+    };
 
-    uint32_t base = usePlate ? prep.fill.colour : DominantColour(prep.content);
+    uint32_t base;
+    if (usable(backgroundHint))                          base = backgroundHint;
+    else if (prep.fill.found && usable(prep.fill.colour)) base = prep.fill.colour;
+    else                                                  base = DominantColour(prep.content);
 
     // Derived from the glyph's own colours, the tile lands at the same luma as
     // the glyph and the glyph disappears into it. Drive it to the opposite side
@@ -281,13 +285,13 @@ IconPrep PrepareIcon(const Bitmap& source) {
     return prep;
 }
 
-Bitmap MakeIconTile(const Bitmap& source, int size) {
+Bitmap MakeIconTile(const Bitmap& source, int size, uint32_t backgroundHint) {
     if (source.Empty() || size <= 0) return {};
 
     const int shapeSize = (std::max)(1, static_cast<int>(std::lround(size * kShapeRatio)));
     const std::vector<uint8_t>& mask = SquircleMask(shapeSize);
 
-    const IconPrep prep = PrepareIcon(source);
+    const IconPrep prep = PrepareIcon(source, backgroundHint);
     const Bitmap& content = prep.content;
     if (content.Empty()) return {};
 

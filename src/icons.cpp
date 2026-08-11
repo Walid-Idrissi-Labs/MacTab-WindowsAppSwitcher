@@ -14,6 +14,7 @@
 #include "common.h"
 #include "diag.h"
 #include "icon_source.h"
+#include "package_assets.h"
 #include "squircle.h"
 
 namespace mactab::icons {
@@ -94,6 +95,15 @@ std::wstring DiskCachePath(const Request& request) {
             hash = Fnv1a(&attributes.ftLastWriteTime, sizeof(attributes.ftLastWriteTime), hash);
             hash = Fnv1a(&attributes.nFileSizeLow,    sizeof(attributes.nFileSizeLow),    hash);
         }
+    }
+
+    // A packaged app has no executable worth stamping, so its identity comes
+    // from the installed package versions instead. Without this a Store app
+    // that updates keeps whatever tile was built before the update, forever.
+    if (request.packaged) {
+        const std::wstring version = packages::VersionTag(request.aumid);
+        if (!version.empty())
+            hash = Fnv1a(version.data(), version.size() * sizeof(wchar_t), hash);
     }
 
     wchar_t name[64];
@@ -192,10 +202,11 @@ std::wstring ShellItemDisplayName(IShellItem* item) {
     return name;
 }
 
-// Packaged apps live in the virtual Apps folder, addressed by AUMID. This is
-// also the only place their friendly display name and their real Store logo
-// can be read from.
-Bitmap ExtractPackaged(const Request& request, std::wstring& displayName) {
+// Packaged apps live in the virtual Apps folder, addressed by AUMID. That is
+// the only place their friendly display name can be read from, so this runs
+// whether or not the icon comes from here.
+Bitmap ExtractPackaged(const Request& request, std::wstring& displayName,
+                       bool wantImage) {
     if (request.aumid.empty()) return {};
 
     const std::wstring parsingName = L"shell:AppsFolder\\" + request.aumid;
@@ -208,6 +219,11 @@ Bitmap ExtractPackaged(const Request& request, std::wstring& displayName) {
     }
 
     displayName = ShellItemDisplayName(item.Get());
+    if (!wantImage) return {};
+
+    // The icon this returns is already composited onto the app's background
+    // colour, at whatever size the shell chose. Only worth having when reading
+    // the package's own asset failed.
     return ImageFromShellItem(item.Get(), kSourceIconSize);
 }
 
@@ -262,14 +278,33 @@ Bitmap ExtractWindowIcon(HWND window) {
 
 Bitmap ProduceTile(const Request& request) {
     std::wstring displayName;
+    uint32_t background = 0;
 
     // A user-supplied override wins over anything we can synthesise. Some apps
     // ship an icon that no amount of analysis will make look right, and this is
     // the escape hatch for exactly those.
     Bitmap source = config::LoadThemeOverride(request.exePath, request.aumid);
 
-    if (source.Empty() && request.packaged)
-        source = ExtractPackaged(request, displayName);
+    if (request.packaged) {
+        // The package's own asset file first: it is the picture the taskbar
+        // shows, at the largest size the app ships, with nothing composited
+        // behind it.
+        if (source.Empty()) {
+            packages::Logo logo;
+            if (packages::FindLogo(request.aumid, logo)) {
+                source = DecodeImageFile(logo.path);
+                background = logo.background;
+            }
+        }
+
+        // The shell is bound either way: a packaged app's friendly name is not
+        // in the manifest in any form we can read, only in the shell's view of
+        // the package.
+        std::wstring shellName;
+        Bitmap plated = ExtractPackaged(request, shellName, source.Empty());
+        displayName = shellName;
+        if (source.Empty()) source = std::move(plated);
+    }
 
     if (source.Empty())
         source = ExtractExecutable(request);
@@ -290,7 +325,7 @@ Bitmap ProduceTile(const Request& request) {
         g_displayNames[request.key] = displayName;
     }
 
-    return MakeIconTile(source, request.size);
+    return MakeIconTile(source, request.size, background);
 }
 
 void Remember(const CacheKey& key, Bitmap tile) {

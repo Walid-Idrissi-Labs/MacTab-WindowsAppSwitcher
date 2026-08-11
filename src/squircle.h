@@ -65,10 +65,14 @@ struct IconPrep {
 // much of the canvas it covers, because the canvas is mostly an artifact of
 // wherever the icon came from. A circle fills 79% of its box, a rounded square
 // most of it, a letterform around a third.
-IconPrep PrepareIcon(const Bitmap& source);
+// `backgroundHint`, when its alpha is non-zero, is a colour the app itself
+// declares as the one to sit its icon on. A packaged app's manifest gives one,
+// and it is a better tile colour than anything derivable from the mark: it is
+// the colour Windows plates the same app with.
+IconPrep PrepareIcon(const Bitmap& source, uint32_t backgroundHint = 0);
 
 // The finished tile, `size` x `size`, straight alpha, transparent padding
 // around the shape.
-Bitmap MakeIconTile(const Bitmap& source, int size);
+Bitmap MakeIconTile(const Bitmap& source, int size, uint32_t backgroundHint = 0);
 
 } // namespace mactab

@@ -117,6 +117,7 @@ add_executable(MacTab WIN32
     src/icons.cpp
     src/image.cpp
     src/mission.cpp
+    src/package_assets.cpp
     src/squircle.cpp
     src/thumbnail.cpp
     src/tray.cpp
@@ -184,6 +185,7 @@ target_link_libraries(MacTab PRIVATE
     shcore         # GetDpiForMonitor
     windowscodecs  # PNG decoding: icon theme packs, and 256px icon frames
     version        # FileDescription from executables' version resources
+    xmllite        # reading a package manifest for its logo and tile colour
 )
 
 set_target_properties(MacTab PROPERTIES
