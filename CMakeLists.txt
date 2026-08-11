@@ -111,6 +111,7 @@ add_executable(MacTab WIN32
     src/diag.cpp
     src/foreground_history.cpp
     src/geometry.cpp
+    src/glass_draw.cpp
     src/hotkey.cpp
     src/icon_source.cpp
     src/icons.cpp

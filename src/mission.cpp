@@ -30,6 +30,8 @@
 #include "config.h"
 #include "diag.h"
 #include "geometry.h"
+#include "glass.h"
+#include "glass_draw.h"
 #include "mission_layout.h"
 #include "thumbnail.h"
 #include "wallpaper.h"
@@ -315,25 +317,6 @@ bool GuardMission(Mission::Impl& impl, const char* what, F&& fn) {
         MACTAB_FAIL("mission: %s threw a non-WinRT exception", what);
         return false;
     }
-}
-
-ComPtr<ID2D1Bitmap1> UploadBitmap(ID2D1DeviceContext* dc, Bitmap image) {
-    if (!dc || image.Empty()) return {};
-
-    PremultiplyInPlace(image);
-
-    D2D1_BITMAP_PROPERTIES1 properties{};
-    properties.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
-                                               D2D1_ALPHA_MODE_PREMULTIPLIED);
-
-    ComPtr<ID2D1Bitmap1> bitmap;
-    if (FAILED(dc->CreateBitmap(
-            D2D1::SizeU(static_cast<UINT32>(image.width),
-                        static_cast<UINT32>(image.height)),
-            image.pixels.data(), static_cast<UINT32>(image.width) * 4,
-            &properties, bitmap.Put())))
-        return {};
-    return bitmap;
 }
 
 void FillSquircle(ID2D1DeviceContext* dc, ID2D1Factory* factory,

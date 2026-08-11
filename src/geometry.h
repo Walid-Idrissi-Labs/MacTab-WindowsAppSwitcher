@@ -4,8 +4,19 @@
 #include <d2d1_1.h>
 
 #include "com.h"
+#include "image.h"
 
 namespace mactab {
+
+// Upload a CPU bitmap for use as a D2D effect input or a DrawBitmap source.
+//
+// Takes the bitmap by value because it has to premultiply it, and every caller
+// either builds it fresh or is handing over a copy it does not need again.
+//
+// Here rather than in each of the three files that draws, which is where it was.
+// Three copies of a bitmap upload is two too many, and the one in panel.cpp was
+// the only one anything type-checked.
+ComPtr<ID2D1Bitmap1> UploadBitmap(ID2D1DeviceContext* dc, Bitmap image);
 
 // A rounded rectangle whose corners follow a superellipse rather than a
 // circular arc.

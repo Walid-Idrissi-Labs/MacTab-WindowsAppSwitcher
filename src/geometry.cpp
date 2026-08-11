@@ -38,6 +38,26 @@ void AddCorner(ID2D1GeometrySink* sink, D2D1_POINT_2F centre, float radius,
 
 } // namespace
 
+ComPtr<ID2D1Bitmap1> UploadBitmap(ID2D1DeviceContext* dc, Bitmap image) {
+    ComPtr<ID2D1Bitmap1> result;
+    if (!dc || image.Empty()) return result;
+
+    PremultiplyInPlace(image);
+
+    const D2D1_SIZE_U size{ static_cast<UINT32>(image.width),
+                            static_cast<UINT32>(image.height) };
+    D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_NONE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+    if (FAILED(dc->CreateBitmap(size, image.pixels.data(),
+                                static_cast<UINT32>(image.width * 4),
+                                &props, result.Put()))) {
+        result.Reset();
+    }
+    return result;
+}
+
 ComPtr<ID2D1PathGeometry> CreateSquircleGeometry(ID2D1Factory* factory,
                                                  float width, float height, float radius,
                                                  float exponent) {
