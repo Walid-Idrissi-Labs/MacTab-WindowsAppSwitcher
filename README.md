@@ -581,9 +581,11 @@ defaults and comments on first run:
 
 ### Tuning the glass yourself
 
-Every number in the material is a key in the same file, and *Reload glass from
-settings.ini* in the tray menu re-reads them without a restart. Nothing is
-written there by default: leave a key out and the shipped value stands.
+Every number in the material is a key in the same file. *Open settings.ini* in
+the tray menu opens it in whatever the shell has associated with `.ini`
+(Notepad on a machine with no override); *Reload glass from settings.ini*
+re-reads it without a restart. Nothing is written there by default: leave a
+key out and the shipped value stands.
 
 Shared by both appearances, in logical pixels at 100% scaling:
 
@@ -599,10 +601,10 @@ Shared by both appearances, in logical pixels at 100% scaling:
 Per appearance, prefixed `GlassDark` or `GlassLight`: `Saturation`, `Gain`,
 `Bias`, `TintR` `TintG` `TintB` `TintA`, `RimAmbient`, `RimLobe`, `SpecLine`,
 `RimEnvFloor`, `RimEnvGain`, `RimOuterDark`, `TargetMin`, `TargetMax`,
-`KneeBelow`, `KneeAbove`, `FallbackAlpha`. So `GlassDarkTintA=0.06` thins the
-dark tint. Values are clamped to ranges the rest of the material was designed
-inside, and out-of-range or unparseable ones are logged rather than ignored
-silently.
+`KneeBelow`, `KneeAbove`, `FallbackAlpha`. So `GlassDarkTintA=0.03` thins the
+dark tint further than the 0.06 it already ships at. Values are clamped to
+ranges the rest of the material was designed inside, and out-of-range or
+unparseable ones are logged rather than ignored silently.
 
 This exists because of the constraint at the top of this file: MacTab is written
 on a Mac and cannot be run there, so the only person who can see the glass is

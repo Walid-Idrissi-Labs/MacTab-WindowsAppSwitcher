@@ -144,9 +144,10 @@ const wchar_t* kDefaultIni =
     L";   KneeBelow KneeAbove       how much of an excursion past that survives\r\n"
     L";   FallbackAlpha the base coat used when the desktop grab fails\r\n"
     L";\r\n"
-    L"; For example, to see through it more:\r\n"
+    L"; For example, to see through it more (0.9 already ships TintA at 0.06,\r\n"
+    L"; down from 0.10; this goes further):\r\n"
     L";   GlassBlurSigma=5\r\n"
-    L";   GlassDarkTintA=0.06\r\n";
+    L";   GlassDarkTintA=0.03\r\n";
 
 std::wstring ReadString(const wchar_t* key, const wchar_t* fallback) {
     wchar_t buffer[128] = L"";

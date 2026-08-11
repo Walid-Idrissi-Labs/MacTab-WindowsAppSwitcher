@@ -264,9 +264,15 @@ struct Params {
 // 0.71 * L + 0.068, so nearly three quarters of the desktop's contrast reaches
 // the screen. 0.3 ran 0.42 and 0.4.0 ran 0.53, which is why it still read as a
 // slab after the blur came down.
+//
+// 0.9 took the tint alpha down from 0.10 to 0.06, the flat coat sitting over
+// everything else. Less of it means more of the gain and bias above actually
+// arrives: end to end this alone moves the slope from 0.71 to 0.74. Not
+// rebalanced against the saturation ratio, unlike light below, because there is
+// no dark-mode reference to keep it honest against.
 inline constexpr Params kDark{
     1.70f, 0.789f, 0.0654f,
-    { 0.09f, 0.09f, 0.11f, 0.10f },
+    { 0.09f, 0.09f, 0.11f, 0.06f },
     0.96f,
     0.065f, 0.035f, 0.045f,
     0.30f, 1.40f,
@@ -281,9 +287,15 @@ inline constexpr Params kDark{
 // and a much higher intercept, since that is what makes it the light one. There
 // is no light-mode reference to fit against, so the intercept is set to put a
 // mid wallpaper at 0.69 and the band is set by what dark text stays readable on.
+//
+// 0.9 took tint alpha down the same 0.10 to 0.06 as dark, and unlike dark this
+// one has a reference to answer to: less tint means less of it diluting the
+// saturation matrix's output, so the ratio the preview checks against the
+// measured 0.87 drifts up on its own. Saturation came down from 1.84 to 1.6 to
+// land it back in [0.84, 0.90] rather than leaving it to luck.
 inline constexpr Params kLight{
-    1.84f, 0.789f, 0.2199f,
-    { 0.97f, 0.97f, 0.98f, 0.10f },
+    1.60f, 0.789f, 0.2199f,
+    { 0.97f, 0.97f, 0.98f, 0.06f },
     0.96f,
     0.085f, 0.045f, 0.055f,
     0.30f, 1.40f,
