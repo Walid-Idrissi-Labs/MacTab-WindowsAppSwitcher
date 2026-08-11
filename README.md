@@ -458,6 +458,7 @@ defaults and comments on first run:
 
 | Key | Default | |
 |---|---|---|
+| `SettingsVersion` | 2 | Written by MacTab so it knows which defaults a file predates. It never overwrites a value you have changed yourself |
 | `RevealDelayMs` | 180 | How long Alt must be held before the panel appears |
 | `LeftAltOnly` | 1 | Ignore Right Alt and anything with Ctrl held. Keep this on if AltGr types `@ # { } [ ]` on your layout |
 | `TileSize` | 128 | Icon size in logical pixels at 100% scaling |

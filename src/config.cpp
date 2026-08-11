@@ -55,6 +55,10 @@ const wchar_t* kDefaultIni =
     L"; frost. Set to 0 if the bezel looks doubled or banded.\r\n"
     L"GlassRimTap=1\r\n"
     L"\r\n"
+    L"; Written by MacTab so it knows which defaults this file predates. Leave it\r\n"
+    L"; alone; it never overwrites a value you have changed yourself.\r\n"
+    L"SettingsVersion=2\r\n"
+    L"\r\n"
     L"; --- Mission Control -------------------------------------------------\r\n"
     L";\r\n"
     L"; Mission Control spreads every window out and puts the desktops along the\r\n"
@@ -144,6 +148,20 @@ std::wstring ReadString(const wchar_t* key, const wchar_t* fallback) {
                                g_settingsPath.c_str());
     return buffer;
 }
+
+// Settings whose SHIPPED default has changed, in a file that was written before
+// it changed.
+//
+// The file is only written once, on first run, so an upgrade leaves every value
+// in it exactly as it was. That is right for anything the user chose and wrong
+// for a default they never touched: 0.7 shipped Mission Control with the
+// wallpaper blurred at 18 and dimmed by 0.55, and 0.8 stopped blurring it,
+// because macOS does not. Left alone, the change would be invisible on every
+// machine that already had the file.
+//
+// Stamped rather than sniffed, so a value somebody has deliberately set is only
+// ever rewritten once and never again.
+constexpr int kSettingsVersion = 2;
 
 int ReadInt(const wchar_t* key, int fallback) {
     return static_cast<int>(::GetPrivateProfileIntW(kSection, key, fallback,
@@ -327,6 +345,29 @@ Bitmap DecodeImageFile(const std::wstring& path) {
     return out;
 }
 
+void Migrate() {
+    if (ReadInt(L"SettingsVersion", 1) >= kSettingsVersion) return;
+
+    // Only the two whose meaning changed, and only when they still hold the
+    // value 0.7 wrote. Anything else is a choice somebody made.
+    wchar_t buffer[64] = L"";
+    ::GetPrivateProfileStringW(kSection, L"MissionBlurSigma", L"", buffer,
+                               ARRAYSIZE(buffer), g_settingsPath.c_str());
+    if (::lstrcmpW(buffer, L"18") == 0)
+        ::WritePrivateProfileStringW(kSection, L"MissionBlurSigma", L"0",
+                                     g_settingsPath.c_str());
+
+    ::GetPrivateProfileStringW(kSection, L"MissionDim", L"", buffer,
+                               ARRAYSIZE(buffer), g_settingsPath.c_str());
+    if (::lstrcmpW(buffer, L"0.55") == 0)
+        ::WritePrivateProfileStringW(kSection, L"MissionDim", L"0.45",
+                                     g_settingsPath.c_str());
+
+    ::WritePrivateProfileStringW(kSection, L"SettingsVersion", L"2",
+                                 g_settingsPath.c_str());
+    MACTAB_DIAG("config: settings brought up to version %d", kSettingsVersion);
+}
+
 } // namespace
 
 const Settings& Current() { return g_settings; }
@@ -364,6 +405,8 @@ void Load() {
     }
 
     ::SHCreateDirectoryExW(nullptr, g_themesDir.c_str(), nullptr);
+
+    Migrate();
 
     g_settings.revealDelayMs = static_cast<UINT>(
         (std::max)(0, (std::min)(2000, ReadInt(L"RevealDelayMs", 180))));
