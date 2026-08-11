@@ -276,7 +276,16 @@ struct Mission::Impl {
         HTHUMBNAIL thumbnail = nullptr;
         RECT       screenRect{};   // where it lands in the arrangement
         RECT       liveRect{};     // where it is NOW, which differs while expanded
-        RECT       sourceRect{};   // where the window really is
+        RECT       sourceRect{};   // where it flies IN from
+
+        // Where the window really is, always.
+        //
+        // Not the same as sourceRect, which is only the window's own place on
+        // the reveal: a desktop sliding past starts its tiles off the side of
+        // the screen, and a rearrangement starts them wherever they happened to
+        // be sitting. The collapse has to put every window back on itself
+        // whichever of those last happened, so it reads this instead.
+        RECT       homeRect{};
         float      baseW = 1.0f;   // the holder's own size, which Scale multiplies
         float      baseH = 1.0f;
         int        item  = -1;     // index into Impl::items
@@ -1820,14 +1829,16 @@ void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
         tile.baseW    = place.w;
         tile.baseH    = place.h;
 
+        tile.homeRect = RECT{ item.bounds.left   - screen.rect.left,
+                              item.bounds.top    - screen.rect.top,
+                              item.bounds.right  - screen.rect.left,
+                              item.bounds.bottom - screen.rect.top };
+
         // Where it flies in from. Zero means the window's own place on screen,
         // which is the reveal; a direction means off the side, which is a
         // desktop sliding past.
         tile.sourceRect = (slide == 0)
-            ? RECT{ item.bounds.left   - screen.rect.left,
-                    item.bounds.top    - screen.rect.top,
-                    item.bounds.right  - screen.rect.left,
-                    item.bounds.bottom - screen.rect.top }
+            ? tile.homeRect
             : RECT{ tile.screenRect.left   + slide * static_cast<LONG>(screen.Width()),
                     tile.screenRect.top,
                     tile.screenRect.right  + slide * static_cast<LONG>(screen.Width()),
@@ -2852,8 +2863,8 @@ void Mission::Hide(bool restoreFocus, bool immediate) {
 
                     auto offset = impl.compositor.CreateVector3KeyFrameAnimation();
                     offset.InsertKeyFrame(1.0f,
-                        { static_cast<float>(tile.sourceRect.left),
-                          static_cast<float>(tile.sourceRect.top), 0.0f }, easing);
+                        { static_cast<float>(tile.homeRect.left),
+                          static_cast<float>(tile.homeRect.top), 0.0f }, easing);
                     offset.Duration(duration);
                     tile.holder.StartAnimation(L"Offset", offset);
 
@@ -2862,8 +2873,8 @@ void Mission::Hide(bool restoreFocus, bool immediate) {
 
                     auto scale = impl.compositor.CreateVector3KeyFrameAnimation();
                     scale.InsertKeyFrame(1.0f,
-                        { (tile.sourceRect.right - tile.sourceRect.left) / baseW,
-                          (tile.sourceRect.bottom - tile.sourceRect.top) / baseH,
+                        { (tile.homeRect.right - tile.homeRect.left) / baseW,
+                          (tile.homeRect.bottom - tile.homeRect.top) / baseH,
                           1.0f }, easing);
                     scale.Duration(duration);
                     tile.holder.StartAnimation(L"Scale", scale);
