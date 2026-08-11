@@ -1675,7 +1675,12 @@ void Mission::Impl::BakeChrome(Screen& screen, Tile& tile) {
     // Wide enough for a readable name under a narrow window, and never so wide
     // that two neighbours' names run into each other.
     const float width  = (std::max)(tile.pileW, screen.Scaled(190.0f));
-    const float height = badge + screen.Scaled(kTitleGap) + titleH;
+
+    // Room under the name for its own shadow. Without it the lowest ring offset
+    // falls outside the surface and is thrown away, which is the same mistake
+    // that once clipped the top half off every application icon.
+    const float height = badge + screen.Scaled(kTitleGap) + titleH +
+                         screen.Scaled(kTitleShadow) * 2.0f;
 
     tile.chromeSurface = graphics.CreateDrawingSurface(
         { width, height },
