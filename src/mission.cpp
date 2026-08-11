@@ -61,14 +61,16 @@ constexpr float kTitleGap     = 8.0f;
 constexpr float kTileRadius   = 8.0f;
 constexpr float kOutlineWidth = 3.0f;
 
-// The little cross that closes a desktop, as a fraction of a miniature's height,
-// and where its centre sits inside the miniature's top-left corner.
-//
 // Drawn on every desktop rather than only on the one under the pointer. macOS
 // reveals it on hover, but the bar here is baked as one surface and a hover
 // state would mean re-baking every miniature, every icon and every name each
 // time the pointer crossed one. At this size it is unobtrusive enough to leave
 // out, and a control you can see is a control people find.
+// The teardown timer, on the first overlay's own window.
+constexpr UINT_PTR kCloseTimerId = 1;
+
+// The little cross that closes a desktop, as a fraction of a miniature's height,
+// and where its centre sits inside the miniature's top-left corner.
 constexpr float kCloseSize   = 0.26f;
 constexpr float kCloseInset  = 0.16f;
 
@@ -222,6 +224,20 @@ struct Mission::Impl {
 
     bool ready   = false;
     bool visible = false;
+
+    // On screen, but on its way out: the windows are flying back to where they
+    // really are and nothing is listening any more.
+    //
+    // A separate flag rather than clearing `visible`, so the teardown can be
+    // forced from anywhere if the timer that normally does it never fires. A
+    // full-screen topmost window left up because a timer was missed is the worst
+    // failure this file can have, and it is worth two lines to make it
+    // impossible rather than unlikely.
+    bool     closing    = false;
+    UINT_PTR closeTimer = 0;
+    bool     restoreOnHide = true;
+
+    void FinishHide();
 
     WUC::Compositor                compositor{ nullptr };
     WUC::CompositionGraphicsDevice graphics{ nullptr };
@@ -544,6 +560,11 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                        static_cast<WPARAM>(hit.item), 0);
         return 0;
     }
+
+    // The collapse has finished playing; take the windows off the screen.
+    case WM_TIMER:
+        if (wParam == kCloseTimerId) impl->FinishHide();
+        return 0;
 
     // Capture can be taken away, by a system dialog or an alt-tab out. Leaving
     // the drag armed would make the next click somewhere else finish a move.
@@ -1085,7 +1106,9 @@ void Mission::DisplaysChanged() {
     Impl& impl = *m_impl;
     if (!impl.ready) return;
 
-    Hide();
+    // Not the collapse: the windows these tiles came from are on displays that
+    // may not exist any more, so there is nowhere to put them back.
+    HideNow();
     wallpaper::Invalidate();
 
     for (Impl::Screen& screen : impl.screens) {
@@ -1095,8 +1118,10 @@ void Mission::DisplaysChanged() {
         screen.tileLayer       = nullptr;
         screen.chromeLayer     = nullptr;
         screen.outline         = nullptr;
+        screen.barGlass        = nullptr;
         screen.bar             = nullptr;
         screen.backdropSurface = nullptr;
+        screen.barGlassSurface = nullptr;
         screen.barSurface      = nullptr;
         screen.target          = nullptr;
         if (screen.hwnd) ::DestroyWindow(screen.hwnd);
@@ -1123,6 +1148,7 @@ void Mission::Shutdown() {
     Impl& impl = *m_impl;
     if (!impl.ready && impl.screens.empty()) return;
 
+    impl.FinishHide();
     impl.ready = false;
 
     for (Impl::Screen& screen : impl.screens) {
@@ -1132,8 +1158,10 @@ void Mission::Shutdown() {
         screen.tileLayer       = nullptr;
         screen.chromeLayer     = nullptr;
         screen.outline         = nullptr;
+        screen.barGlass        = nullptr;
         screen.bar             = nullptr;
         screen.backdropSurface = nullptr;
+        screen.barGlassSurface = nullptr;
         screen.barSurface      = nullptr;
         screen.target          = nullptr;
         if (screen.hwnd) ::DestroyWindow(screen.hwnd);
@@ -1154,7 +1182,7 @@ void Mission::Shutdown() {
 }
 
 bool Mission::Ready() const   { return m_impl->ready; }
-bool Mission::Visible() const { return m_impl->visible; }
+bool Mission::Visible() const { return m_impl->visible && !m_impl->closing; }
 
 HWND Mission::ItemWindow(int index) const {
     if (index < 0 || index >= static_cast<int>(m_impl->items.size())) return nullptr;
@@ -2495,6 +2523,10 @@ void Mission::Impl::Rearrange(int desktop) {
 void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spaces,
                    int desktop) {
     Impl& impl = *m_impl;
+
+    // A collapse still playing is finished at once rather than raced with.
+    if (impl.closing) impl.FinishHide();
+
     if (impl.visible || impl.screens.empty()) return;
 
     const bool ok = GuardMission(impl, "Show", [&] {
@@ -2685,14 +2717,23 @@ std::vector<HWND> Mission::Windows() const {
     return handles;
 }
 
-void Mission::Hide(bool restoreFocus) {
-    Impl& impl = *m_impl;
-    if (!impl.visible && impl.screens.empty()) return;
+// Everything that actually takes the overlay off the screen.
+//
+// Split out of Hide because the windows fly back to where they came from first,
+// and that takes as long as the reveal did. Safe to call twice.
+void Mission::Impl::FinishHide() {
+    if (!visible && !closing) return;
 
-    impl.visible = false;
+    if (closeTimer && !screens.empty()) {
+        ::KillTimer(screens.front().hwnd, closeTimer);
+        closeTimer = 0;
+    }
 
-    for (Impl::Screen& screen : impl.screens) {
-        GuardMission(impl, "Hide", [&] {
+    visible = false;
+    closing = false;
+
+    for (Screen& screen : screens) {
+        GuardMission(*this, "Hide", [&] {
             screen.root.Opacity(0.0f);
             screen.outline.Opacity(0.0f);
         });
@@ -2701,23 +2742,106 @@ void Mission::Hide(bool restoreFocus) {
         // Released immediately rather than at the next invocation. Each
         // thumbnail is a registration DWM holds on our behalf, and the budget
         // for this process while nothing is happening is zero.
-        GuardMission(impl, "ReleaseTiles", [&] { impl.ReleaseTiles(screen); });
+        GuardMission(*this, "ReleaseTiles", [&] { ReleaseTiles(screen); });
     }
 
-    impl.items.clear();
-    impl.spaces.clear();
+    items.clear();
+    spaces.clear();
 
-    // The uploaded icons go with them. They exist so an app's five windows
-    // share one upload within a single invocation, which is where the saving
-    // is; keeping them across a session that opens and closes hundreds of
+    // The uploaded icons go with them. They exist so an app's five windows share
+    // one upload within a single invocation, which is where the saving is;
+    // keeping them across a session that opens and closes hundreds of
     // applications would grow without a bound.
-    impl.iconBitmaps.clear();
+    iconBitmaps.clear();
 
-    if (restoreFocus && impl.restoreWindow && ::IsWindow(impl.restoreWindow))
-        ::SetForegroundWindow(impl.restoreWindow);
+    if (restoreOnHide && restoreWindow && ::IsWindow(restoreWindow))
+        ::SetForegroundWindow(restoreWindow);
 
-    impl.restoreWindow = nullptr;
+    restoreWindow = nullptr;
 }
+
+// Put every window back where it really is, then leave.
+//
+// The reveal lifts the windows off the desktop; the dismissal has to lower them
+// onto it again, or the whole gesture is half an animation. `immediate` is for
+// the paths that cannot wait: a desktop switch is about to run its own animation
+// underneath, and an overlay still on screen while the desktop slides under it
+// looks like a fault.
+void Mission::Hide(bool restoreFocus, bool immediate) {
+    Impl& impl = *m_impl;
+    if (!impl.visible && impl.screens.empty()) return;
+
+    impl.restoreOnHide = restoreFocus;
+
+    const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
+
+    if (!immediate && impl.visible && !impl.closing && !impl.screens.empty()) {
+        impl.closing = true;
+
+        const bool started = GuardMission(impl, "Collapse", [&] {
+            auto easing = impl.compositor.CreateCubicBezierEasingFunction(
+                { 0.4f, 0.0f }, { 0.2f, 1.0f });
+
+            for (Impl::Screen& screen : impl.screens) {
+                screen.outline.Opacity(0.0f);
+                screen.chromeLayer.StartAnimation(
+                    L"Opacity", [&] {
+                        auto fade = impl.compositor.CreateScalarKeyFrameAnimation();
+                        fade.InsertKeyFrame(0.0f, 1.0f);
+                        fade.InsertKeyFrame(0.35f, 0.0f, easing);
+                        fade.Duration(duration);
+                        return fade;
+                    }());
+
+                for (Impl::Tile& tile : screen.tiles) {
+                    const float w = static_cast<float>(tile.liveRect.right - tile.liveRect.left);
+                    const float h = static_cast<float>(tile.liveRect.bottom - tile.liveRect.top);
+                    if (w <= 0.0f || h <= 0.0f) continue;
+
+                    auto offset = impl.compositor.CreateVector3KeyFrameAnimation();
+                    offset.InsertKeyFrame(1.0f,
+                        { static_cast<float>(tile.sourceRect.left),
+                          static_cast<float>(tile.sourceRect.top), 0.0f }, easing);
+                    offset.Duration(duration);
+                    tile.holder.StartAnimation(L"Offset", offset);
+
+                    const float baseW = (std::max)(1.0f, tile.baseW);
+                    const float baseH = (std::max)(1.0f, tile.baseH);
+
+                    auto scale = impl.compositor.CreateVector3KeyFrameAnimation();
+                    scale.InsertKeyFrame(1.0f,
+                        { (tile.sourceRect.right - tile.sourceRect.left) / baseW,
+                          (tile.sourceRect.bottom - tile.sourceRect.top) / baseH,
+                          1.0f }, easing);
+                    scale.Duration(duration);
+                    tile.holder.StartAnimation(L"Scale", scale);
+                }
+
+                auto fade = impl.compositor.CreateScalarKeyFrameAnimation();
+                fade.InsertKeyFrame(0.55f, 1.0f);
+                fade.InsertKeyFrame(1.0f, 0.0f, easing);
+                fade.Duration(duration);
+                screen.root.StartAnimation(L"Opacity", fade);
+            }
+        });
+
+        // The timer is what eventually hides the windows, so a failure to set
+        // one is not something to shrug at: fall straight through to the
+        // immediate path rather than leaving a full-screen overlay up.
+        if (started) {
+            impl.closeTimer = ::SetTimer(impl.screens.front().hwnd, kCloseTimerId,
+                                         config::Current().missionRevealMs + 30, nullptr);
+            if (impl.closeTimer) return;
+            MACTAB_WARN("mission: no timer for the collapse; hiding at once");
+        }
+
+        impl.closing = false;
+    }
+
+    impl.FinishHide();
+}
+
+void Mission::HideNow() { m_impl->FinishHide(); }
 
 void Mission::UpdateIcon(const std::wstring& appKey, const Bitmap& icon) {
     Impl& impl = *m_impl;

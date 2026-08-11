@@ -489,7 +489,11 @@ void CloseMission(bool commitDesktop) {
     // window belonging to the desktop being left is both a flash of the wrong
     // application and, since Windows shows a window it is asked to activate, a
     // switch straight back to where it lives.
-    g_app.mission.Hide(browsed < 0);
+    // Committing a desktop switch cannot wait for the windows to settle back:
+    // the shell animates the switch, and an overlay still on screen while the
+    // desktop slides underneath it looks like a fault. Everything else gets the
+    // collapse.
+    g_app.mission.Hide(browsed < 0, browsed >= 0);
     MACTAB_DIAG("mission: dismissed");
 
     if (browsed < 0) return;
@@ -610,6 +614,11 @@ void ActivateFromMission(int index) {
     // Hidden without putting focus back where it was, because it is about to go
     // somewhere else entirely. Restoring first would hand foreground to the old
     // window for a frame and show as a flash of the wrong app.
+    //
+    // The collapse runs while the window is being activated, so the tile lands
+    // on the real window at the moment the real window comes forward, which is
+    // the whole trick.
+    StopWatchingWindows();
     g_app.mission.Hide(false);
 
     if (target && ::IsWindow(target)) {

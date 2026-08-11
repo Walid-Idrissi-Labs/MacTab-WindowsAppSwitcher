@@ -114,10 +114,20 @@ public:
     // them without keeping a second list in step with this one.
     std::vector<HWND> Windows() const;
 
+    // Lower the windows back onto the desktop and leave.
+    //
     // `restoreFocus` puts foreground back where it was before the overlay took
     // it. Pass false when the caller is about to activate something itself, so
     // the old window does not flash up in between.
-    void Hide(bool restoreFocus = true);
+    //
+    // `immediate` skips the collapse. For the paths that cannot wait for it: a
+    // desktop switch runs its own animation underneath, and an overlay still on
+    // screen while the desktop slides under it looks like a fault.
+    void Hide(bool restoreFocus = true, bool immediate = false);
+
+    // Take it off the screen this instant, collapse or no collapse. For shutdown
+    // and for anything that must not leave a full-screen window up.
+    void HideNow();
     bool Visible() const;
 
     // The window behind item `index`, or null. Read before Hide(), which throws
