@@ -64,9 +64,14 @@ public:
     // than once.
     void Prewarm();
 
-    // wParam values for spaceMessage that are not a space index.
-    static constexpr WPARAM kSpaceAdd   = 0xFFFF;
-    static constexpr WPARAM kSpaceClose = 0xFFFE;
+    // wParam values for spaceMessage.
+    //
+    // A bare index means "look at this desktop". kSpaceAdd means the plus button.
+    // kSpaceCloseBase plus an index means the little cross on that desktop, which
+    // has to name which one rather than meaning "the current one": the whole
+    // point of the strip is that you are looking at a desktop you are not on.
+    static constexpr WPARAM kSpaceAdd       = 0xFFFF;
+    static constexpr WPARAM kSpaceCloseBase = 0x8000;
 
     // Build and reveal. Items may name windows on any display and any desktop;
     // each is arranged on the display that holds it, and only the windows of
@@ -83,6 +88,31 @@ public:
 
     // Which desktop is being looked at, or -1.
     int  BrowsedDesktop() const;
+
+    // Move the overlays onto `desktop` and put them back in front.
+    //
+    // For the two things that change the machine from inside: adding a desktop
+    // and closing one both move the view, and these windows keep whichever
+    // desktop they were assigned to, so without this the overlay is left cloaked
+    // somewhere nobody is looking.
+    void FollowDesktop(const GUID& desktop);
+
+    // Rebuild in place, for a change to the machine rather than to the view: a
+    // desktop added or closed, or a window that has gone away. Everything flies
+    // from where it currently is to where it now belongs, so the overlay reads
+    // as reacting rather than as being thrown away and made again.
+    //
+    // `desktop` is the one to show afterwards; pass BrowsedDesktop() to stay.
+    void Rebuild(std::vector<MissionItem> items, std::vector<MissionSpace> spaces,
+                 int desktop);
+
+    // Drop a window that no longer exists, and re-relax everything around it.
+    // False when the overlay was not showing that window anyway.
+    bool ForgetWindow(HWND hwnd);
+
+    // Every window the overlay is currently showing, so the caller can watch
+    // them without keeping a second list in step with this one.
+    std::vector<HWND> Windows() const;
 
     // `restoreFocus` puts foreground back where it was before the overlay took
     // it. Pass false when the caller is about to activate something itself, so

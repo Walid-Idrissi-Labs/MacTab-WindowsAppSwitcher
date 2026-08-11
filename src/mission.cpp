@@ -61,6 +61,17 @@ constexpr float kTitleGap     = 8.0f;
 constexpr float kTileRadius   = 8.0f;
 constexpr float kOutlineWidth = 3.0f;
 
+// The little cross that closes a desktop, as a fraction of a miniature's height,
+// and where its centre sits inside the miniature's top-left corner.
+//
+// Drawn on every desktop rather than only on the one under the pointer. macOS
+// reveals it on hover, but the bar here is baked as one surface and a hover
+// state would mean re-baking every miniature, every icon and every name each
+// time the pointer crossed one. At this size it is unobtrusive enough to leave
+// out, and a control you can see is a control people find.
+constexpr float kCloseSize   = 0.26f;
+constexpr float kCloseInset  = 0.16f;
+
 // How far outside the window the hover outline's texture reaches.
 //
 // Its own number, and small. Reusing the shadow's spread put the nine-grid's
@@ -348,6 +359,8 @@ struct Mission::Impl {
     int  HitTestTile(const Screen& screen, POINT client) const;
     int  PileSize(const Screen& screen, int group) const;
     int  HitTestChip(const Screen& screen, POINT client) const;
+    int  HitTestClose(const Screen& screen, POINT client) const;
+    static D2D1_POINT_2F CloseCentre(const mission::SpaceChip& chip);
     int  Neighbour(const Screen& screen, int from, int dx, int dy) const;
 
     ComPtr<ID2D1Bitmap1> IconFor(ID2D1DeviceContext* dc, const MissionItem& item);
@@ -355,7 +368,7 @@ struct Mission::Impl {
     void BeginDrag(Screen& screen, POINT client);
     void UpdateDrag(Screen& screen, POINT client);
     bool FinishDrag(Screen& screen, POINT client);   // true if it was a drag
-    void Rearrange();
+    void Rearrange(int desktop);
 };
 
 namespace {
@@ -460,6 +473,9 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     if (!screen) return ::DefWindowProcW(hwnd, msg, wParam, lParam);
 
     switch (msg) {
+    // wParam on dismissMessage says whether the user MEANT to leave. Escape and
+    // a click on the background are decisions and take you to the desktop you
+    // were looking at; losing focus is not, and must not move anybody.
     case WM_LBUTTONDOWN:
         impl->BeginDrag(*screen, POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
         return 0;
@@ -482,6 +498,13 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         // not a request to switch to it.
         if (impl->FinishDrag(*screen, point)) return 0;
 
+        const int closing = impl->HitTestClose(*screen, point);
+        if (closing >= 0) {
+            ::PostMessageW(impl->notifyWindow, impl->spaceMessage,
+                           Mission::kSpaceCloseBase + static_cast<WPARAM>(closing), 0);
+            return 0;
+        }
+
         const int chip = impl->HitTestChip(*screen, point);
         if (chip >= 0) {
             const mission::SpaceChip& c = screen->chips[static_cast<size_t>(chip)];
@@ -497,7 +520,7 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         // gesture feel like a place rather than a dialog.
         if (tile < 0) {
             if (screen->expandedGroup >= 0) impl->CollapsePile(*screen);
-            else ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
+            else ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 1, 0);
             return 0;
         }
 
@@ -527,7 +550,7 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CAPTURECHANGED:
         if (impl->drag.tile >= 0) {
             impl->drag = Mission::Impl::Drag{};
-            impl->Rearrange();
+            impl->Rearrange(impl->browsed);
         }
         return 0;
 
@@ -536,10 +559,26 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         const int  hovered  = screen->hovered;
         const bool expanded = screen->expandedGroup >= 0;
 
-        // Left and right walk the desktops when there is more than one, which
-        // is what the strip is for. With a single desktop there is nothing to
-        // walk, so they go back to moving between windows.
-        const bool arrowsBrowse = impl->spaces.size() > 1 && !expanded;
+        // Ctrl and the arrows walk the desktops, which is the binding macOS uses
+        // and the one Ctrl+Win+Left and Ctrl+Win+Right arrive here as. Bare
+        // arrows move between windows.
+        //
+        // Those two used to be the same key. An earlier round made bare arrows
+        // walk the desktops, which left no way to move between windows at all
+        // and meant the meaning of an arrow depended on how many desktops
+        // happened to exist. They are separate now, and the only overlap left is
+        // a screen with nothing on it, where moving between windows has nothing
+        // to move between.
+        const bool ctrl = (::GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool walkSpaces =
+            impl->spaces.size() > 1 && !expanded && (ctrl || screen->tiles.empty());
+
+        const auto step = [&](int delta) {
+            const int last = static_cast<int>(impl->spaces.size()) - 1;
+            const int next = (std::max)(0, (std::min)(last, impl->browsed + delta));
+            ::PostMessageW(impl->notifyWindow, impl->spaceMessage,
+                           static_cast<WPARAM>(next), 0);
+        };
 
         switch (wParam) {
         case VK_ESCAPE:
@@ -547,7 +586,7 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             // that skipped a level would throw away the thing the user was
             // half way through doing.
             if (expanded) impl->CollapsePile(*screen);
-            else          ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
+            else          ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 1, 0);
             return 0;
 
         case VK_RETURN:
@@ -558,21 +597,13 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case VK_LEFT:
-            if (arrowsBrowse)
-                ::PostMessageW(impl->notifyWindow, impl->spaceMessage,
-                               static_cast<WPARAM>((std::max)(0, impl->browsed - 1)), 0);
-            else
-                impl->SetHovered(*screen, impl->Neighbour(*screen, hovered, -1, 0));
+            if (walkSpaces) step(-1);
+            else impl->SetHovered(*screen, impl->Neighbour(*screen, hovered, -1, 0));
             return 0;
 
         case VK_RIGHT:
-            if (arrowsBrowse)
-                ::PostMessageW(impl->notifyWindow, impl->spaceMessage,
-                               static_cast<WPARAM>((std::min)(
-                                   static_cast<int>(impl->spaces.size()) - 1,
-                                   impl->browsed + 1)), 0);
-            else
-                impl->SetHovered(*screen, impl->Neighbour(*screen, hovered, 1, 0));
+            if (walkSpaces) step(1);
+            else impl->SetHovered(*screen, impl->Neighbour(*screen, hovered, 1, 0));
             return 0;
 
         case VK_UP:
@@ -590,9 +621,11 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case VK_TAB:
-            if (!screen->tiles.empty())
-                impl->SetHovered(*screen,
-                                 (hovered + 1) % static_cast<int>(screen->tiles.size()));
+            if (!screen->tiles.empty()) {
+                const int count = static_cast<int>(screen->tiles.size());
+                const int delta = ((::GetKeyState(VK_SHIFT) & 0x8000) != 0) ? -1 : 1;
+                impl->SetHovered(*screen, ((hovered + delta) % count + count) % count);
+            }
             return 0;
 
         default:
@@ -1480,6 +1513,31 @@ void Mission::Impl::BakeBar(Screen& screen) {
                                : D2D1::ColorF(theme.chipBorder.r, theme.chipBorder.g,
                                               theme.chipBorder.b, theme.chipBorder.a * 0.3f));
 
+        // The cross that closes it. Never on the last desktop: the shell ignores
+        // the request, and a control that does nothing is worse than no control.
+        if (spaces.size() > 1) {
+            const D2D1_POINT_2F centre = CloseCentre(chip);
+            const float r = chip.h * kCloseSize * 0.5f;
+
+            ComPtr<ID2D1SolidColorBrush> disc;
+            if (SUCCEEDED(dc->CreateSolidColorBrush(
+                    D2D1::ColorF(0.06f, 0.06f, 0.08f, 0.72f), disc.Put())))
+                dc->FillEllipse(D2D1::Ellipse(centre, r, r), disc.Get());
+
+            ComPtr<ID2D1SolidColorBrush> mark;
+            if (SUCCEEDED(dc->CreateSolidColorBrush(
+                    D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.92f), mark.Put()))) {
+                const float arm    = r * 0.44f;
+                const float stroke = (std::max)(1.0f, screen.Scaled(1.4f));
+                dc->DrawLine(D2D1::Point2F(centre.x - arm, centre.y - arm),
+                             D2D1::Point2F(centre.x + arm, centre.y + arm),
+                             mark.Get(), stroke);
+                dc->DrawLine(D2D1::Point2F(centre.x + arm, centre.y - arm),
+                             D2D1::Point2F(centre.x - arm, centre.y + arm),
+                             mark.Get(), stroke);
+            }
+        }
+
         // The name goes under the miniature, not on it: a name printed over a
         // photograph is unreadable on some fraction of all wallpapers, and no
         // colour fixes that.
@@ -1939,6 +1997,37 @@ int Mission::Impl::PileSize(const Screen& screen, int group) const {
     return n;
 }
 
+// Where the close cross sits on a desktop miniature, in bar coordinates.
+D2D1_POINT_2F Mission::Impl::CloseCentre(const mission::SpaceChip& chip) {
+    return D2D1::Point2F(chip.x + chip.h * kCloseInset,
+                         chip.y + chip.h * kCloseInset);
+}
+
+// Which desktop's close cross the point is on, or -1.
+//
+// Checked before the miniature itself, because the cross is inside it: without
+// this the click would simply be a click on the desktop and the cross would do
+// nothing at all.
+int Mission::Impl::HitTestClose(const Screen& screen, POINT client) const {
+    if (spaces.size() < 2) return -1;
+
+    for (size_t i = 0; i < screen.chips.size(); ++i) {
+        const mission::SpaceChip& c = screen.chips[i];
+        if (c.add) continue;
+
+        const D2D1_POINT_2F centre = CloseCentre(c);
+        const float radius = c.h * kCloseSize * 0.5f;
+        const float dx = client.x - centre.x;
+        const float dy = client.y - centre.y;
+
+        // A little larger than it is drawn. It is a small target and a miss by
+        // two pixels reads as the control not working rather than as a miss.
+        const float reach = radius + c.h * 0.06f;
+        if (dx * dx + dy * dy <= reach * reach) return c.index;
+    }
+    return -1;
+}
+
 int Mission::Impl::HitTestChip(const Screen& screen, POINT client) const {
     for (size_t i = 0; i < screen.chips.size(); ++i) {
         const mission::SpaceChip& c = screen.chips[i];
@@ -1956,7 +2045,19 @@ int Mission::Impl::HitTestChip(const Screen& screen, POINT client) const {
 // screen in a way that looks random.
 int Mission::Impl::Neighbour(const Screen& screen, int from, int dx, int dy) const {
     if (screen.tiles.empty()) return -1;
-    if (from < 0 || from >= static_cast<int>(screen.tiles.size())) return 0;
+
+    // The first arrow press starts on the most recently used window rather than
+    // on whichever tile happened to be built first. Nothing is highlighted when
+    // the overlay opens, which is what macOS does, so this is where a keyboard
+    // user comes in and it should be somewhere they recognise.
+    if (from < 0 || from >= static_cast<int>(screen.tiles.size())) {
+        int best = 0;
+        for (size_t i = 1; i < screen.tiles.size(); ++i)
+            if (screen.tiles[i].item >= 0 &&
+                screen.tiles[i].item < screen.tiles[static_cast<size_t>(best)].item)
+                best = static_cast<int>(i);
+        return best;
+    }
 
     const RECT& origin = screen.tiles[static_cast<size_t>(from)].liveRect;
     const float ox = static_cast<float>(origin.left + origin.right) * 0.5f;
@@ -2299,7 +2400,7 @@ bool Mission::Impl::FinishDrag(Screen& screen, POINT client) {
             MACTAB_WARN("mission: Windows does not allow moving another "
                         "application's window between desktops");
         }
-        Rearrange();
+        Rearrange(browsed);
         return true;
     }
 
@@ -2358,26 +2459,32 @@ bool Mission::Impl::FinishDrag(Screen& screen, POINT client) {
         }
     }
 
-    Rearrange();
+    Rearrange(browsed);
     return true;
 }
 
-// Lay everything out again where it now is, and let it travel there from where
-// it currently sits rather than from the desktop.
-void Mission::Impl::Rearrange() {
-    std::map<int, RECT> current;
+// Lay everything out again and fly it from wherever it currently is.
+//
+// Keyed by window handle rather than by index into `items`, which matters as
+// soon as anything can remove an item: a closed window shifts every index after
+// it, and every window past the gap would then fly in from the position of its
+// neighbour.
+void Mission::Impl::Rearrange(int desktop) {
+    std::map<HWND, RECT> current;
     for (const Screen& other : screens)
         for (const Tile& tile : other.tiles)
-            current.emplace(tile.item, tile.liveRect);
+            if (tile.item >= 0 && tile.item < static_cast<int>(items.size()))
+                current.emplace(items[static_cast<size_t>(tile.item)].hwnd, tile.liveRect);
 
-    BuildForDesktop(browsed, 0);
+    BuildForDesktop(desktop, 0);
 
     for (Screen& other : screens) {
         for (Tile& tile : other.tiles) {
             tile.holder.Opacity(1.0f);
             if (tile.chrome) tile.chrome.Opacity(1.0f);
 
-            const auto was = current.find(tile.item);
+            if (tile.item < 0 || tile.item >= static_cast<int>(items.size())) continue;
+            const auto was = current.find(items[static_cast<size_t>(tile.item)].hwnd);
             if (was != current.end()) tile.sourceRect = was->second;
         }
         StartReveal(compositor, other,
@@ -2500,6 +2607,82 @@ void Mission::BrowseDesktop(int index) {
 
         MACTAB_DIAG("mission: browsing desktop %d", index);
     });
+}
+
+void Mission::FollowDesktop(const GUID& desktop) {
+    Impl& impl = *m_impl;
+    if (!impl.visible) return;
+
+    // Creating or closing a desktop moves the VIEW, and these windows belong to
+    // whichever desktop they were last assigned to, so without this the overlay
+    // is left cloaked on a desktop nobody is looking at while the machine sits
+    // on the new one with nothing on screen.
+    for (Impl::Screen& screen : impl.screens) {
+        desktops::MoveWindowTo(screen.hwnd, desktop);
+        ::SetWindowPos(screen.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    if (!impl.screens.empty()) {
+        ::SetForegroundWindow(impl.screens.front().hwnd);
+        ::SetFocus(impl.screens.front().hwnd);
+    }
+}
+
+void Mission::Rebuild(std::vector<MissionItem> items, std::vector<MissionSpace> spaces,
+                      int desktop) {
+    Impl& impl = *m_impl;
+    if (!impl.visible) return;
+
+    GuardMission(impl, "Rebuild", [&] {
+        impl.items  = std::move(items);
+        impl.spaces = std::move(spaces);
+
+        // The uploads are keyed by application and the applications may have
+        // changed underneath us. Cheap to redo; wrong to keep.
+        impl.iconBitmaps.clear();
+
+        // A dragged tile no longer refers to anything.
+        impl.drag = Impl::Drag{};
+
+        const int last   = static_cast<int>(impl.spaces.size()) - 1;
+        const int target = (last < 0) ? 0 : (std::max)(0, (std::min)(last, desktop));
+
+        impl.Rearrange(target);
+    });
+}
+
+bool Mission::ForgetWindow(HWND hwnd) {
+    Impl& impl = *m_impl;
+    if (!impl.visible || !hwnd) return false;
+
+    const auto gone = std::find_if(impl.items.begin(), impl.items.end(),
+                                   [hwnd](const MissionItem& item) {
+                                       return item.hwnd == hwnd;
+                                   });
+    if (gone == impl.items.end()) return false;
+
+    // If it was the one under the pointer, the drag has nothing left to hold.
+    if (impl.drag.tile >= 0) {
+        ::ReleaseCapture();
+        impl.drag = Impl::Drag{};
+    }
+
+    impl.items.erase(gone);
+
+    // Rebuilt rather than deleted from the tree. The arrangement is a
+    // position-preserving relaxation, so taking one window out legitimately
+    // moves every other one, and the windows gliding into the space left behind
+    // is both the correct result and the one that reads as something happening.
+    GuardMission(impl, "ForgetWindow", [&] { impl.Rearrange(impl.browsed); });
+    return true;
+}
+
+std::vector<HWND> Mission::Windows() const {
+    std::vector<HWND> handles;
+    handles.reserve(m_impl->items.size());
+    for (const MissionItem& item : m_impl->items) handles.push_back(item.hwnd);
+    return handles;
 }
 
 void Mission::Hide(bool restoreFocus) {

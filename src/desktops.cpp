@@ -41,6 +41,24 @@ bool ReadBinary(const std::wstring& key, const wchar_t* value,
                           nullptr, out.data(), &size) == ERROR_SUCCESS;
 }
 
+// The desktop being viewed, from the registry alone.
+//
+// Deliberately without Query's fallback to our own window's desktop. That
+// fallback answers "which desktop is this WINDOW on", which is the right answer
+// at rest and the wrong one entirely while waiting for a switch: a window does
+// not move when the view does, so a wait built on it would return instantly and
+// always.
+bool CurrentFromRegistry(GUID& out) {
+    std::vector<BYTE> raw;
+    if ((!ReadBinary(kRoot, L"CurrentVirtualDesktop", raw) &&
+         !ReadBinary(SessionKeyPath(), L"CurrentVirtualDesktop", raw)) ||
+        raw.size() < sizeof(GUID))
+        return false;
+
+    std::memcpy(&out, raw.data(), sizeof(GUID));
+    return true;
+}
+
 std::wstring GuidToBraces(const GUID& id) {
     wchar_t text[64] = L"";
     ::StringFromGUID2(id, text, ARRAYSIZE(text));
@@ -235,6 +253,51 @@ bool SwitchTo(const State& state, int targetIndex) {
         if (!SendChord(key)) return false;
 
     return true;
+}
+
+bool WaitForCurrent(const GUID& target, DWORD timeoutMs) {
+    const DWORD deadline = ::GetTickCount() + timeoutMs;
+
+    for (;;) {
+        GUID current{};
+        if (CurrentFromRegistry(current) && ::IsEqualGUID(current, target))
+            return true;
+
+        if (::GetTickCount() >= deadline) return false;
+        ::Sleep(10);
+    }
+}
+
+bool CloseAt(HWND ownWindow, int index) {
+    const State state = Query(ownWindow);
+    if (!state.known || index < 0 || index >= static_cast<int>(state.all.size()))
+        return false;
+
+    // The shell ignores the chord on the last desktop, and offering it looks
+    // broken. Callers hide the affordance; this is the backstop.
+    if (state.all.size() <= 1) return false;
+
+    if (index != state.current) {
+        // Ctrl+Win+F4 closes the desktop being VIEWED and only that one, so the
+        // view has to go there first.
+        //
+        // And it has to actually arrive before the close is sent. The chords go
+        // through one input queue in order, so back to back they usually work,
+        // but "usually" is not a standard to hold destructive things to: a
+        // dropped chord, an elevated window holding the foreground, or the shell
+        // running late would put the close on the wrong desktop. So the switch
+        // is confirmed against the shell's own record of where the view is, and
+        // if that never says what it should, nothing is closed at all.
+        if (!SwitchTo(state, index)) return false;
+
+        if (!WaitForCurrent(state.all[static_cast<size_t>(index)].id, 600)) {
+            MACTAB_WARN("desktops: the view never reached %d, so nothing was closed",
+                        index);
+            return false;
+        }
+    }
+
+    return CloseCurrent();
 }
 
 bool Create() {

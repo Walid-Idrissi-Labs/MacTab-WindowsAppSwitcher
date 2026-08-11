@@ -83,6 +83,21 @@ bool SwitchTo(const State& state, int targetIndex);
 // rather than failed. False here means "not allowed", not "went wrong".
 bool MoveWindowTo(HWND hwnd, const GUID& desktop);
 
+// Block until the shell reports `target` as the desktop being viewed, or give up.
+//
+// The one observable a switch has. Reading it costs two registry values, and
+// this is only ever called with an overlay already off screen, so a short stall
+// on the UI thread is cheaper than the machinery to avoid one.
+bool WaitForCurrent(const GUID& target, DWORD timeoutMs = 600);
+
+// Close the desktop at `index`, whichever one is being viewed.
+//
+// Public API can only close the current desktop, so this goes there first and
+// confirms it arrived before sending the close. False means nothing was closed,
+// which is the only safe way to fail: closing the WRONG desktop because a chord
+// went missing is not recoverable.
+bool CloseAt(HWND ownWindow, int index);
+
 // Ctrl+Win+D. The new desktop is created after the current one and becomes
 // current, which is what Windows does and what the strip has to assume.
 bool Create();

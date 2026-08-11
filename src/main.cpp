@@ -37,6 +37,10 @@ constexpr UINT WM_MACTAB_CLICK = WM_APP + 4;
 constexpr UINT WM_MACTAB_MC_ACTIVATE = WM_APP + 5;
 constexpr UINT WM_MACTAB_MC_DISMISS  = WM_APP + 6;
 constexpr UINT WM_MACTAB_MC_SPACE    = WM_APP + 7;
+constexpr UINT WM_MACTAB_MC_GONE     = WM_APP + 8;   // wParam: the dead HWND
+
+// Ticks only while Mission Control is on screen.
+constexpr UINT_PTR kMissionWatchTimer = 1;
 
 UINT g_msgRequestQuit    = 0;   // RegisterWindowMessage(kQuitMessageName)
 UINT g_msgTaskbarCreated = 0;   // RegisterWindowMessage(L"TaskbarCreated")
@@ -81,14 +85,43 @@ bool HasFlag(const wchar_t* cmdLine, const wchar_t* flag) {
 void PopulatePanel();
 void RefreshIcons();
 
-void CloseMission();
+// Which chord the settings ask for. Anything unrecognised means Win+Tab, which
+// is the shipped default and the one an unreadable ini should fall back to.
+hotkey::Gesture MissionGesture() {
+    if (!config::Current().missionEnabled) return hotkey::Gesture::None;
+
+    const std::wstring& choice = config::Current().missionGesture;
+    if (choice == L"winup") return hotkey::Gesture::WinUp;
+    if (choice == L"both")  return hotkey::Gesture::Both;
+    if (choice == L"none")  return hotkey::Gesture::None;
+    return hotkey::Gesture::WinTab;
+}
+
+// How to describe it in the tray balloon.
+const wchar_t* MissionGestureName() {
+    switch (MissionGesture()) {
+    case hotkey::Gesture::WinUp: return L"Win+Up";
+    case hotkey::Gesture::Both:  return L"Win+Tab and Win+Up";
+    case hotkey::Gesture::None:  return L"the tray menu";
+    default:                     return L"Win+Tab";
+    }
+}
+
+void CloseMission(bool commitDesktop = false);
+void StartWatchingWindows();
+void StopWatchingWindows();
 
 void BeginGesture(bool reverse) {
     Gesture& g = g_app.gesture;
 
     // Both own the keyboard and only one of them can have it. Alt+Tab wins,
     // because it is the gesture that is about to take you somewhere.
-    CloseMission();
+    //
+    // Without committing whatever desktop was being looked at: the switcher is
+    // about to decide where the user lands, and activating a window on another
+    // desktop takes them there anyway. Two answers to the same question, one of
+    // them arriving first, is how you get a switch that fights itself.
+    CloseMission(false);
 
     g.apps       = BuildSwitcherList();
     g.active     = true;
@@ -432,40 +465,70 @@ bool EnsureMission() {
     return true;
 }
 
-void CloseMission() {
-    if (g_app.mission.Visible()) {
-        g_app.mission.Hide();
-        hotkey::SetMissionOpen(false);
-        MACTAB_DIAG("mission: dismissed");
+// Take Mission Control down.
+//
+// `commitDesktop` is what separates the two ways it can close. Deliberately
+// chosen by the caller rather than decided in here, because the difference is
+// entirely about WHY it is closing and only the caller knows that.
+//
+// Walking the strip inside Mission Control only ever changes what you are
+// LOOKING at; the overlay belongs to the desktop it was built on and switching
+// underneath it would strand it. So the switch is made real on the way out, and
+// only when the user meant to leave: Escape, the toggle, a click on the
+// background. Losing focus, a display appearing, a session lock or Alt+Tab
+// taking over are not decisions, and must not move anybody's desktop.
+void CloseMission(bool commitDesktop) {
+    if (!g_app.mission.Visible()) return;
+
+    const int browsed = commitDesktop ? g_app.mission.BrowsedDesktop() : -1;
+
+    StopWatchingWindows();
+    hotkey::SetMissionOpen(false);
+
+    // Never with focus restored on this path. Putting foreground back on a
+    // window belonging to the desktop being left is both a flash of the wrong
+    // application and, since Windows shows a window it is asked to activate, a
+    // switch straight back to where it lives.
+    g_app.mission.Hide(browsed < 0);
+    MACTAB_DIAG("mission: dismissed");
+
+    if (browsed < 0) return;
+
+    // Re-read rather than trusting what was true when the overlay opened.
+    // SwitchTo counts steps from wherever the view is NOW, and something else
+    // may have moved it while Mission Control was up.
+    const desktops::State state = desktops::Query(g_app.host);
+    if (state.known && state.current >= 0 && state.current != browsed) {
+        MACTAB_DIAG("mission: committing the desktop being looked at (%d)", browsed);
+        desktops::SwitchTo(state, browsed);
     }
 }
 
-void OpenMission() {
-    if (!config::Current().missionEnabled) return;
-    if (!EnsureMission()) return;
+// Everything the overlay is shown with, gathered in one place because three
+// paths need it now: opening, adding or closing a desktop, and a window going
+// away while it is up.
+struct MissionPayload {
+    std::vector<MissionItem>  items;
+    std::vector<MissionSpace> spaces;
+    int                       current = 0;
+    bool                      known   = false;
+};
 
-    // A toggle, like the key it replaces and like the gesture it copies.
-    if (g_app.mission.Visible()) {
-        CloseMission();
-        return;
-    }
-
-    // Never over a switch in flight. Both own the keyboard and only one of them
-    // can have it.
-    if (g_app.gesture.active) return;
+MissionPayload BuildMissionPayload() {
+    MissionPayload payload;
 
     // Every desktop's windows, not just this one's, so the strip can be walked
     // from inside without leaving.
     const desktops::State state = desktops::Query(g_app.host);
+    payload.known   = state.known;
+    payload.current = (std::max)(0, state.current);
 
-    std::vector<MissionSpace> spaces;
     if (state.known) {
         for (size_t i = 0; i < state.all.size(); ++i)
-            spaces.push_back(MissionSpace{ state.all[i].name, state.all[i].id,
-                                           static_cast<int>(i) == state.current });
+            payload.spaces.push_back(MissionSpace{ state.all[i].name, state.all[i].id,
+                                                   static_cast<int>(i) == state.current });
     }
 
-    std::vector<MissionItem> items;
     int group = 0;
 
     for (const SwitcherApp& app : BuildWindowList(state.known && state.all.size() > 1)) {
@@ -492,28 +555,50 @@ void OpenMission() {
             item.icon    = icon;
             item.bounds  = window.bounds;
             item.group   = group;
-            item.order   = static_cast<int>(items.size());
+            item.order   = static_cast<int>(payload.items.size());
 
             // -1 stays -1 for a pinned window, whose desktop id is a sentinel
             // that is in no list, and that is exactly right: it shows on every
             // desktop because it is on every desktop.
             item.desktop = state.known ? desktops::IndexOf(state, window.desktop) : -1;
 
-            items.push_back(std::move(item));
+            payload.items.push_back(std::move(item));
         }
         ++group;
     }
 
-    MACTAB_DIAG("mission: opening with %zu window(s) and %zu space(s)",
-                items.size(), spaces.size());
+    return payload;
+}
 
-    g_app.mission.Show(std::move(items), std::move(spaces),
-                       (std::max)(0, state.current));
+void OpenMission() {
+    if (!config::Current().missionEnabled) return;
+    if (!EnsureMission()) return;
+
+    // A toggle, like the key it replaces and like the gesture it copies. Closing
+    // it this way is a decision, so it takes you to the desktop you were looking
+    // at.
+    if (g_app.mission.Visible()) {
+        CloseMission(true);
+        return;
+    }
+
+    // Never over a switch in flight. Both own the keyboard and only one of them
+    // can have it.
+    if (g_app.gesture.active) return;
+
+    MissionPayload payload = BuildMissionPayload();
+
+    MACTAB_DIAG("mission: opening with %zu window(s) and %zu space(s)",
+                payload.items.size(), payload.spaces.size());
+
+    const int current = payload.current;
+    g_app.mission.Show(std::move(payload.items), std::move(payload.spaces), current);
 
     // The hook stops passing Ctrl+Win+Left and Ctrl+Win+Right through while the
-    // overlay is up: they would switch the desktop out from under a window that
-    // belongs to the old one.
+    // overlay is up, and posts them back to be aimed at the strip instead.
     hotkey::SetMissionOpen(g_app.mission.Visible());
+
+    if (g_app.mission.Visible()) StartWatchingWindows();
 }
 
 void ActivateFromMission(int index) {
@@ -533,25 +618,212 @@ void ActivateFromMission(int index) {
     }
 }
 
-void HandleMissionSpace(WPARAM which) {
-    if (which == Mission::kSpaceAdd || which == Mission::kSpaceClose) {
-        // Adding or removing a desktop is a change to the machine, not a change
-        // of view, so the overlay comes down first: the switch may animate, and
-        // an overlay still on screen while the desktop slides underneath it
-        // looks like a bug.
-        CloseMission();
-        if (which == Mission::kSpaceAdd) desktops::Create();
-        else                             desktops::CloseCurrent();
+// Wait for the shell to finish adding or removing a desktop.
+//
+// Both go through injected keystrokes, so there is no return value to wait on
+// and no notification when they land: the only observable is the shell's own
+// list of desktops changing length. Bounded, and a timeout means the rest of the
+// work is skipped rather than done on a stale picture.
+bool WaitForDesktopCount(size_t before, DWORD timeoutMs = 800) {
+    const DWORD deadline = ::GetTickCount() + timeoutMs;
+    for (;;) {
+        const desktops::State state = desktops::Query(g_app.host);
+        if (state.known && state.all.size() != before) return true;
+        if (::GetTickCount() >= deadline) return false;
+        ::Sleep(10);
+    }
+}
+
+// Adding or closing a desktop, without leaving Mission Control.
+//
+// Both chords move the view, and these overlays belong to whichever desktop they
+// were last assigned to, so the sequence is: make the change, wait for the shell
+// to admit it happened, bring the overlays across to wherever the view ended up,
+// and rebuild in place. macOS stays open through both, and closing and reopening
+// would throw away the thing the user was in the middle of.
+void ChangeSpaces(bool add, int index) {
+    const desktops::State before = desktops::Query(g_app.host);
+    if (!before.known) return;
+
+    const size_t was = before.all.size();
+
+    if (add) {
+        if (!desktops::Create()) return;
+    } else if (!desktops::CloseAt(g_app.host, index)) {
+        // CloseAt refuses rather than guessing when it cannot confirm the view
+        // reached the desktop being closed. Nothing happened, so nothing here
+        // has to be undone.
         return;
     }
 
-    // Clicking a desktop LOOKS at it. It does not go there.
+    if (!WaitForDesktopCount(was)) {
+        MACTAB_WARN("mission: the desktop list never changed; leaving the strip alone");
+        return;
+    }
+
+    MissionPayload payload = BuildMissionPayload();
+    if (!payload.known || payload.spaces.empty()) return;
+
+    g_app.mission.FollowDesktop(
+        payload.spaces[static_cast<size_t>(payload.current)].id);
+
+    const int current = payload.current;
+    g_app.mission.Rebuild(std::move(payload.items), std::move(payload.spaces), current);
+    StartWatchingWindows();
+}
+
+void HandleMissionSpace(WPARAM which) {
+    if (which == Mission::kSpaceAdd) {
+        ChangeSpaces(true, 0);
+        return;
+    }
+
+    if (which >= Mission::kSpaceCloseBase) {
+        ChangeSpaces(false, static_cast<int>(which - Mission::kSpaceCloseBase));
+        return;
+    }
+
+    // Clicking a desktop LOOKS at it. It does not go there, yet.
     //
     // The windows on another desktop are shell-cloaked but they are still
     // enumerable and still have geometry, so the arrangement can be built for
-    // any of them without leaving. Going there for real happens when one of
+    // any of them without leaving, and the strip stays put while you look
+    // around. Going there for real happens on the way out, or the moment one of
     // those windows is activated, which Windows does as part of the activation.
     g_app.mission.BrowseDesktop(static_cast<int>(which));
+}
+
+// --- Keeping the overlay honest while it is up -------------------------------
+//
+// Mission Control is a picture of the machine, and the machine does not stop
+// while it is being looked at. A window closed from its own taskbar preview, an
+// application quitting, a desktop created by another tool: any of those leaves
+// the overlay showing something that is not there any more.
+//
+// Both watchers exist only while it is open. The budget for this process while
+// nothing is happening is zero, and a hook that runs all day so that a window
+// which is open for two seconds can be correct is not a trade worth making.
+
+HWINEVENTHOOK    g_missionMinimize = nullptr;
+HWINEVENTHOOK    g_missionDestroy  = nullptr;
+std::vector<HWND> g_missionWindows;      // sorted, for the hook's lookup
+size_t           g_missionDesktopCount = 0;
+int              g_missionDesktopIndex = -1;
+
+// Deliberately narrow.
+//
+// EVENT_OBJECT_DESTROY fires for every menu, tooltip and popup in the session,
+// which is why foreground_history.cpp will not hook it at all. Here it is
+// filtered to real top-level windows and then to the handful the overlay is
+// actually showing, so nearly every one is two comparisons and a binary search.
+void CALLBACK MissionWatchProc(HWINEVENTHOOK, DWORD, HWND hwnd, LONG objectId,
+                               LONG childId, DWORD, DWORD) {
+    if (!hwnd || objectId != OBJID_WINDOW || childId != CHILDID_SELF) return;
+    if (!std::binary_search(g_missionWindows.begin(), g_missionWindows.end(), hwnd))
+        return;
+
+    ::PostMessageW(g_app.host, WM_MACTAB_MC_GONE, reinterpret_cast<WPARAM>(hwnd), 0);
+}
+
+void StopWatchingWindows() {
+    if (g_missionMinimize) {
+        ::UnhookWinEvent(g_missionMinimize);
+        g_missionMinimize = nullptr;
+    }
+    if (g_missionDestroy) {
+        ::UnhookWinEvent(g_missionDestroy);
+        g_missionDestroy = nullptr;
+    }
+    g_missionWindows.clear();
+    ::KillTimer(g_app.host, kMissionWatchTimer);
+}
+
+void StartWatchingWindows() {
+    g_missionWindows = g_app.mission.Windows();
+    std::sort(g_missionWindows.begin(), g_missionWindows.end());
+
+    const desktops::State state = desktops::Query(g_app.host);
+    g_missionDesktopCount = state.all.size();
+    g_missionDesktopIndex = state.current;
+
+    // Two registrations, because SetWinEventHook takes one contiguous range and
+    // these two events are nowhere near each other.
+    //
+    // Minimising counts as going away: minimized windows are not in the
+    // arrangement, here or on macOS, because there is no size to give something
+    // that does not currently have one.
+    if (!g_missionMinimize)
+        g_missionMinimize = ::SetWinEventHook(
+            EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART,
+            nullptr, MissionWatchProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    if (!g_missionDestroy)
+        g_missionDestroy = ::SetWinEventHook(
+            EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY,
+            nullptr, MissionWatchProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    // Desktops have no notification of any kind, public or otherwise, so the
+    // only way to notice one appearing is to look. Twice a second, two registry
+    // reads each time, and only while the overlay is on screen.
+    ::SetTimer(g_app.host, kMissionWatchTimer, 500, nullptr);
+}
+
+// A window the overlay was showing has gone.
+void ForgetMissionWindow(HWND hwnd) {
+    if (!g_app.mission.Visible()) return;
+    if (!g_app.mission.ForgetWindow(hwnd)) return;
+
+    MACTAB_DIAG("mission: %p went away", static_cast<void*>(hwnd));
+
+    g_missionWindows = g_app.mission.Windows();
+    std::sort(g_missionWindows.begin(), g_missionWindows.end());
+}
+
+// Somebody else changed the desktops while we were looking at them.
+void SyncMissionDesktops() {
+    if (!g_app.mission.Visible()) return;
+
+    const desktops::State state = desktops::Query(g_app.host);
+    if (!state.known) return;
+    if (state.all.size() == g_missionDesktopCount && state.current == g_missionDesktopIndex)
+        return;
+
+    MACTAB_DIAG("mission: the desktops changed underneath us (%zu -> %zu, current %d -> %d)",
+                g_missionDesktopCount, state.all.size(),
+                g_missionDesktopIndex, state.current);
+
+    const bool moved = state.current != g_missionDesktopIndex;
+
+    MissionPayload payload = BuildMissionPayload();
+    if (!payload.known || payload.spaces.empty()) return;
+
+    // Follow the view rather than closing. The overlay would otherwise be left
+    // cloaked on a desktop nobody is on, which looks exactly like it crashed.
+    if (moved)
+        g_app.mission.FollowDesktop(
+            payload.spaces[static_cast<size_t>(payload.current)].id);
+
+    const int last    = static_cast<int>(payload.spaces.size()) - 1;
+    const int browsed = g_app.mission.BrowsedDesktop();
+    const int target  = moved ? payload.current
+                              : (std::max)(0, (std::min)(last, browsed));
+
+    g_app.mission.Rebuild(std::move(payload.items), std::move(payload.spaces), target);
+    StartWatchingWindows();
+}
+
+// Step the strip by one, for Ctrl+Win+Left and Ctrl+Win+Right.
+//
+// Those never reach the overlay: the hook has to swallow them or the shell
+// switches the desktop out from under an overlay that belongs to the old one, so
+// it posts them here instead.
+void StepMissionSpace(int delta) {
+    if (!g_app.mission.Visible()) return;
+    const int browsed = g_app.mission.BrowsedDesktop();
+    if (browsed < 0) return;
+    g_app.mission.BrowseDesktop(browsed + delta);
 }
 
 // --- Tray ------------------------------------------------------------------
@@ -723,7 +995,21 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_MACTAB_MC_DISMISS:
-        CloseMission();
+        // wParam is 1 when the user meant to leave, which is what decides
+        // whether the desktop they were looking at becomes the one they are on.
+        CloseMission(wParam != 0);
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == kMissionWatchTimer) SyncMissionDesktops();
+        return 0;
+
+    case WM_MACTAB_MC_GONE:
+        ForgetMissionWindow(reinterpret_cast<HWND>(wParam));
+        return 0;
+
+    case hotkey::WM_MACTAB_MISSION_STEP:
+        StepMissionSpace(static_cast<int>(static_cast<INT_PTR>(wParam)));
         return 0;
 
     case WM_MACTAB_MC_SPACE:
@@ -814,13 +1100,16 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const bool ready = enabled ? EnsureMission() : true;
             if (enabled && !ready) config::SetMissionEnabled(false);
 
-            hotkey::SetMissionOnWinTab(enabled && ready);
+            hotkey::SetMissionGesture((enabled && ready) ? MissionGesture()
+                                                        : hotkey::Gesture::None);
             if (!enabled) CloseMission();
 
-            g_app.tray.ShowBalloon(L"MacTab",
-                                   (enabled && ready)
-                                       ? L"Win+Tab now opens Mission Control."
-                                       : L"Win+Tab left to Windows.");
+            std::wstring message = L"Win+Tab left to Windows.";
+            if (enabled && ready) {
+                message = MissionGestureName();
+                message += L" now opens Mission Control.";
+            }
+            g_app.tray.ShowBalloon(L"MacTab", message.c_str());
             return 0;
         }
 
@@ -1125,7 +1414,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
     hotkey::Options hotkeyOptions{};
     hotkeyOptions.revealDelayMs = config::Current().revealDelayMs;
     hotkeyOptions.leftAltOnly   = config::Current().leftAltOnly;
-    hotkeyOptions.missionOnWinTab = config::Current().missionEnabled;
+    hotkeyOptions.missionGesture = MissionGesture();
     if (!hotkey::Start(g_app.host, hotkeyOptions)) {
         ::MessageBoxW(nullptr,
                       L"MacTab could not install its keyboard hook, so Alt+Tab cannot "

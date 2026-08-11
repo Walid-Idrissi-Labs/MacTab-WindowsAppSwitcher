@@ -84,6 +84,32 @@ enum : UINT {
     // Win+Tab: open Mission Control. Nothing else follows; unlike the switcher
     // this is a toggle, not a hold, so the hook is done the moment it posts.
     WM_MACTAB_MISSION = WM_APP + 16,
+
+    // Ctrl+Win+Left or Ctrl+Win+Right, pressed while Mission Control is open.
+    // wParam: +1 for the next desktop, -1 for the previous one.
+    //
+    // The hook has to post this rather than let the key reach the overlay,
+    // because it swallowed it: the shell's own desktop switch cannot be allowed
+    // to run under an overlay that belongs to the desktop being left.
+    WM_MACTAB_MISSION_STEP = WM_APP + 17,
+};
+
+// Which key opens Mission Control.
+//
+// Win+Tab by default, and that is a deliberate departure from the specification
+// this was built to, which asks for Win+Up.
+//
+// Win+Up is Aero Snap's maximise. Taking it costs the user a shortcut they use
+// for something else entirely, and the same specification says not to hijack
+// unrelated Windows shortcuts. Win+Tab is the shell's own Task View key, which is
+// to say the analogous feature: replacing it is replacing like with like. Anyone
+// who would rather have Win+Up can set MissionGesture in settings.ini and knows
+// what they are giving up.
+enum class Gesture {
+    None,
+    WinTab,
+    WinUp,
+    Both,
 };
 
 struct Options {
@@ -98,9 +124,9 @@ struct Options {
     // typing fires the switcher.
     bool leftAltOnly = true;
 
-    // Intercept Win+Tab for Mission Control. Off leaves Windows' Task View
-    // exactly as it was.
-    bool missionOnWinTab = true;
+    // Which chord opens Mission Control. None leaves Windows' Task View and
+    // Aero Snap exactly as they were.
+    Gesture missionGesture = Gesture::WinTab;
 };
 
 // Spawns the hook thread and installs the hook. Blocks until the hook is
@@ -120,21 +146,22 @@ bool Reload();
 
 bool IsRunning();
 
-// Start or stop intercepting Win+Tab without restarting the hook.
+// Change the Mission Control chord without restarting the hook.
 //
 // Written from the UI thread and read inside the hook callback on its own
-// thread. A plain bool, because it is a feature switch rather than state: a torn
+// thread. A plain enum, because it is a feature switch rather than state: a torn
 // read is not possible and the worst a stale one can do is let one keystroke
 // through to Task View, which is exactly what turning it off asks for anyway.
-void SetMissionOnWinTab(bool enabled);
+void SetMissionGesture(Gesture gesture);
 
 // Tell the hook that Mission Control is on screen.
 //
-// While it is, Ctrl+Win+Left and Ctrl+Win+Right are swallowed. Those switch
-// virtual desktops, and switching the desktop out from under a full-screen
-// overlay that belongs to the old one leaves the overlay stranded. Inside
-// Mission Control the arrows walk the strip instead, which is the same gesture
-// pointed at the same thing.
+// While it is, Ctrl+Win+Left and Ctrl+Win+Right are swallowed and posted back as
+// WM_MACTAB_MISSION_STEP. Those chords switch virtual desktops, and switching the
+// desktop out from under a full-screen overlay that belongs to the old one leaves
+// the overlay stranded, so the shell must not run them; but they are still the
+// right gesture aimed at the right thing, so they walk the strip instead. Closing
+// Mission Control on a different desktop is what makes the switch real.
 void SetMissionOpen(bool open);
 
 // Abort any in-flight gesture and clear the stuck-Alt state. Called on session

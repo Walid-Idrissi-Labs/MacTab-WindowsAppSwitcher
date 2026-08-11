@@ -57,9 +57,16 @@ const wchar_t* kDefaultIni =
     L"\r\n"
     L"; --- Mission Control -------------------------------------------------\r\n"
     L";\r\n"
-    L"; Win+Tab spreads every window out instead of opening Task View. Off by\r\n"
-    L"; default; also in the tray menu under Settings.\r\n"
+    L"; Mission Control spreads every window out and puts the desktops along the\r\n"
+    L"; top. Off by default; also in the tray menu under Settings.\r\n"
     L"MissionEnabled=0\r\n"
+    L"\r\n"
+    L"; Which chord opens it.\r\n"
+    L";   wintab   Win+Tab, replacing Task View, which is the same feature\r\n"
+    L";   winup    Win+Up, which COSTS YOU Aero Snap's maximise\r\n"
+    L";   both     either one\r\n"
+    L";   none     neither; open it from the tray instead\r\n"
+    L"MissionGesture=wintab\r\n"
     L"\r\n"
     L"; 1 = pull each app's windows into a cluster with its icon and name under\r\n"
     L"; it. Costs room, because gathering a scattered app's windows means moving\r\n"
@@ -75,8 +82,16 @@ const wchar_t* kDefaultIni =
     L"\r\n"
     L"; The wallpaper behind the windows: how soft it goes, and how far back it\r\n"
     L"; is pushed. Dim is 0 for none and 1 for opaque.\r\n"
-    L"MissionBlurSigma=18\r\n"
-    L"MissionDim=0.55\r\n"
+    L";\r\n"
+    L"; Sigma is 0 because macOS does not blur the desktop here, it dims it and\r\n"
+    L"; lifts the windows off. Anything above 0 also lets the backdrop be baked at\r\n"
+    L"; a fraction of the screen's resolution, since the blur hides the stretch:\r\n"
+    L"; below 1 it is baked at full size, below 4 at half, above that at a\r\n"
+    L"; quarter. On a 4K screen that is the difference between about 33 MB per\r\n"
+    L"; display and about 2 MB, so if Mission Control costs more memory than you\r\n"
+    L"; want it to, this is the number to raise.\r\n"
+    L"MissionBlurSigma=0\r\n"
+    L"MissionDim=0.45\r\n"
     L"\r\n"
     L"; How long the windows take to fly out to their places, in milliseconds.\r\n"
     L"MissionRevealMs=260\r\n"
@@ -361,6 +376,7 @@ void Load() {
     g_settings.glassRimTap     = ReadInt(L"GlassRimTap", 1) != 0;
 
     g_settings.missionEnabled    = ReadInt(L"MissionEnabled", 0) != 0;
+    g_settings.missionGesture    = ReadString(L"MissionGesture", L"wintab");
     g_settings.missionGroupByApp = ReadInt(L"MissionGroupByApp", 1) != 0;
     g_settings.missionRevealMs   = static_cast<UINT>(
         (std::max)(0, (std::min)(2000, ReadInt(L"MissionRevealMs", 260))));

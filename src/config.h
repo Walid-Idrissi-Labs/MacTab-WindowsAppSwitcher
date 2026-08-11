@@ -73,13 +73,20 @@ struct Settings {
 
     // --- Mission Control ----------------------------------------------------
 
-    // Win+Tab opens the arrangement instead of Windows' Task View.
+    // Mission Control at all.
     //
     // Off by default. Alt+Tab is the product and it replaces a key most people
-    // press a hundred times a day; Win+Tab takes over a second one, and taking
-    // over two keys uninvited is a different proposition from taking over one.
-    // The tray menu turns it on without a restart.
+    // press a hundred times a day; this takes over a second one, and taking over
+    // two keys uninvited is a different proposition from taking over one. The
+    // tray menu turns it on without a restart.
     bool missionEnabled = false;
+
+    // Which chord opens it: "wintab", "winup", "both" or "none".
+    //
+    // Win+Tab by default. Win+Up is Aero Snap's maximise, so choosing it costs
+    // the user a shortcut that does something else; Win+Tab is Task View, which
+    // is the same feature by another name. See hotkey::Gesture.
+    std::wstring missionGesture = L"wintab";
 
     // Space between two windows, how far each window of an app is offset
     // from the one in front of it in its pile, and how much room is left
@@ -99,8 +106,14 @@ struct Settings {
 
     // The wallpaper behind the arrangement: how far it is blurred and how far
     // it is pushed back. Dim is the alpha of the tint over it, 0 to 1.
-    float missionBlurSigma = 18.0f;
-    float missionDim       = 0.55f;
+    //
+    // Sigma is 0 because macOS does not blur the desktop in Mission Control; it
+    // dims it and lifts the windows off. It also decides what resolution the
+    // backdrop is baked at, since a blur is what makes a stretched copy
+    // invisible: see BackdropScale in mission.cpp, and the note in the shipped
+    // settings.ini about what that costs in memory.
+    float missionBlurSigma = 0.0f;
+    float missionDim       = 0.45f;
 
     // How long the windows take to fly from where they are to where they land.
     UINT missionRevealMs = 260;

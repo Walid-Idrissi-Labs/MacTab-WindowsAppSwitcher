@@ -48,6 +48,15 @@ State    g_state         = State::Idle;
 UINT_PTR g_revealTimer   = 0;
 WORD     g_gestureAltVk  = 0;   // which Alt key opened the gesture
 
+const char* GestureName(Gesture gesture) {
+    switch (gesture) {
+    case Gesture::WinTab: return "Win+Tab";
+    case Gesture::WinUp:  return "Win+Up";
+    case Gesture::Both:   return "Win+Tab and Win+Up";
+    default:              return "nothing";
+    }
+}
+
 bool KeyDown(int vk) {
     return (::GetAsyncKeyState(vk) & 0x8000) != 0;
 }
@@ -121,8 +130,15 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         // hook is finished. Mission Control is a place the user is in, it takes
         // foreground and handles its own keyboard, so there is no state machine
         // to run and nothing to commit on release.
-        if (down && vk == VK_TAB && g_options.missionOnWinTab &&
-            (KeyDown(VK_LWIN) || KeyDown(VK_RWIN))) {
+        const bool winHeld = KeyDown(VK_LWIN) || KeyDown(VK_RWIN);
+        const bool missionChord =
+            winHeld && !KeyDown(VK_CONTROL) &&
+            ((vk == VK_TAB && (g_options.missionGesture == Gesture::WinTab ||
+                               g_options.missionGesture == Gesture::Both)) ||
+             (vk == VK_UP  && (g_options.missionGesture == Gesture::WinUp ||
+                               g_options.missionGesture == Gesture::Both)));
+
+        if (down && missionChord) {
             PostToUi(WM_MACTAB_MISSION);
 
             // Two jobs, one injection.
@@ -148,16 +164,20 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         }
 
         // While Mission Control is up, the shell's own desktop switch is taken
-        // out of service.
+        // out of service and aimed at the strip instead.
         //
         // Ctrl+Win+Left and Ctrl+Win+Right move the viewed desktop, and the
-        // overlay belongs to the desktop it was created on: switching under it
-        // leaves a full-screen window stranded on a desktop nobody is looking
-        // at. The arrows walk the strip inside Mission Control instead, which
-        // is the same gesture aimed at the same thing.
+        // overlay belongs to the desktop it was created on: letting the shell
+        // run them leaves a full-screen window stranded on a desktop nobody is
+        // looking at. So they are swallowed. But they are still exactly the
+        // right gesture, so the hook posts them onward: the overlay cannot
+        // receive a key that never reached it.
         if (down && g_missionOpen && (vk == VK_LEFT || vk == VK_RIGHT) &&
-            KeyDown(VK_CONTROL) && (KeyDown(VK_LWIN) || KeyDown(VK_RWIN)))
+            KeyDown(VK_CONTROL) && winHeld) {
+            PostToUi(WM_MACTAB_MISSION_STEP,
+                     static_cast<WPARAM>(vk == VK_RIGHT ? 1 : -1));
             return 1;
+        }
 
         // Gesture opens on Alt+Tab. Note Tab arrives as WM_SYSKEYDOWN because
         // Alt is down, which is why `down` tests both message forms.
@@ -425,9 +445,9 @@ bool Start(HWND uiWindow, const Options& options) {
     }
 
     ::InterlockedExchange(&g_running, 1);
-    MACTAB_DIAG("hotkey: started (revealDelay %u ms, leftAltOnly %d, winTab %d)",
+    MACTAB_DIAG("hotkey: started (revealDelay %u ms, leftAltOnly %d, mission %s)",
                 g_options.revealDelayMs, g_options.leftAltOnly ? 1 : 0,
-                g_options.missionOnWinTab ? 1 : 0);
+                GestureName(g_options.missionGesture));
     return true;
 }
 
@@ -471,9 +491,9 @@ void SetMissionOpen(bool open) {
     g_missionOpen = open;
 }
 
-void SetMissionOnWinTab(bool enabled) {
-    g_options.missionOnWinTab = enabled;
-    MACTAB_DIAG("hotkey: Win+Tab interception %s", enabled ? "on" : "off");
+void SetMissionGesture(Gesture gesture) {
+    g_options.missionGesture = gesture;
+    MACTAB_DIAG("hotkey: Mission Control on %s", GestureName(gesture));
 }
 
 bool IsRunning() {
