@@ -237,6 +237,16 @@ struct Mission::Impl {
     UINT_PTR closeTimer = 0;
     bool     restoreOnHide = true;
 
+    // Ignore focus loss until this tick.
+    //
+    // Adding or closing a desktop switches the view, and while the view is
+    // somewhere else these overlays are cloaked, which Windows reports as losing
+    // activation. The message loop is not running during the wait, so those
+    // arrive in a batch AFTER the overlays have been brought back across, and
+    // dismissing on them would close Mission Control the instant it was put
+    // right. They are not a user leaving, so they are not listened to.
+    DWORD ignoreFocusUntil = 0;
+
     void FinishHide();
 
     WUC::Compositor                compositor{ nullptr };
@@ -700,6 +710,7 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     // focus, and for a same-thread transfer that handle is reliable.
     case WM_KILLFOCUS:
         if (impl->visible && impl->notifyWindow &&
+            ::GetTickCount() >= impl->ignoreFocusUntil &&
             !impl->IsOwnWindow(reinterpret_cast<HWND>(wParam)))
             ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
         return 0;
@@ -709,7 +720,8 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     // condition, and it catches the paths where the focus handle comes back
     // null. Dismissal is idempotent, so both firing is harmless.
     case WM_ACTIVATEAPP:
-        if (wParam == FALSE && impl->visible && impl->notifyWindow)
+        if (wParam == FALSE && impl->visible && impl->notifyWindow &&
+            ::GetTickCount() >= impl->ignoreFocusUntil)
             ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
         return 0;
 
@@ -2712,12 +2724,20 @@ void Mission::FollowDesktop(const GUID& desktop) {
     // whichever desktop they were last assigned to, so without this the overlay
     // is left cloaked on a desktop nobody is looking at while the machine sits
     // on the new one with nothing on screen.
+    // Everything the switch made Windows say about our activation is now stale,
+    // and it has been queued rather than delivered, because the message loop was
+    // not running while we waited for the shell.
+    impl.ignoreFocusUntil = ::GetTickCount() + 600;
+
     for (Impl::Screen& screen : impl.screens) {
         desktops::MoveWindowTo(screen.hwnd, desktop);
         ::SetWindowPos(screen.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 
+    // Allowed, and not by luck: the desktop was changed by injecting the same
+    // keystrokes a user would press, so this process produced the last input
+    // event, which is one of the conditions under which foreground may be taken.
     if (!impl.screens.empty()) {
         ::SetForegroundWindow(impl.screens.front().hwnd);
         ::SetFocus(impl.screens.front().hwnd);
@@ -2794,6 +2814,7 @@ void Mission::Impl::FinishHide() {
 
     visible = false;
     closing = false;
+    ignoreFocusUntil = 0;
 
     for (Screen& screen : screens) {
         GuardMission(*this, "Hide", [&] {
