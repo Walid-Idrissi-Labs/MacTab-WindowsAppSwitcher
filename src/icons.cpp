@@ -293,7 +293,13 @@ Bitmap ProduceTile(const Request& request) {
             packages::Logo logo;
             if (packages::FindLogo(request.aumid, logo)) {
                 source = DecodeImageFile(logo.path);
-                background = logo.background;
+
+                // Only once the asset actually decoded. The colour describes
+                // that asset, and applying it to whatever else the ladder ends
+                // up finding would be tinting one app's icon from another
+                // source's idea of it.
+                if (!source.Empty())
+                    background = logo.background;
             }
         }
 

@@ -144,12 +144,8 @@ bool ReadManifest(const std::wstring& packagePath, const std::wstring& appId,
         // Square44x44Logo is what the taskbar draws from. Square150x150Logo is
         // the Start tile, which is a different picture with tile padding built
         // into it, and only worth having when there is no 44 at all.
-        if (ReadAttribute(reader.Get(), L"Square44x44Logo", logo) ||
-            ReadAttribute(reader.Get(), L"Square150x150Logo", logo) ||
-            ReadAttribute(reader.Get(), L"Logo", logo))
-            return true;
-
-        return false;
+        return ReadAttribute(reader.Get(), L"Square44x44Logo", logo) ||
+               ReadAttribute(reader.Get(), L"Square150x150Logo", logo);
     }
 
     return false;
