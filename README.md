@@ -312,30 +312,58 @@ Off by default. Turn it on in the tray menu under *Settings*, or set
 uninvited is a different proposition from taking over one.
 
 `Win+Tab` then spreads every window out so none of them overlap, on every
-display at once, and puts the virtual desktops in a glass bar across the top. Click a
-window to go to it, click a desktop to switch, click the `+` to add one,
-`Esc` or a click on the background to leave. Arrow keys move between windows
-geometrically rather than through a list, because the arrangement has no rows
-to walk along.
-
+display at once, and puts the virtual desktops in a glass bar across the top.
 It is a toggle, not a hold. Mission Control is a place you are in.
+
+`MissionGesture=winup` moves it to `Win+Up` instead, or `both` for either.
+Win+Tab is the default deliberately: it is Task View, which is this feature under
+another name, where Win+Up is Aero Snap's maximise and taking that costs you a
+key that already does something else.
 
 | In Mission Control | |
 |---|---|
-| Click a window | Go to it. If it is on another desktop, that takes you there |
-| Click an app's icon, scroll up, or `↓` | Spread that app's pile so its windows can be told apart |
+| Click a window, or `Enter` | Go to it. If it is on another desktop, that takes you there |
+| `←` `→` `↑` `↓` | Move between windows, geometrically rather than through a list |
+| `Tab`, `Shift+Tab` | Next and previous window |
+| Click an app's icon, scroll up, or `↓` on a pile | Spread that app's pile so its windows can be told apart |
 | Click the background, scroll down, `↑` or `Esc` | Put the pile back, or leave |
-| Click a desktop, or `←` `→` | Look at that desktop's windows without going there |
+| Click a desktop, or `Ctrl+←` `Ctrl+→` | Look at that desktop's windows |
+| `Ctrl+Win+←` `Ctrl+Win+→` | The same thing, so the shell's own chord keeps its meaning |
+| Click the `+` | Add a desktop, without leaving |
+| Click the `⨯` on a desktop | Close it, without leaving |
 | Drag a window to another display | Move it there, keeping its size and its proportional place |
 | Drag a window onto a desktop | Move it there, if Windows allows it (see below) |
-| Click the `+` | Add a desktop |
-| `Tab` | Next window |
-| `Enter` | Go to the highlighted window |
+| `Esc` | Leave |
 
-`Ctrl+Win+←` and `Ctrl+Win+→` are swallowed while it is open. They switch the
-desktop, and the overlay belongs to the desktop it was created on, so switching
-under it would strand a full-screen window on a desktop nobody is looking at.
-The arrows do the same job from inside instead.
+**Looking at a desktop is not the same as being on it, until you leave.** Clicking
+one shows its windows sliding in; the machine stays where it is, because the
+overlay belongs to the desktop it was built on and switching underneath it would
+strand a full-screen window somewhere nobody is looking. Leaving on purpose,
+with `Esc`, the toggle, or a click on the background, is what makes it real and
+takes you to the desktop you were looking at. Losing focus, a display appearing,
+a session lock or Alt+Tab taking over do not: those are not decisions, and none
+of them should move your desktop.
+
+`Ctrl+Win+←` and `Ctrl+Win+→` never reach the shell while it is open, for the
+same reason, and are handed to the strip instead.
+
+**Adding and closing a desktop happen without leaving.** Both go through the same
+keyboard shortcuts you would press, both move the view, and these overlays keep
+whichever desktop they were assigned to, so each one is: make the change, wait for
+the shell to admit it happened, bring the overlays across to wherever the view
+ended up, rebuild in place.
+
+Closing a desktop other than the one you are on needs the view to go there first,
+because the public API can only close the current one. It goes there, confirms it
+arrived against the shell's own record, and only then sends the close. If that
+confirmation never comes, nothing is closed at all. Closing the wrong desktop is
+not something you can undo.
+
+**It stays honest while it is open.** A window that closes or minimises disappears
+and everything else relaxes into the space it left; a desktop created or removed
+by anything else shows up within half a second. Both watchers are installed when
+it opens and removed when it closes, because the idle budget for this process is
+zero.
 
 **The arrangement.** One scale for every window, so a large window still looks
 large next to a small one and every aspect ratio is exact. Windows start where
@@ -368,11 +396,37 @@ it is first: that flight is most of what makes the gesture read as Mission
 Control rather than as a dialog. If it misbehaves on your driver, set
 `MissionThumbnails=snapshot` and everything else stays as it is.
 
+**The bar is the same glass the switcher is made of.** Not a similar one: the same
+code, in `src/glass_draw.cpp`, with the same measured numbers, so tuning the
+material tunes both. Three things about this piece are its own. It runs past the
+screen on the left, right and top, so its dark stroke and its lit edge fall off
+the display and only the bottom edge is ever seen, which is the profile macOS
+shows. It is cut from the wallpaper at full resolution rather than from the
+overlay's own backdrop, because the rim bends a sharp image and a quarter-scale
+copy would make that second bend indistinguishable from the first. And the strip
+is dimmed before the material sees it, by the same amount the backdrop is, so the
+glass adapts to the scene you are actually looking at instead of to a brighter one
+that only exists in a file.
+
 **The background is the wallpaper, not the screen.** Mission Control lifts the
 windows off and leaves the desktop, so capturing the screen would put every
 window into the blurred backdrop as well as into the arrangement, and each one
 would appear twice. It also means there is nothing to capture on the reveal
 path.
+
+It is not blurred by default, because macOS does not blur it either: it dims it
+and lifts the windows off. That has a cost worth knowing about. The blur is what
+used to make it safe to bake the backdrop at a quarter of the screen's resolution
+and stretch it back; with nothing to hide the stretch behind, it is baked at full
+size, which on a 4K display is about 33 MB per screen. `MissionBlurSigma` buys
+that back: above 1 it halves, above 4 it quarters.
+
+**The windows go back down when you leave.** The reveal lifts them off the desktop
+and the dismissal lowers them onto it, so activating a window has its tile land on
+the real window at the moment the real window comes forward. The one path that
+skips it is committing a desktop switch, because the shell animates that itself
+and an overlay still on screen while the desktop slides underneath looks like a
+fault.
 
 **It opens on every display**, each with its own arrangement of that screen's
 windows and its own copy of the bar, which is what macOS does.
@@ -409,13 +463,14 @@ defaults and comments on first run:
 | `PanelDisplay` | active | `active`, `mouse` or `main` |
 | `GlassRefraction` | 1 | Bend the desktop at the panel's rim. Set to 0 if the edge looks doubled or smeared on your machine |
 | `GlassRimTap` | 1 | Bend a sharper copy at the rim than in the middle, which is what makes the edge read as a lens. Set to 0 if the bezel looks doubled or banded |
-| `MissionEnabled` | 0 | 1 makes Win+Tab open Mission Control instead of Task View. Also in the tray menu |
+| `MissionEnabled` | 0 | 1 turns Mission Control on. Also in the tray menu |
+| `MissionGesture` | wintab | `wintab`, `winup`, `both` or `none`. `winup` costs you Aero Snap's maximise |
 | `MissionGroupByApp` | 1 | 0 arranges purely by position and ignores which app owns what |
 | `MissionGap` | 26 | Space kept between windows, logical pixels |
 | `MissionFan` | 30 | How far each window of an app is offset from the one in front of it in its pile |
 | `MissionClusterGap` | 88 | Space between one app's pile and the next |
-| `MissionBlurSigma` | 18 | How soft the wallpaper behind the arrangement goes |
-| `MissionDim` | 0.55 | How far back the wallpaper is pushed, 0 to 1 |
+| `MissionBlurSigma` | 0 | How soft the wallpaper behind the arrangement goes. Also decides what resolution it is baked at: raise it if Mission Control costs more memory than you want |
+| `MissionDim` | 0.45 | How far back the wallpaper is pushed, 0 to 1 |
 | `MissionRevealMs` | 260 | How long the windows take to fly to their places |
 | `MissionThumbnails` | auto | `auto`, `shared`, `snapshot` or `icon`. Drop to `snapshot` if the windows come out blank or misplaced |
 
@@ -623,7 +678,15 @@ useful with the log attached than without it.
    show the right number with the right one highlighted. *Log virtual desktops*
    in the tray menu prints what was read out of the registry, which is the one
    thing about desktops that cannot be reasoned about from here.
-10. **Does the panel appear within a frame?** `gesture: reveal ... shown in N ms`.
+10. **The desktops, from inside.** With three of them: click the third, press
+   `Esc`, and you should be on the third. Click the `+` and Mission Control
+   should stay up with a fourth in the strip. Click the `⨯` on a desktop you are
+   not on and it should go, with nothing else moving. If any of those does
+   nothing, the log says whether the shell ever admitted the change happened.
+11. **Open it, leave a desktop, open it again.** The second one must not take you
+   back to the first desktop. These overlays are made once, a window keeps its
+   desktop for life, and asking Windows to show one is asking it to go there.
+12. **Does the panel appear within a frame?** `gesture: reveal ... shown in N ms`.
    This is the one performance claim that could not be verified from
    documentation, so it is measured rather than assumed.
 
@@ -635,8 +698,8 @@ each of these so the claims can be checked rather than trusted.
 
 | Claim | How it is achieved |
 |---|---|
-| No timers at rest | The only timer is the reveal delay, armed on the first Tab and killed on commit. |
-| No polling | MRU comes from one `EVENT_SYSTEM_FOREGROUND` hook. Dead windows are pruned lazily rather than by subscribing to `EVENT_OBJECT_DESTROY`, which fires for every menu and tooltip in the session. |
+| No timers at rest | The reveal delay, armed on the first Tab and killed on commit. Mission Control adds two while it is on screen, for the collapse and for watching the desktops, and both are killed when it closes. |
+| No polling | MRU comes from one `EVENT_SYSTEM_FOREGROUND` hook. `EVENT_OBJECT_DESTROY` fires for every menu and tooltip in the session, so it is hooked only while Mission Control is open, and filtered to the handful of windows it is showing. |
 | One-frame reveal | The window, devices and visual tree are built once at startup and never destroyed. Showing is `SetWindowPos` plus property writes. |
 | No CPU during animation | Fades, scale and the selection spring are Composition animations, which run on DWM's thread. |
 | Bounded memory | Icon tiles are an LRU capped at 96 entries (~6 MB at 128px). |
@@ -665,8 +728,12 @@ each of these so the claims can be checked rather than trusted.
   public API moves a window between desktops only when the calling process owns
   it, which is almost never what you want to drag. The drop is attempted and the
   window snaps back when Windows refuses, rather than pretending it worked. The
-  interface that could do it properly is the one described above. Closing a
-  desktop other than the one you are on has the same problem.
+  interface that could do it properly is the one described above.
+
+  Closing a desktop other than the one you are on is a different case and does
+  work: the view goes there first, which is allowed, and the close is only sent
+  once the shell's own record says it arrived. What that costs is a moment of the
+  desktop actually switching underneath the overlay before it comes back.
 - **The desktop miniatures show where the windows are, not what is in them.**
   A window on another desktop is shell-cloaked and DWM will not compose a
   cloaked window through any path available to a normal process, so each one is
@@ -676,6 +743,15 @@ each of these so the claims can be checked rather than trusted.
   above this project's floor, and the visual DWM hands back for a thumbnail
   cannot be masked in any case.
 - **Minimised windows are not in Mission Control**, which is also true on macOS.
+- **Mission Control opens on every display**, as macOS does, rather than only on
+  the one holding the focused window. Each display gets its own arrangement of
+  its own windows, its own DPI and its own copy of the strip; what it does not
+  get is a separate set of desktops per display, because Windows does not have
+  those.
+- **The backdrop is held in memory while Mission Control is enabled**, at the
+  screen's own resolution, which on a 4K display is about 33 MB per screen. That
+  is the price of not blurring it. `MissionBlurSigma` above 1 halves it and above
+  4 quarters it.
 - **HDR displays** fall back to GDI capture. Desktop duplication hands back
   scRGB float rather than BGRA when HDR is on and does not convert, so the
   duplication path bails rather than showing wrong colours.
