@@ -359,6 +359,9 @@ arrived against the shell's own record, and only then sends the close. If that
 confirmation never comes, nothing is closed at all. Closing the wrong desktop is
 not something you can undo.
 
+It comes back afterwards, too. The shell leaves you on a neighbour of the desktop
+it removed, and deleting a desktop is not a request to go anywhere.
+
 **It stays honest while it is open.** A window that closes or minimises disappears
 within a frame and everything else relaxes into the space it left. A window that
 opens, and a desktop created or removed by anything else, show up within half a
