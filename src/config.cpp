@@ -40,6 +40,20 @@ const wchar_t* kDefaultIniHead =
     L"; auto | dark | light\r\n"
     L"Theme=auto\r\n"
     L"\r\n"
+    L"; How the desktop behind the panel is grabbed, which is what the glass is\r\n"
+    L"; made of. If the panel is a flat grey slab with nothing showing through\r\n"
+    L"; it, no grab is getting back, and this is the key to try.\r\n"
+    L";   auto         try each of the three below and use the first that\r\n"
+    L";                comes back with a picture in it\r\n"
+    L";   duplication  the compositor's own copy. Cannot work on a still\r\n"
+    L";                desktop: it has nothing to hand over until the screen\r\n"
+    L";                changes, which is why the glass can appear only while\r\n"
+    L";                something behind the panel is moving\r\n"
+    L";   bitblt       a screen copy including layered windows\r\n"
+    L";   plain        the same copy without the flag that forces a compositor\r\n"
+    L";                sync, which is the one most likely to come back black\r\n"
+    L"CaptureSource=auto\r\n"
+    L"\r\n"
     L"; 1 = one tile per application (macOS). 0 = one tile per window.\r\n"
     L"GroupByApp=1\r\n"
     L"\r\n"
@@ -522,6 +536,7 @@ void ReadSettings() {
     g_settings.leftAltOnly = ReadInt(L"LeftAltOnly", 1) != 0;
     g_settings.tileSize    = (std::max)(48, (std::min)(256, ReadInt(L"TileSize", 128)));
     g_settings.theme       = ReadKeyword(L"Theme", L"auto");
+    g_settings.captureSource = ReadKeyword(L"CaptureSource", L"auto");
     g_settings.groupByApp  = ReadInt(L"GroupByApp", 1) != 0;
     g_settings.panelDisplay = ParsePanelDisplay(ReadKeyword(L"PanelDisplay", L"active"));
     g_settings.glassRefraction = ReadInt(L"GlassRefraction", 1) != 0;

@@ -228,7 +228,7 @@ Frame GrabWithDuplication(const RECT& rect) {
     return frame;
 }
 
-Frame GrabWithBitBlt(const RECT& rect) {
+Frame GrabWithBitBlt(const RECT& rect, bool captureBlt) {
     Frame frame;
 
     const int width  = static_cast<int>(rect.right  - rect.left);
@@ -258,17 +258,25 @@ Frame GrabWithBitBlt(const RECT& rect) {
     if (dib && bits) {
         const HGDIOBJ previous = ::SelectObject(memory, dib);
 
-        // CAPTUREBLT so layered windows above the desktop are included; without
-        // it the backdrop would be missing exactly the translucent surfaces
-        // that make a blur look convincing.
-        if (::BitBlt(memory, 0, 0, width, height, screen, rect.left, rect.top,
-                     SRCCOPY | CAPTUREBLT)) {
+        // CAPTUREBLT includes layered windows above the desktop, which is worth
+        // having: without it the backdrop is missing exactly the translucent
+        // surfaces that make a blur look convincing.
+        //
+        // It is also the flag most likely to be the reason a blit comes back
+        // black. It forces a DWM sync and has never been the well-trodden path
+        // on a composited desktop, where every window is already in the redirect
+        // surface the plain blit reads. So both are tried, in that order, and
+        // whichever returns something that is not blank wins. The two are not
+        // the same call: they go through different paths in the compositor.
+        const DWORD rop = captureBlt ? (SRCCOPY | CAPTUREBLT) : SRCCOPY;
+
+        if (::BitBlt(memory, 0, 0, width, height, screen, rect.left, rect.top, rop)) {
             frame.pixels = Bitmap::Create(width, height);
             std::memcpy(frame.pixels.pixels.data(), bits,
                         static_cast<size_t>(width) * height * 4);
             for (uint32_t& pixel : frame.pixels.pixels)
                 pixel |= 0xFF000000u;
-            frame.source = Source::GdiBitBlt;
+            frame.source = captureBlt ? Source::GdiBitBlt : Source::GdiPlain;
             frame.bounds = rect;   // BitBlt reads the virtual screen, no clamping
         }
 
@@ -281,37 +289,149 @@ Frame GrabWithBitBlt(const RECT& rect) {
     return frame;
 }
 
+// What a grab actually came back with.
+//
+// Nothing here ever looked at the pixels, and that turned out to be the whole
+// problem: a blit that "succeeds" and hands back a rectangle of black is
+// indistinguishable, to every line of code downstream, from a genuinely black
+// desktop. The panel then blurs black, tints it, and the adaptive bias lifts it
+// to a flat mid-dark grey, which is precisely the slab this material has been
+// accused of being for five releases.
+//
+// Sampled rather than exhaustive: every fourth pixel is tens of thousands of
+// samples on a panel-sized grab, which is far more than enough to tell a picture
+// from a blank, and it runs on the capture worker where the time is free.
+struct Content {
+    double mean   = 0.0;   // mean luma, 0..1
+    double spread = 0.0;   // mean absolute deviation from that, 0..1
+};
+
+Content Assess(const Bitmap& pixels) {
+    Content content;
+    if (pixels.pixels.empty()) return content;
+
+    constexpr size_t kStride = 4;
+
+    double  total = 0.0;
+    size_t  count = 0;
+    for (size_t i = 0; i < pixels.pixels.size(); i += kStride) {
+        const uint32_t px = pixels.pixels[i];
+        total += (RedOf(px) * 0.2126 + GreenOf(px) * 0.7152 + BlueOf(px) * 0.0722) / 255.0;
+        ++count;
+    }
+    if (!count) return content;
+
+    content.mean = total / static_cast<double>(count);
+
+    double deviation = 0.0;
+    for (size_t i = 0; i < pixels.pixels.size(); i += kStride) {
+        const uint32_t px = pixels.pixels[i];
+        const double luma =
+            (RedOf(px) * 0.2126 + GreenOf(px) * 0.7152 + BlueOf(px) * 0.0722) / 255.0;
+        deviation += (luma > content.mean) ? (luma - content.mean) : (content.mean - luma);
+    }
+    content.spread = deviation / static_cast<double>(count);
+    return content;
+}
+
+// A grab worth putting behind the panel.
+//
+// Rejects a black rectangle with nothing in it, which is what a failed GDI
+// capture of a composited desktop looks like. Deliberately NOT a general
+// "uniform" test: a plain dark wallpaper is flat too, and it is a real desktop
+// that the material handles correctly, so only near-black AND featureless is
+// treated as a failure. That pairs with the order in GrabRegion, where a frame
+// that fails this is kept as a last resort rather than thrown away: a real black
+// desktop still ends up drawn, just after the other paths have been tried.
+bool Blank(const Content& content) {
+    return content.mean < 0.012 && content.spread < 0.004;
+}
+
+Source g_forced = Source::None;
+
 } // namespace
 
 const char* SourceName(Source source) {
     switch (source) {
     case Source::DesktopDuplication: return "desktop-duplication";
     case Source::GdiBitBlt:          return "gdi-bitblt";
+    case Source::GdiPlain:           return "gdi-plain";
     case Source::None:               break;
     }
     return "none";
 }
 
+void Force(Source source) {
+    g_forced = source;
+    MACTAB_DIAG("capture: source forced to %s", SourceName(source));
+}
+
+Source Forced() { return g_forced; }
+
+Source ParseSource(const wchar_t* keyword) {
+    if (!keyword) return Source::None;
+    if (::lstrcmpiW(keyword, L"duplication") == 0) return Source::DesktopDuplication;
+    if (::lstrcmpiW(keyword, L"bitblt")      == 0) return Source::GdiBitBlt;
+    if (::lstrcmpiW(keyword, L"plain")       == 0) return Source::GdiPlain;
+    return Source::None;   // "auto", and anything unrecognised
+}
+
 Frame GrabRegion(const RECT& rect) {
     const double started = NowMs();
 
-    Frame frame;
+    // In preference order. Duplication first because it is the only one that
+    // reads the composed desktop from the compositor rather than through GDI;
+    // the two blits after it are there because on some machines it never
+    // delivers, and on a still desktop it CANNOT: it has nothing to hand over
+    // until something on screen changes.
+    const Source order[] = { Source::DesktopDuplication,
+                             Source::GdiBitBlt,
+                             Source::GdiPlain };
 
-    if (InRemoteSession()) {
+    const bool remote = InRemoteSession();
+    if (remote)
         MACTAB_DIAG("capture: remote session, skipping desktop duplication");
-    } else {
-        frame = GrabWithDuplication(rect);
+
+    Frame best;   // the last thing that came back at all, blank or not
+
+    for (const Source source : order) {
+        if (g_forced != Source::None && source != g_forced) continue;
+        if (source == Source::DesktopDuplication && remote) continue;
+
+        Frame frame;
+        switch (source) {
+        case Source::DesktopDuplication: frame = GrabWithDuplication(rect);   break;
+        case Source::GdiBitBlt:          frame = GrabWithBitBlt(rect, true);  break;
+        case Source::GdiPlain:           frame = GrabWithBitBlt(rect, false); break;
+        case Source::None:               break;
+        }
+
+        if (frame.source == Source::None || frame.pixels.Empty())
+            continue;
+
+        const Content content = Assess(frame.pixels);
+        MACTAB_DIAG("capture: %s came back %dx%d, mean luma %.3f, spread %.3f%s",
+                    SourceName(frame.source), frame.pixels.width, frame.pixels.height,
+                    content.mean, content.spread,
+                    Blank(content) ? " (blank, trying the next path)" : "");
+
+        if (!Blank(content)) {
+            MACTAB_DIAG("capture: %s, %dx%d at (%ld,%ld) in %.2f ms",
+                        SourceName(frame.source),
+                        frame.pixels.width, frame.pixels.height,
+                        frame.bounds.left, frame.bounds.top, NowMs() - started);
+            return frame;
+        }
+
+        best = std::move(frame);
     }
 
-    if (frame.source == Source::None)
-        frame = GrabWithBitBlt(rect);
-
-    MACTAB_DIAG("capture: %s, %dx%d at (%ld,%ld) in %.2f ms",
-                SourceName(frame.source),
-                frame.pixels.width, frame.pixels.height,
-                frame.bounds.left, frame.bounds.top, NowMs() - started);
-
-    return frame;
+    // Everything available came back blank. Hand back the last one anyway: a
+    // desktop that really is black is a case the material handles, and a black
+    // backdrop drawn honestly is no worse than the flat coat that replaces it.
+    MACTAB_WARN("capture: no path returned a usable frame (%s after %.2f ms)",
+                SourceName(best.source), NowMs() - started);
+    return best;
 }
 
 void ReleaseCachedResources() {

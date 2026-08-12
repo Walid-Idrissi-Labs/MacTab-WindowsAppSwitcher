@@ -36,6 +36,17 @@ struct Settings {
     // "auto" follows the system app theme; "dark" and "light" pin it.
     std::wstring theme = L"auto";
 
+    // How the desktop behind the panel is grabbed: "auto", "duplication",
+    // "bitblt" or "plain".
+    //
+    // Here for the same reason missionThumbnails is, and it is the most
+    // important of these switches rather than the least. Without a usable grab
+    // the panel draws a nearly opaque coat and there is no glass at all, and
+    // which path works is a property of a machine's GPU, its compositor and its
+    // display that cannot be established from here. "auto" tries each in turn
+    // and takes the first that comes back with something in it.
+    std::wstring captureSource = L"auto";
+
     // Group windows into applications (macOS behaviour). When false, every
     // window gets its own tile.
     bool groupByApp = true;

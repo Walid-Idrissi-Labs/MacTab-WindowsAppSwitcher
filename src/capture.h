@@ -30,9 +30,28 @@ enum class Source {
     None,                 // capture failed; caller should fall back to a flat tint
     DesktopDuplication,   // preferred: no border, no prompt, GPU-side frame
     GdiBitBlt,            // works everywhere including RDP and VMs
+    GdiPlain,             // the same blit without CAPTUREBLT
 };
 
 const char* SourceName(Source source);
+
+// Force one path, from settings.ini, or Source::None for "try them all".
+//
+// Here for the reason MissionThumbnails is: which of these works is a property
+// of a machine nobody developing MacTab can log into, and a user who can see the
+// panel is a better test than any amount of reasoning about DWM. Set
+// CaptureSource in settings.ini and the answer comes back as "this one works",
+// which is worth more than a theory.
+//
+// Written on the UI thread when the settings are read, and read on the capture
+// worker. A plain enum, for the same reason hotkey::SetMissionGesture is safe:
+// it cannot tear, and a stale read costs one gesture the path it would have
+// preferred.
+void Force(Source source);
+Source Forced();
+
+// Parse the settings keyword: "auto", "duplication", "bitblt" or "plain".
+Source ParseSource(const wchar_t* keyword);
 
 struct Frame {
     Bitmap pixels;

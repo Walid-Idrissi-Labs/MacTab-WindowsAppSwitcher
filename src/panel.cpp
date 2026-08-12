@@ -552,6 +552,7 @@ void Panel::PrepareLayout(int itemCount) {
 
 bool Panel::Ready() const   { return m_impl->ready; }
 bool Panel::Visible() const { return m_impl->visible; }
+bool Panel::BackdropIsFlat() const { return m_impl->lastFrame.pixels.Empty(); }
 HWND Panel::Hwnd() const    { return m_impl->hwnd; }
 int  Panel::TileSizePx() const {
     return static_cast<int>(std::lround(m_impl->tilePx));

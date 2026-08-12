@@ -5,6 +5,7 @@
 #include "activate.h"
 #include "app.h"
 #include "app_identity.h"
+#include "capture.h"
 #include "common.h"
 #include "config.h"
 #include "diag.h"
@@ -83,6 +84,9 @@ struct AppState {
     bool      diagRequested = false;
     bool      wtsRegistered = false;
     bool      shuttingDown  = false;
+
+    // Said once per session, not once per gesture. See ReportFlatPanel.
+    bool      reportedFlatPanel = false;
 };
 
 AppState g_app;
@@ -330,6 +334,31 @@ void CancelGesture(WORD altVirtualKey) {
     MACTAB_DIAG("gesture: cancelled");
 }
 
+// Say out loud that the panel has no backdrop, once per session.
+//
+// The state this reports is the one that made the material look untunable: with
+// no picture of the desktop behind it the panel draws a coat that is 96% opaque,
+// so it reads as a grey slab and every value in settings.ini stops changing
+// anything, because none of what those values describe is being drawn. From
+// outside it is indistinguishable from a badly tuned material, and it stayed
+// that way for five releases because nothing ever said which one it was.
+//
+// Once, not per gesture: a machine where the grab never works would otherwise
+// pop a balloon on every Alt+Tab. The diagnostics log carries the detail, and
+// CaptureSource in settings.ini is the thing to try.
+void ReportFlatPanel() {
+    if (g_app.reportedFlatPanel) return;
+    if (!g_app.panel.BackdropIsFlat()) return;
+
+    g_app.reportedFlatPanel = true;
+    MACTAB_WARN("panel: revealed with no backdrop; the glass cannot be seen");
+    g_app.tray.ShowBalloon(
+        L"MacTab",
+        L"The panel could not grab the desktop behind it, so it is showing a "
+        L"plain tint instead of glass. Try CaptureSource=plain in settings.ini, "
+        L"then bitblt, then duplication.");
+}
+
 void RevealPanel() {
     Gesture& g = g_app.gesture;
 
@@ -348,6 +377,8 @@ void RevealPanel() {
     g_app.panel.Show();
     MACTAB_DIAG("gesture: reveal, index %d of %zu, shown in %.2f ms",
                 g.index, g.apps.size(), NowMs() - started);
+
+    ReportFlatPanel();
 }
 
 // Q / W / H / backtick, dispatched once the panel is up.
@@ -1085,6 +1116,12 @@ void ReloadSettingsFromFile() {
 // than polled, so those two have to be pushed rather than pulled.
 void ApplySettings() {
     hotkey::SetTiming(config::Current().revealDelayMs, config::Current().leftAltOnly);
+    capture::Force(capture::ParseSource(config::Current().captureSource.c_str()));
+
+    // A machine that starts working deserves to be told about it again if it
+    // stops. Cheap, and it makes the balloon a per-attempt answer rather than a
+    // once-ever one while somebody is working through the CaptureSource values.
+    g_app.reportedFlatPanel = false;
 
     const bool mission = config::Current().missionEnabled;
     if (mission) {
@@ -1593,6 +1630,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
 
     diag::Init(g_app.diagRequested);
     config::Load();
+    capture::Force(capture::ParseSource(config::Current().captureSource.c_str()));
     MACTAB_DIAG("boot: command line \"%s\"", ToUtf8(cmdLine ? cmdLine : L"").c_str());
 
     if (!ClaimSingleInstance()) {

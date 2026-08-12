@@ -57,6 +57,17 @@ public:
     void Hide();
     bool Visible() const;
 
+    // True when the panel currently on screen is drawing its flat fallback coat
+    // because no usable picture of the desktop behind it came back.
+    //
+    // Exposed so the tray can SAY so. This is the state the whole material
+    // disappears into, and it is invisible from the code's point of view and
+    // indistinguishable from bad tuning from the user's: the panel just looks
+    // like a grey slab, and every number in settings.ini stops doing anything
+    // because nothing they describe is being drawn. Left unreported through five
+    // releases, it cost more than any bug in the material itself.
+    bool BackdropIsFlat() const;
+
     // Index under a screen point, or -1. The window has no per-pixel hit
     // testing (see the WS_EX_NOREDIRECTIONBITMAP note in panel.cpp), so this is
     // a plain test against the computed layout.
