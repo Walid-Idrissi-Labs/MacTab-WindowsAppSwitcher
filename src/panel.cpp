@@ -1261,11 +1261,20 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
     // Alt+Tab rather than on the next launch. Everything else on the panel is
     // baked per gesture anyway; the selection highlight is the one surface that
     // is not, so it is the one that has to be rebuilt here.
-    if (const bool light = ResolveLightTheme(); light != impl.themeIsLight) {
-        impl.theme        = MakeTheme(light);
+    //
+    // Unconditionally, not only when the appearance flips. The theme carries the
+    // material, the material comes from config, and reloading settings.ini
+    // changes the material without changing which appearance is in force. Gated
+    // on the flip, as this was, every hand-tuned value in GlassDark* and
+    // GlassLight* did nothing at all until the next restart, which is the whole
+    // feature the ini keys exist for. It is a copy of twenty floats and two
+    // colours, so doing it every gesture costs nothing worth measuring.
+    const bool light = ResolveLightTheme();
+    if (light != impl.themeIsLight) {
         impl.themeIsLight = light;
         MACTAB_DIAG("panel: theme is now %s", light ? "light" : "dark");
     }
+    impl.theme = MakeTheme(light);
 
     // PrepareLayout has usually just run for this exact count; laying out
     // again would mean a second SetWindowPos per gesture for nothing.

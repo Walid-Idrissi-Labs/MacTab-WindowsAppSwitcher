@@ -152,6 +152,19 @@ void Load();
 // see the result at all. Now it means saving the file and picking a menu item.
 void ReloadGlass();
 
+// Re-read the WHOLE file, not just the material.
+//
+// Same rule as ReloadGlass: everything it writes is read on the UI thread, and
+// it deliberately does not touch the themes directory string that the icon
+// worker reads on its own thread.
+//
+// This is what a save of settings.ini now runs. Until 0.8.5 only the glass was
+// re-read, so every other key in the file appeared to do nothing until MacTab
+// was restarted, which is indistinguishable from the key being broken. The
+// caller applies what the running process holds separately: see ApplySettings in
+// main.cpp.
+void Reload();
+
 // Put settings.ini back exactly as it ships, keeping what was there as
 // settings.ini.bak, and re-read everything from it.
 //
@@ -239,6 +252,13 @@ const std::wstring& ThemesDir();
 // Full path to settings.ini, for the tray item that opens it directly. Empty
 // until Load() has run.
 const std::wstring& SettingsPath();
+
+// How many glass values the last read actually took out of settings.ini.
+//
+// Reported by the tray's reload. Somebody whose edit appeared to do nothing
+// needs to know whether the file was read and ignored or never read at all, and
+// on this project there is nobody standing next to them to ask.
+int GlassOverrides();
 
 // Returns an empty bitmap when there is no override for this app.
 Bitmap LoadThemeOverride(const std::wstring& exePath, const std::wstring& aumid);

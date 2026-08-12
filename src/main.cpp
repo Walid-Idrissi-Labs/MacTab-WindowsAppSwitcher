@@ -987,7 +987,7 @@ void ShowTrayMenu(HWND hwnd, POINT screenPt) {
                   IDM_TRAY_RELOAD_HOOK, L"Reload keyboard hook");
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_SETTINGS, L"Open settings.ini");
-    ::AppendMenuW(menu, MF_STRING, IDM_TRAY_RELOAD_GLASS, L"Reload glass from settings.ini");
+    ::AppendMenuW(menu, MF_STRING, IDM_TRAY_RELOAD_GLASS, L"Reload settings.ini");
 
     // Disabled for the same reason the uninstall item is: a settings file that
     // was never created is a case worth explaining rather than a menu item that
@@ -1061,6 +1061,19 @@ void OpenSettingsFile(HWND owner) {
 void ReloadGlassFromSettings() {
     config::ReloadGlass();
     g_app.mission.InvalidateBackdrop();
+}
+
+void ApplySettings();
+
+// The whole file, re-read and put into effect.
+//
+// What saving settings.ini runs, and what the tray item runs. It used to be
+// ReloadGlassFromSettings above, which re-read the material and nothing else, so
+// changing the hold delay or the Mission Control keys in the file did nothing
+// until a restart and looked exactly like a key that does not work.
+void ReloadSettingsFromFile() {
+    config::Reload();
+    ApplySettings();
 }
 
 // Everything the running process took from settings.ini at startup, taken from
@@ -1218,8 +1231,8 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // One-shot: Win32 timers repeat, and this one has nothing to do
             // until the file changes again.
             ::KillTimer(hwnd, kSettingsReloadTimer);
-            MACTAB_DIAG("host: settings.ini changed, reloading the glass");
-            ReloadGlassFromSettings();
+            MACTAB_DIAG("host: settings.ini changed, re-reading it");
+            ReloadSettingsFromFile();
         }
         return 0;
 
@@ -1364,15 +1377,30 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ResetSettingsFile(hwnd);
             return 0;
 
-        case IDM_TRAY_RELOAD_GLASS:
+        case IDM_TRAY_RELOAD_GLASS: {
             // Kept even though saving the file now does this on its own. It is
             // the way to re-read a file that was edited while the watcher was
             // not running, and it is the only one of the two that says out loud
             // that it worked.
-            ReloadGlassFromSettings();
-            g_app.tray.ShowBalloon(L"MacTab",
-                                   L"Glass reloaded. Alt+Tab to see it.");
+            ReloadSettingsFromFile();
+
+            // With the numbers in it, because "reloaded" on its own answers the
+            // wrong question. The one thing somebody tuning by hand cannot tell
+            // is whether the file was read at all or read and ignored, and on
+            // this project nobody can look over their shoulder and see. Two
+            // values are enough to settle it: the blur, and the dark tint's
+            // alpha.
+            wchar_t message[200] = L"";
+            ::swprintf(message, ARRAYSIZE(message),
+                       L"%d glass value%s set in the file. Blur %.4g, dark tint "
+                       L"alpha %.4g. Alt+Tab to see it.",
+                       config::GlassOverrides(),
+                       config::GlassOverrides() == 1 ? L"" : L"s",
+                       static_cast<double>(glass::g_tuning.blurSigma),
+                       static_cast<double>(config::Current().glassDark.tint[3]));
+            g_app.tray.ShowBalloon(L"MacTab", message);
             return 0;
+        }
 
         case IDM_TRAY_DUMP_LIST:
             // M2 verification: what this prints should match what Windows'

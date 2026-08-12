@@ -546,8 +546,14 @@ on a machine nobody here can see.
 
 Tray icon, then *Settings*. Panel display (active window's display, the display
 with the mouse, or always the main display) and appearance (follow Windows,
-light, dark). Both take effect on the next Alt+Tab. *Reload glass from
-settings.ini* is on the main menu and re-reads the material without a restart.
+light, dark). Both take effect on the next Alt+Tab.
+
+Saving `settings.ini` re-reads the whole file and applies it, and *Reload
+settings.ini* on the main menu does the same on demand and reports how many
+glass values it found set, which is the one thing you cannot see from outside
+when an edit looks like it did nothing. Up to 0.9 both of those re-read only
+the material, and only the material's optics ever reached the screen without a
+restart; see the note under *Tuning the glass yourself*.
 
 *Reset settings.ini* is under it, and puts the file back exactly as it ships.
 It asks first, and it keeps what you had as `settings.ini.bak` rather than
@@ -605,9 +611,19 @@ number you have changed makes it worse.
 
 *Open settings.ini* in the tray menu opens the file in whatever the shell has
 associated with `.ini` (Notepad on a machine with no override). Saving it
-re-reads the material on its own; *Reload glass from settings.ini* does the
-same from the menu and says out loud that it worked. *Reset settings.ini* is
-the way back.
+re-reads the file on its own; *Reload settings.ini* does the same from the menu
+and reports what it found. *Reset settings.ini* is the way back.
+
+Until 0.9 this did not work, and it is worth being precise about why, because
+the file was documented as tunable for four releases while most of it was not.
+The panel copies the material into its own theme, and that copy was only
+refreshed when Windows switched between light and dark. Reloading changed the
+numbers in the settings and nothing else, so the six shared `Glass*` optics,
+which are read at draw time, took effect, and all thirty-six `GlassDark*` and
+`GlassLight*` values did nothing at all until MacTab was restarted. Both the
+save and the menu item also re-read only the material, so every key outside it
+needed a restart too. The theme is now rebuilt on every gesture and the whole
+file is re-read on every save.
 
 Shared by both appearances, in logical pixels at 100% scaling:
 

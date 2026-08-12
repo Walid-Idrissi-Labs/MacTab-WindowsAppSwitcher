@@ -18,6 +18,9 @@ Settings     g_settings;
 std::wstring g_settingsPath;
 std::wstring g_themesDir;
 
+// How many glass values the last read took out of the file. See ReadGlass.
+int g_glassOverrides = 0;
+
 // Everything above the glass section, which is generated. See DefaultIni().
 const wchar_t* kDefaultIniHead =
     L"; MacTab settings. Delete this file to restore defaults, or use Reset\r\n"
@@ -120,11 +123,50 @@ const wchar_t* kDefaultIniBody =
     L"MissionThumbnails=auto\r\n"
     L"\r\n";
 
+// Throw away whatever the profile APIs are holding for this file.
+//
+// GetPrivateProfileString does not go to disk every time: the system keeps the
+// most recently used ini mapping cached, and a file edited by another process
+// after we have read it can go on being served from that cache. That is the
+// exact shape of this program's tuning loop, where Notepad writes the file and
+// MacTab re-reads it seconds later inside the same session, so a stale read here
+// would look precisely like a key that does nothing.
+//
+// Passing three nulls is the documented way to flush it. It writes no key and
+// creates no file; on a path that does not exist it fails and there is nothing
+// to flush anyway.
+void FlushIniCache() {
+    if (g_settingsPath.empty()) return;
+    ::WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_settingsPath.c_str());
+}
+
 std::wstring ReadString(const wchar_t* key, const wchar_t* fallback) {
     wchar_t buffer[128] = L"";
     ::GetPrivateProfileStringW(kSection, key, fallback, buffer, ARRAYSIZE(buffer),
                                g_settingsPath.c_str());
     return buffer;
+}
+
+// The same, for a key whose value is one of a fixed set of words.
+//
+// Lowercased and trimmed, because every reader of these compares against a
+// lowercase literal: Theme=Dark and PanelDisplay=Main silently fell through to
+// the default, which from the outside is a setting that does nothing. Key names
+// are already case-insensitive in the profile APIs, so a file where the key
+// tolerates any casing and the value does not is a trap of our own making.
+std::wstring ReadKeyword(const wchar_t* key, const wchar_t* fallback) {
+    std::wstring value = ReadString(key, fallback);
+
+    if (const size_t comment = value.find_first_of(L";#"); comment != std::wstring::npos)
+        value.erase(comment);
+
+    while (!value.empty() && (value.back() == L' ' || value.back() == L'\t'))
+        value.pop_back();
+
+    for (wchar_t& c : value) {
+        if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c + 32);
+    }
+    return value;
 }
 
 // Settings whose SHIPPED default has changed, in a file that was written before
@@ -220,6 +262,14 @@ bool ReadFloat(const wchar_t* key, float& out) {
                                g_settingsPath.c_str());
     if (buffer[0] == L'\0') return false;
 
+    // A comment after the value. The profile APIs only treat a semicolon as a
+    // comment at the start of a line, so "0.03 ; was 0.06" arrives here whole,
+    // and a file that ships every default as a commented line invites exactly
+    // that note being left behind on the copy. Cut it off rather than refuse the
+    // line: the number in front of it is unambiguous.
+    if (wchar_t* comment = ::wcspbrk(buffer, L";#"))
+        *comment = L'\0';
+
     // A comma where the decimal point should be, which is what most of Europe
     // types without thinking about it. wcstod works in the C locale here, so it
     // would stop at the comma, hand back the whole-number part and report a
@@ -289,6 +339,14 @@ void ReadGlass() {
         for (const glass::Field& f : glass::kFields) apply(t, f.name);
         for (const glass::TintField& f : glass::kTintFields) apply(t, f.name);
     }
+
+    // Kept, not just logged. The tray's reload reports it, because the question
+    // somebody whose edit appeared to do nothing actually has is whether the
+    // file was read at all, and a count of the values taken out of it answers
+    // that in one number. Zero after an edit means the line is still commented
+    // out or misspelt, which is the likeliest thing to have gone wrong and the
+    // hardest to see when the file is full of commented lines by design.
+    g_glassOverrides = overrides;
 
     if (overrides > 0) {
         MACTAB_DIAG("config: %d glass override%s from settings.ini", overrides,
@@ -377,16 +435,21 @@ bool ReadIniUtf16(std::wstring& out) {
 // Comments only. Not a single value in the file changes, and a key the user has
 // set is not touched even when the block below documents a different default for
 // it, which is exactly the rule the version stamp exists to keep.
-void AppendGlassSection() {
+//
+// Returns false only when the section is still missing afterwards, which is what
+// decides whether the version is stamped: a file that was locked by an editor or
+// re-saved as UTF-8 is a case to try again on the next run, not one to record as
+// done. Already having the section counts as success.
+bool AppendGlassSection() {
     std::wstring existing;
     if (!ReadIniUtf16(existing)) {
         MACTAB_WARN("config: settings.ini is not UTF-16, leaving it alone. "
                     "Reset settings.ini from the tray menu to get the glass section");
-        return;
+        return false;
     }
 
     // Belt and braces against a file that has the section but lost its stamp.
-    if (existing.find(glass::kIniMarker) != std::wstring::npos) return;
+    if (existing.find(glass::kIniMarker) != std::wstring::npos) return true;
 
     std::wstring block;
     if (!existing.empty() && existing.back() != L'\n') block += L"\r\n";
@@ -399,13 +462,18 @@ void AppendGlassSection() {
     if (!file || file.get() == INVALID_HANDLE_VALUE) {
         MACTAB_WARN("config: could not append the glass section (err %lu)",
                     ::GetLastError());
-        return;
+        return false;
     }
 
     DWORD written = 0;
-    if (::WriteFile(file.get(), block.data(),
-                    static_cast<DWORD>(block.size() * sizeof(wchar_t)), &written, nullptr))
-        MACTAB_DIAG("config: glass section added to settings.ini");
+    if (!::WriteFile(file.get(), block.data(),
+                     static_cast<DWORD>(block.size() * sizeof(wchar_t)), &written, nullptr)) {
+        MACTAB_WARN("config: writing the glass section failed (err %lu)", ::GetLastError());
+        return false;
+    }
+
+    MACTAB_DIAG("config: glass section added to settings.ini");
+    return true;
 }
 
 void Migrate() {
@@ -453,19 +521,19 @@ void ReadSettings() {
         (std::max)(0, (std::min)(2000, ReadInt(L"RevealDelayMs", 180))));
     g_settings.leftAltOnly = ReadInt(L"LeftAltOnly", 1) != 0;
     g_settings.tileSize    = (std::max)(48, (std::min)(256, ReadInt(L"TileSize", 128)));
-    g_settings.theme       = ReadString(L"Theme", L"auto");
+    g_settings.theme       = ReadKeyword(L"Theme", L"auto");
     g_settings.groupByApp  = ReadInt(L"GroupByApp", 1) != 0;
-    g_settings.panelDisplay = ParsePanelDisplay(ReadString(L"PanelDisplay", L"active"));
+    g_settings.panelDisplay = ParsePanelDisplay(ReadKeyword(L"PanelDisplay", L"active"));
     g_settings.glassRefraction = ReadInt(L"GlassRefraction", 1) != 0;
     g_settings.glassRimTap     = ReadInt(L"GlassRimTap", 1) != 0;
 
     g_settings.missionEnabled    = ReadInt(L"MissionEnabled", 0) != 0;
-    g_settings.missionGesture    = ReadString(L"MissionGesture", L"wintab");
+    g_settings.missionGesture    = ReadKeyword(L"MissionGesture", L"wintab");
     g_settings.missionGroupByApp = ReadInt(L"MissionGroupByApp", 1) != 0;
     g_settings.missionSharpPreviews = ReadInt(L"MissionSharpPreviews", 1) != 0;
     g_settings.missionRevealMs   = static_cast<UINT>(
         (std::max)(0, (std::min)(2000, ReadInt(L"MissionRevealMs", 260))));
-    g_settings.missionThumbnails = ReadString(L"MissionThumbnails", L"auto");
+    g_settings.missionThumbnails = ReadKeyword(L"MissionThumbnails", L"auto");
 
     g_settings.missionGap        = 26.0f;
     g_settings.missionFan        = 30.0f;
@@ -514,7 +582,14 @@ const Settings& Current() { return g_settings; }
 
 void ReloadGlass() {
     if (g_settingsPath.empty()) return;
+    FlushIniCache();
     ReadGlass();
+}
+
+void Reload() {
+    if (g_settingsPath.empty()) return;
+    FlushIniCache();
+    ReadSettings();
 }
 
 void Load() {
@@ -535,6 +610,11 @@ void Load() {
     ::SHCreateDirectoryExW(nullptr, g_themesDir.c_str(), nullptr);
 
     Migrate();
+
+    // Both the first-run write and the migration's append go through raw file
+    // writes rather than the profile APIs, so anything those APIs cached while
+    // Migrate was reading the old file is stale by now.
+    FlushIniCache();
     ReadSettings();
 }
 
@@ -565,6 +645,7 @@ bool ResetSettings() {
 
     // Deliberately not Load(): the themes directory string is read by the icon
     // worker on its own thread, and it has not changed anyway.
+    FlushIniCache();
     ReadSettings();
     MACTAB_DIAG("config: settings.ini reset to defaults, old file kept as .bak");
     return true;
@@ -716,6 +797,8 @@ bool SetAutostart(bool enabled) {
 const std::wstring& ThemesDir() { return g_themesDir; }
 
 const std::wstring& SettingsPath() { return g_settingsPath; }
+
+int GlassOverrides() { return g_glassOverrides; }
 
 Bitmap LoadThemeOverride(const std::wstring& exePath, const std::wstring& aumid) {
     if (g_themesDir.empty()) return {};

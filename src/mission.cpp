@@ -2846,15 +2846,20 @@ void Mission::Show(std::vector<MissionItem> items, std::vector<MissionSpace> spa
         impl.items  = std::move(items);
         impl.spaces = std::move(spaces);
 
+        // Re-made every time it opens, not only when the appearance flips, for
+        // the reason in Panel::SetItems: the material inside it comes from
+        // config, and reloading settings.ini changes the material while leaving
+        // the appearance alone. The baked surfaces are dropped on a flip only,
+        // because a reload already drops them through InvalidateBackdrop.
         const bool light = ResolveLightTheme();
         if (light != impl.themeIsLight) {
             impl.themeIsLight = light;
-            impl.theme        = MakeTheme(light);
             for (Impl::Screen& screen : impl.screens) {
                 screen.backdropSurface = nullptr;
                 screen.barGlassSurface = nullptr;
             }
         }
+        impl.theme = MakeTheme(light);
 
         // Move the overlays onto the desktop being shown.
         //
