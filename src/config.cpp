@@ -40,6 +40,11 @@ const wchar_t* kDefaultIniHead =
     L"; auto | dark | light\r\n"
     L"Theme=auto\r\n"
     L"\r\n"
+    L"; The glass itself. 0 gives a plain tinted plate instead: no grab of the\r\n"
+    L"; desktop, no blur, no refraction, nothing showing through. Also in the\r\n"
+    L"; tray menu under Settings.\r\n"
+    L"Glass=1\r\n"
+    L"\r\n"
     L"; How the desktop behind the panel is grabbed, which is what the glass is\r\n"
     L"; made of. If the panel is a flat grey slab with nothing showing through\r\n"
     L"; it, no grab is getting back, and this is the key to try.\r\n"
@@ -536,6 +541,7 @@ void ReadSettings() {
     g_settings.leftAltOnly = ReadInt(L"LeftAltOnly", 1) != 0;
     g_settings.tileSize    = (std::max)(48, (std::min)(256, ReadInt(L"TileSize", 128)));
     g_settings.theme       = ReadKeyword(L"Theme", L"auto");
+    g_settings.glassEnabled  = ReadInt(L"Glass", 1) != 0;
     g_settings.captureSource = ReadKeyword(L"CaptureSource", L"auto");
     g_settings.groupByApp  = ReadInt(L"GroupByApp", 1) != 0;
     g_settings.panelDisplay = ParsePanelDisplay(ReadKeyword(L"PanelDisplay", L"active"));
@@ -702,6 +708,24 @@ bool SetTheme(const wchar_t* value) {
     MACTAB_DIAG("config: theme -> %s (%s)", ToUtf8(value).c_str(),
                 ok ? "saved" : "not saved");
     return ok != FALSE;
+}
+
+bool SetGlassEnabled(bool enabled) {
+    // Applied first, persisted second, for the reason on SetPanelDisplay: a
+    // failed write is a reason to lose the setting at the next launch, not a
+    // reason to ignore what the user just clicked.
+    g_settings.glassEnabled = enabled;
+
+    if (g_settingsPath.empty()) {
+        MACTAB_WARN("config: no settings file, Glass will not survive a restart");
+        return false;
+    }
+
+    const bool ok = ::WritePrivateProfileStringW(kSection, L"Glass",
+                                                 enabled ? L"1" : L"0",
+                                                 g_settingsPath.c_str()) != FALSE;
+    MACTAB_DIAG("config: Glass -> %d (persisted %d)", enabled ? 1 : 0, ok ? 1 : 0);
+    return ok;
 }
 
 bool SetMissionEnabled(bool enabled) {

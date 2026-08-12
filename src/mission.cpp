@@ -1406,7 +1406,9 @@ void Mission::Impl::BakeBarGlass(Screen& screen) {
     glass::Piece piece;
     piece.dc             = dc;
     piece.factory        = d2dFactory.Get();
-    piece.frame          = &backdrop;
+    // Glass off means the bar is the same plain plate the switcher becomes: it
+    // is one material and one switch, not two that can disagree.
+    piece.frame          = config::Current().glassEnabled ? &backdrop : nullptr;
     piece.base           = BarMaterial(themeIsLight);
     piece.dpiScale       = screen.dpiScale;
     piece.cornerExponent = layout::kPanelCornerExponent;

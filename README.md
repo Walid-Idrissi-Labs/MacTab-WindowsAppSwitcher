@@ -546,7 +546,8 @@ on a machine nobody here can see.
 
 Tray icon, then *Settings*. Panel display (active window's display, the display
 with the mouse, or always the main display) and appearance (follow Windows,
-light, dark). Both take effect on the next Alt+Tab.
+light, dark), and *Glass backdrop*, which unchecked gives a plain tinted plate
+instead of the material. All three take effect on the next Alt+Tab.
 
 Saving `settings.ini` re-reads the whole file and applies it, and *Reload
 settings.ini* on the main menu does the same on demand and reports how many
@@ -576,6 +577,7 @@ defaults and comments on first run:
 | `LeftAltOnly` | 1 | Ignore Right Alt and anything with Ctrl held. Keep this on if AltGr types `@ # { } [ ]` on your layout |
 | `TileSize` | 128 | Icon size in logical pixels at 100% scaling |
 | `Theme` | auto | `auto`, `light` or `dark` |
+| `Glass` | 1 | The material itself. 0 gives a plain tinted plate: no grab of the desktop, no blur, no refraction, nothing showing through. Also in the tray menu under *Settings* |
 | `CaptureSource` | auto | How the desktop behind the panel is grabbed: `auto`, `duplication`, `bitblt` or `plain`. **If the panel is a flat grey slab, this is the key to try**, in the order `plain`, `bitblt`, `duplication` |
 | `GroupByApp` | 1 | 0 gives one tile per window instead of one per application |
 | `PanelDisplay` | active | `active`, `mouse` or `main` |
@@ -615,7 +617,14 @@ associated with `.ini` (Notepad on a machine with no override). Saving it
 re-reads the file on its own; *Reload settings.ini* does the same from the menu
 and reports what it found. *Reset settings.ini* is the way back.
 
-**If the panel is a flat grey slab, do not tune anything yet.** It means the
+If you would rather not have the glass at all, `Glass=0` or the *Glass backdrop*
+item in the tray gives the plain plate deliberately, and skips the desktop grab
+entirely so the gesture costs nothing. It draws through the same path the
+material already falls back to when there is no picture of the desktop to be
+had, so it cannot drift from the version people actually use.
+
+**If the panel is a flat grey slab and you did NOT ask for that, do not tune
+anything yet.** It means the
 panel has no picture of the desktop behind it, so it is drawing a coat that is
 96% opaque and there is nothing there for any of these numbers to act on. MacTab
 now says so with a balloon the first time it happens in a session, and

@@ -36,6 +36,20 @@ struct Settings {
     // "auto" follows the system app theme; "dark" and "light" pin it.
     std::wstring theme = L"auto";
 
+    // The glass at all.
+    //
+    // Off means the panel is a plain tinted plate: no grab of the desktop, no
+    // blur, no refraction, no lit rim reading its backdrop. It is the same coat
+    // the material already falls back to when there is no picture of the desktop
+    // to be had, so it is a path that has always existed and is now reachable on
+    // purpose rather than only by failure.
+    //
+    // On by default, obviously. It is the product. But a switcher that is
+    // legible and costs nothing is a reasonable thing to want on a machine where
+    // the glass is slow, wrong, or simply not to taste, and until now the only
+    // way to get it was for the capture to fail.
+    bool glassEnabled = true;
+
     // How the desktop behind the panel is grabbed: "auto", "duplication",
     // "bitblt" or "plain".
     //
@@ -217,6 +231,12 @@ bool SetTheme(const wchar_t* value);
 // Turn Mission Control on or off and persist it. Same in-place single-key
 // write as the two above, and for the same reasons.
 bool SetMissionEnabled(bool enabled);
+
+// Turn the glass on or off and persist it. Same mechanism again.
+//
+// Takes effect on the next gesture: the panel decides whether to grab the
+// desktop when the gesture starts, so there is nothing to rebuild here.
+bool SetGlassEnabled(bool enabled);
 
 // --- Uninstall --------------------------------------------------------------
 //

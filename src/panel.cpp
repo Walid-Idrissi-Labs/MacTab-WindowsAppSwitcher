@@ -617,6 +617,21 @@ void Panel::Impl::RecoverDevices() {
 // own destructor until the task completes, which would reintroduce exactly the
 // stall this exists to avoid whenever a capture is abandoned.
 void Panel::Impl::StartCapture() {
+    // Glass off: nothing to grab.
+    //
+    // Everything downstream already handles having no frame, because that is the
+    // path a failed capture takes, and it draws the plate the material falls
+    // back to. So switching the glass off is not a second way of drawing the
+    // panel, it is the absence of the first one, which is the only version of
+    // this that cannot drift from the version people actually use.
+    //
+    // It also means the gesture costs nothing: no D3D device, no duplication, no
+    // screen copy, no blur.
+    if (!config::Current().glassEnabled) {
+        MACTAB_DIAG("panel: glass is off, drawing the plain plate");
+        return;
+    }
+
     const int margin = static_cast<int>(MarginPx(dpiScale));
 
     // Asymmetric at the bottom, because the app name's capsule lives down there

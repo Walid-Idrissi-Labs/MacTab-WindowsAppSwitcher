@@ -348,6 +348,13 @@ void CancelGesture(WORD altVirtualKey) {
 // CaptureSource in settings.ini is the thing to try.
 void ReportFlatPanel() {
     if (g_app.reportedFlatPanel) return;
+
+    // Not when the plate is what was asked for. The whole point of this balloon
+    // is to name a failure, and telling somebody who switched the glass off that
+    // the glass is off would be noise at best and would read as a fault at
+    // worst.
+    if (!config::Current().glassEnabled) return;
+
     if (!g_app.panel.BackdropIsFlat()) return;
 
     g_app.reportedFlatPanel = true;
@@ -988,6 +995,13 @@ HMENU CreateSettingsMenu() {
                          checkedTheme, MF_BYCOMMAND);
 
     ::AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
+
+    // The material itself. Unchecked gives the plain tinted plate, which is the
+    // same one the panel falls back to when it cannot see the desktop.
+    ::AppendMenuW(settings, MF_STRING | (config::Current().glassEnabled ? MF_CHECKED : 0u),
+                  IDM_TRAY_GLASS, L"Glass backdrop");
+
+    ::AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
     // Named after the chord that is actually configured, so somebody who has set
     // MissionGesture is not told about a key that no longer opens anything.
     std::wstring missionLabel = L"Mission Control on ";
@@ -1377,6 +1391,20 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             message += (enabled && ready) ? L" now opens Mission Control."
                                           : L" left to Windows.";
             g_app.tray.ShowBalloon(L"MacTab", message.c_str());
+            return 0;
+        }
+
+        case IDM_TRAY_GLASS: {
+            // Next gesture, like the display and appearance items above it: the
+            // panel decides whether to grab the desktop when the gesture starts,
+            // so there is nothing to rebuild here. Mission Control's bar is
+            // baked and kept, so that one does have to be thrown away.
+            const bool glass = !config::Current().glassEnabled;
+            config::SetGlassEnabled(glass);
+            g_app.mission.InvalidateBackdrop();
+            g_app.tray.ShowBalloon(L"MacTab",
+                                   glass ? L"Glass on. Alt+Tab to see it."
+                                         : L"Glass off. The panel is a plain plate now.");
             return 0;
         }
 
