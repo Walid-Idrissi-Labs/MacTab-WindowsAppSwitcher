@@ -549,6 +549,13 @@ with the mouse, or always the main display) and appearance (follow Windows,
 light, dark). Both take effect on the next Alt+Tab. *Reload glass from
 settings.ini* is on the main menu and re-reads the material without a restart.
 
+*Reset settings.ini* is under it, and puts the file back exactly as it ships.
+It asks first, and it keeps what you had as `settings.ini.bak` rather than
+throwing it away; if that copy cannot be written it does nothing at all, since
+the file being replaced is the only record of whatever tuning is being
+abandoned. Everything the running process took from the file is re-applied on
+the spot, so there is nothing to restart.
+
 *Uninstall MacTab* is in the same menu, below Settings. It runs the installer's
 own uninstaller, and is greyed out when MacTab is running as a standalone
 executable rather than an installed copy.
@@ -558,7 +565,7 @@ defaults and comments on first run:
 
 | Key | Default | |
 |---|---|---|
-| `SettingsVersion` | 2 | Written by MacTab so it knows which defaults a file predates. It never overwrites a value you have changed yourself |
+| `SettingsVersion` | 3 | Written by MacTab so it knows which defaults a file predates. It never overwrites a value you have changed yourself |
 | `RevealDelayMs` | 180 | How long Alt must be held before the panel appears |
 | `LeftAltOnly` | 1 | Ignore Right Alt and anything with Ctrl held. Keep this on if AltGr types `@ # { } [ ]` on your layout |
 | `TileSize` | 128 | Icon size in logical pixels at 100% scaling |
@@ -581,11 +588,26 @@ defaults and comments on first run:
 
 ### Tuning the glass yourself
 
-Every number in the material is a key in the same file. *Open settings.ini* in
-the tray menu opens it in whatever the shell has associated with `.ini`
-(Notepad on a machine with no override); *Reload glass from settings.ini*
-re-reads it without a restart. Nothing is written there by default: leave a
-key out and the shipped value stands.
+Every number in the material is a key in the same file, and every one of them
+is written into it, commented out, holding the value this build ships with:
+
+```ini
+; How soft the backdrop goes. The single most decisive number in the
+; material: it decides whether you can see the desktop through the panel
+; or only that something is behind it. Range 0 to 60.
+;GlassBlurSigma=8
+```
+
+To change one, copy the line, take the semicolon off the copy and edit that.
+The original stays above it, so what you are trying always sits next to the
+default it replaced, which is the thing you actually want when the fourth
+number you have changed makes it worse.
+
+*Open settings.ini* in the tray menu opens the file in whatever the shell has
+associated with `.ini` (Notepad on a machine with no override). Saving it
+re-reads the material on its own; *Reload glass from settings.ini* does the
+same from the menu and says out loud that it worked. *Reset settings.ini* is
+the way back.
 
 Shared by both appearances, in logical pixels at 100% scaling:
 
@@ -604,7 +626,17 @@ Per appearance, prefixed `GlassDark` or `GlassLight`: `Saturation`, `Gain`,
 `KneeBelow`, `KneeAbove`, `FallbackAlpha`. So `GlassDarkTintA=0.03` thins the
 dark tint further than the 0.06 it already ships at. Values are clamped to
 ranges the rest of the material was designed inside, and out-of-range or
-unparseable ones are logged rather than ignored silently.
+unparseable ones are logged rather than ignored silently. A comma typed where
+the decimal point goes is read as a decimal point rather than as the end of the
+number, which is what it would otherwise be on a French keyboard.
+
+That table is not maintained by hand any more, and neither is the file: both
+come from the one table of names, ranges and defaults in
+[`src/glass_tune.h`](src/glass_tune.h). `GlassDepth` is the reason it works
+that way. It has been documented here and in the shipped settings file since
+the keys existed, and until 0.8.4 the code looked for `GlassGlassDepth`, so the
+one number in the material anybody was likely to try changing by hand was the
+one key that did nothing.
 
 This exists because of the constraint at the top of this file: MacTab is written
 on a Mac and cannot be run there, so the only person who can see the glass is
@@ -623,6 +655,12 @@ the reference, and shipped as a default if it holds up. One table of names in
 [`src/glass_tune.h`](src/glass_tune.h) drives both sides, so they cannot drift.
 `--diag` logs the material every run, which means a screenshot arrives with the
 numbers that produced it.
+
+The preview also generates the settings file's glass section and reads every
+line of it back through the same parser the running program uses, checking that
+each one reproduces the shipped value exactly. A comment claiming a default the
+binary does not hold is worse than no comment, because somebody would tune
+against it, and this is a program whose author cannot run it.
 
 Drop a PNG into `%LOCALAPPDATA%\MacTab\themes\` named after an executable
 (`chrome.png`, `code.png`) to override that app's generated tile. Some icons will
