@@ -1338,7 +1338,16 @@ void Panel::Impl::PositionTiles(bool animate) {
 
         const WFN::float3 destination{ x, padding - inset, 0.0f };
 
-        if (animate) {
+        // `animate` is false when the panel is being built, where there is no
+        // previous position to travel from; the setting is what decides whether
+        // moving the selection travels at all.
+        //
+        // Worth having as a switch rather than only as taste. A spring is 50 ms
+        // of the highlight not yet being where the keystroke put it, and somebody
+        // who presses Tab four times quickly is reading a highlight that is
+        // always one step behind their fingers. Instant is the honest answer for
+        // that, and it is what every switcher before this one did.
+        if (animate && config::Current().selectionAnimation) {
             // A spring rather than a keyframe curve: the highlight overshoots
             // very slightly and settles, which is what makes macOS's selection
             // feel physical instead of mechanical.
@@ -1348,6 +1357,9 @@ void Panel::Impl::PositionTiles(bool animate) {
             spring.FinalValue(destination);
             selectionVisual.StartAnimation(L"Offset", spring);
         } else {
+            // Any spring still running has to be stopped, or it goes on settling
+            // toward the offset it was given and undoes this one a frame later.
+            selectionVisual.StopAnimation(L"Offset");
             selectionVisual.Offset(destination);
         }
     }

@@ -36,6 +36,16 @@ struct Settings {
     // "auto" follows the system app theme; "dark" and "light" pin it.
     std::wstring theme = L"auto";
 
+    // Whether the selection highlight travels to the tile you have moved to, or
+    // is simply there.
+    //
+    // On by default: the spring settling into place is a large part of why the
+    // panel feels like macOS rather than like a list with a box on it. Off is a
+    // real preference and not only a performance one, since 50 ms of travel is
+    // 50 ms in which the highlight is not yet where the keystroke put it, and
+    // that is visible to anybody who taps Tab faster than it can arrive.
+    bool selectionAnimation = true;
+
     // The glass at all.
     //
     // Off means the panel is a plain tinted plate: no grab of the desktop, no
@@ -233,6 +243,12 @@ bool SetTheme(const wchar_t* value);
 // Turn Mission Control on or off and persist it. Same in-place single-key
 // write as the two above, and for the same reasons.
 bool SetMissionEnabled(bool enabled);
+
+// Turn the selection animation on or off and persist it.
+//
+// Takes effect on the very next keystroke, not the next gesture: the panel reads
+// this where it moves the highlight.
+bool SetSelectionAnimation(bool enabled);
 
 // Turn the glass on or off and persist it. Same mechanism again.
 //

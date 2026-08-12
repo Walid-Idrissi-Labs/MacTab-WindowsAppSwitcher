@@ -546,9 +546,11 @@ on a machine nobody here can see.
 
 Tray icon, then *Settings*. Panel display (active window's display, the display
 with the mouse, or always the main display) and appearance (follow Windows,
-light, dark), and *Glass backdrop*, which is **off by default** and is what
-turns the material on: unchecked, the panel is a plain tinted plate. All three
-take effect on the next Alt+Tab.
+light, dark), *Glass backdrop*, which is **off by default** and is what turns the
+material on, and *Animate the selection*, which is on and springs the highlight
+across as you move. The first three take effect on the next Alt+Tab; the
+animation one applies to the very next keystroke, including inside a hold that is
+already in progress.
 
 Saving `settings.ini` re-reads the whole file and applies it, and *Reload
 settings.ini* on the main menu does the same on demand and reports how many
@@ -578,6 +580,7 @@ defaults and comments on first run:
 | `LeftAltOnly` | 1 | Ignore Right Alt and anything with Ctrl held. Keep this on if AltGr types `@ # { } [ ]` on your layout |
 | `TileSize` | 128 | Icon size in logical pixels at 100% scaling |
 | `Theme` | auto | `auto`, `light` or `dark` |
+| `SelectionAnimation` | 1 | 1 springs the selection highlight across to the tile you moved to. 0 puts it there with no travel. Also in the tray menu under *Settings* |
 | `Glass` | 0 | The material itself, **off by default**. The panel is a plain tinted plate: no grab of the desktop, no blur, no refraction. 1 turns the glass on, as does *Glass backdrop* in the tray menu under *Settings* |
 | `CaptureSource` | auto | How the desktop behind the panel is grabbed: `auto`, `duplication`, `bitblt` or `plain`. **If the panel is a flat grey slab, this is the key to try**, in the order `plain`, `bitblt`, `duplication` |
 | `GroupByApp` | 1 | 0 gives one tile per window instead of one per application |

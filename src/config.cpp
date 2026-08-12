@@ -40,6 +40,11 @@ const wchar_t* kDefaultIniHead =
     L"; auto | dark | light\r\n"
     L"Theme=auto\r\n"
     L"\r\n"
+    L"; 1 = the selection highlight springs across to the tile you moved to.\r\n"
+    L"; 0 = it is simply there, with no travel. Also in the tray menu under\r\n"
+    L"; Settings.\r\n"
+    L"SelectionAnimation=1\r\n"
+    L"\r\n"
     L"; The glass itself. Off by default: the panel is a plain tinted plate,\r\n"
     L"; with no grab of the desktop, no blur and no refraction, which is\r\n"
     L"; legible everywhere and costs nothing. 1 turns the material on. Also in\r\n"
@@ -544,6 +549,7 @@ void ReadSettings() {
     g_settings.tileSize    = (std::max)(48, (std::min)(256, ReadInt(L"TileSize", 128)));
     g_settings.theme       = ReadKeyword(L"Theme", L"auto");
     g_settings.glassEnabled  = ReadInt(L"Glass", 0) != 0;
+    g_settings.selectionAnimation = ReadInt(L"SelectionAnimation", 1) != 0;
     g_settings.captureSource = ReadKeyword(L"CaptureSource", L"auto");
     g_settings.groupByApp  = ReadInt(L"GroupByApp", 1) != 0;
     g_settings.panelDisplay = ParsePanelDisplay(ReadKeyword(L"PanelDisplay", L"active"));
@@ -710,6 +716,23 @@ bool SetTheme(const wchar_t* value) {
     MACTAB_DIAG("config: theme -> %s (%s)", ToUtf8(value).c_str(),
                 ok ? "saved" : "not saved");
     return ok != FALSE;
+}
+
+bool SetSelectionAnimation(bool enabled) {
+    g_settings.selectionAnimation = enabled;   // applied first, see SetPanelDisplay
+
+    if (g_settingsPath.empty()) {
+        MACTAB_WARN("config: no settings file, SelectionAnimation will not survive "
+                    "a restart");
+        return false;
+    }
+
+    const bool ok = ::WritePrivateProfileStringW(kSection, L"SelectionAnimation",
+                                                 enabled ? L"1" : L"0",
+                                                 g_settingsPath.c_str()) != FALSE;
+    MACTAB_DIAG("config: SelectionAnimation -> %d (persisted %d)",
+                enabled ? 1 : 0, ok ? 1 : 0);
+    return ok;
 }
 
 bool SetGlassEnabled(bool enabled) {

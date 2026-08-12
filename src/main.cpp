@@ -1001,6 +1001,9 @@ HMENU CreateSettingsMenu() {
     ::AppendMenuW(settings, MF_STRING | (config::Current().glassEnabled ? MF_CHECKED : 0u),
                   IDM_TRAY_GLASS, L"Glass backdrop");
 
+    ::AppendMenuW(settings, MF_STRING | (config::Current().selectionAnimation ? MF_CHECKED : 0u),
+                  IDM_TRAY_SELECTION_ANIM, L"Animate the selection");
+
     ::AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
     // Named after the chord that is actually configured, so somebody who has set
     // MissionGesture is not told about a key that no longer opens anything.
@@ -1391,6 +1394,18 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             message += (enabled && ready) ? L" now opens Mission Control."
                                           : L" left to Windows.";
             g_app.tray.ShowBalloon(L"MacTab", message.c_str());
+            return 0;
+        }
+
+        case IDM_TRAY_SELECTION_ANIM: {
+            // The next keystroke, not the next gesture: the panel reads this
+            // where it moves the highlight, so it applies inside a hold that is
+            // already in progress.
+            const bool animate = !config::Current().selectionAnimation;
+            config::SetSelectionAnimation(animate);
+            g_app.tray.ShowBalloon(L"MacTab",
+                                   animate ? L"The selection springs across again."
+                                           : L"The selection moves without animating.");
             return 0;
         }
 
