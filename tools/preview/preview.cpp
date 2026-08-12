@@ -1654,6 +1654,103 @@ void RunSelfChecks() {
         Check(std::abs(tileLuma - glyphLuma) >= 50,
               "generated tile contrasts with the glyph on it");
     }
+
+    // The glass section of settings.ini, which is generated from the same tables
+    // this file tunes against.
+    //
+    // This is the one check here that is not about pixels, and it earns its
+    // place for the reason everything else in this file does: the person writing
+    // MacTab cannot run it. That file is now the interface for tuning the
+    // material by hand, and a generated comment claiming a default the binary
+    // does not hold would send somebody tuning against a number that was never
+    // there. So the block is generated, parsed back through the same names the
+    // running program parses it with, and the result has to be the shipped
+    // material exactly.
+    {
+        const std::wstring block = glass::IniBlock();
+        Check(block.find(glass::kIniMarker) != std::wstring::npos,
+              "the generated ini block carries the marker the migration looks for");
+
+        glass::Tuning optics{};
+        glass::Params dark  = glass::kDark;
+        glass::Params light = glass::kLight;
+
+        // Everything is written commented out, so nothing in the block can be a
+        // live key: a file that set values would freeze this release's defaults
+        // on every machine that has it.
+        int keys = 0;
+        bool live = false;
+        for (size_t at = 0; at < block.size();) {
+            const size_t end = block.find(L'\n', at);
+            std::wstring line = block.substr(at, end == std::wstring::npos ? end : end - at);
+            at = (end == std::wstring::npos) ? block.size() : end + 1;
+
+            while (!line.empty() && (line.back() == L'\r' || line.back() == L' '))
+                line.pop_back();
+
+            const size_t equals = line.find(L'=');
+            if (equals == std::wstring::npos) continue;
+            if (line.compare(0, 1, L";") != 0) { live = true; continue; }
+
+            // ";GlassDarkTintA=0.06" -> prefix, name, value.
+            std::string name;
+            for (size_t i = 1; i < equals; ++i) name.push_back(static_cast<char>(line[i]));
+            const double value = std::wcstod(line.c_str() + equals + 1, nullptr);
+
+            // Each line is applied over a fresh copy of the shipped material and
+            // then compared back against it, so a value that came out of the
+            // formatter rounded, truncated or empty fails rather than agreeing
+            // with a default that was simply never overwritten.
+            bool applied = false;
+            if (name.rfind("GlassDark", 0) == 0) {
+                dark = glass::kDark;
+                applied = glass::SetField(dark, name.c_str() + 9,
+                                          static_cast<float>(value));
+                float shipped = 0.0f;
+                if (applied && glass::GetField(glass::kDark, name.c_str() + 9, shipped)) {
+                    float got = 0.0f;
+                    glass::GetField(dark, name.c_str() + 9, got);
+                    Check(std::fabs(got - shipped) < 1e-6f,
+                          "a dark default in settings.ini reads back as the shipped value");
+                }
+            } else if (name.rfind("GlassLight", 0) == 0) {
+                light = glass::kLight;
+                applied = glass::SetField(light, name.c_str() + 10,
+                                          static_cast<float>(value));
+                float shipped = 0.0f;
+                if (applied && glass::GetField(glass::kLight, name.c_str() + 10, shipped)) {
+                    float got = 0.0f;
+                    glass::GetField(light, name.c_str() + 10, got);
+                    Check(std::fabs(got - shipped) < 1e-6f,
+                          "a light default in settings.ini reads back as the shipped value");
+                }
+            } else if (name.rfind("Glass", 0) == 0) {
+                applied = glass::SetOptic(optics, name.c_str() + 5,
+                                          static_cast<float>(value));
+                float shipped = 0.0f;
+                if (applied && glass::GetOptic(glass::Tuning{}, name.c_str() + 5, shipped)) {
+                    float got = 0.0f;
+                    glass::GetOptic(optics, name.c_str() + 5, got);
+                    Check(std::fabs(got - shipped) < 1e-6f,
+                          "an optics default in settings.ini reads back as the shipped value");
+                }
+            }
+
+            Check(applied, "every key in the generated block is a name the parser knows");
+            ++keys;
+        }
+
+        Check(!live, "nothing in the generated block is a live key");
+
+        // One line per optic, and one dark plus one light for every field and
+        // every channel of the tint. A field added to Params but forgotten in
+        // the table fails here rather than in a screenshot months later.
+        const size_t expected =
+            std::size(glass::kOpticsFields) +
+            2 * (std::size(glass::kFields) + std::size(glass::kTintFields));
+        Check(static_cast<size_t>(keys) == expected,
+              "the block documents every name in the tables and nothing else");
+    }
 }
 
 // --set dark.gain=0.74, --set light.tinta=0.06, --set blursigma=5

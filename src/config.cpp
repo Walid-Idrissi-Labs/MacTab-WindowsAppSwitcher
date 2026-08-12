@@ -18,8 +18,10 @@ Settings     g_settings;
 std::wstring g_settingsPath;
 std::wstring g_themesDir;
 
-const wchar_t* kDefaultIni =
-    L"; MacTab settings. Delete this file to restore defaults.\r\n"
+// Everything above the glass section, which is generated. See DefaultIni().
+const wchar_t* kDefaultIniHead =
+    L"; MacTab settings. Delete this file to restore defaults, or use Reset\r\n"
+    L"; settings.ini in the tray menu, which keeps a copy of the old one.\r\n"
     L"[MacTab]\r\n"
     L"; Milliseconds Alt must be held before the panel appears. A quicker tap\r\n"
     L"; switches to the previous app without showing anything, like macOS.\r\n"
@@ -57,7 +59,10 @@ const wchar_t* kDefaultIni =
     L"\r\n"
     L"; Written by MacTab so it knows which defaults this file predates. Leave it\r\n"
     L"; alone; it never overwrites a value you have changed yourself.\r\n"
-    L"SettingsVersion=2\r\n"
+    L"SettingsVersion=";   // the number itself is appended from kSettingsVersion
+
+const wchar_t* kDefaultIniBody =
+    L"\r\n"
     L"\r\n"
     L"; --- Mission Control -------------------------------------------------\r\n"
     L";\r\n"
@@ -113,41 +118,7 @@ const wchar_t* kDefaultIni =
     L";   icon     no window contents at all, just the app icon on a card\r\n"
     L"; Drop to snapshot if the windows come out blank, misplaced or flickering.\r\n"
     L"MissionThumbnails=auto\r\n"
-    L"\r\n"
-    L"; --- The glass material ---------------------------------------------\r\n"
-    L";\r\n"
-    L"; Every number in the material can be set here, and the tray menu has a\r\n"
-    L"; Reload glass item that re-reads them without restarting. Nothing below\r\n"
-    L"; is written by default: leave a key out and the shipped value stands.\r\n"
-    L";\r\n"
-    L"; This exists because MacTab is written on a Mac and cannot be run there,\r\n"
-    L"; so the only person who can see the glass is you. Change a number, hit\r\n"
-    L"; Reload glass, look. If something looks right, the same names work in\r\n"
-    L"; tools/preview, so the values can be checked and then shipped.\r\n"
-    L";\r\n"
-    L"; Shared by both appearances, in logical pixels:\r\n"
-    L";   GlassBlurSigma=8          how soft the backdrop goes. The big one.\r\n"
-    L";   GlassBezelWidth=14        how far in from the edge the surface curves\r\n"
-    L";   GlassDepth=24             how thick the pane is; drives the bending\r\n"
-    L";   GlassMaxDisplacement=16   ceiling on how far the rim bends anything\r\n"
-    L";   GlassRimSpan=13           how far in the lit edge reaches\r\n"
-    L";\r\n"
-    L"; Per appearance, prefixed GlassDark or GlassLight:\r\n"
-    L";   Saturation    colour push, above 1 boosts\r\n"
-    L";   Gain          how much of the desktop's contrast survives\r\n"
-    L";   Bias          black point lift\r\n"
-    L";   TintR TintG TintB TintA   the tint over the treated backdrop, 0..1\r\n"
-    L";   RimAmbient RimLobe SpecLine   the lit edge, as amounts to add\r\n"
-    L";   RimEnvFloor RimEnvGain    how much the lit edge reflects its backdrop\r\n"
-    L";   RimOuterDark  the dark line on the outermost pixel\r\n"
-    L";   TargetMin TargetMax       where the panel is steered to land\r\n"
-    L";   KneeBelow KneeAbove       how much of an excursion past that survives\r\n"
-    L";   FallbackAlpha the base coat used when the desktop grab fails\r\n"
-    L";\r\n"
-    L"; For example, to see through it more (0.9 already ships TintA at 0.06,\r\n"
-    L"; down from 0.10; this goes further):\r\n"
-    L";   GlassBlurSigma=5\r\n"
-    L";   GlassDarkTintA=0.03\r\n";
+    L"\r\n";
 
 std::wstring ReadString(const wchar_t* key, const wchar_t* fallback) {
     wchar_t buffer[128] = L"";
@@ -168,7 +139,53 @@ std::wstring ReadString(const wchar_t* key, const wchar_t* fallback) {
 //
 // Stamped rather than sniffed, so a value somebody has deliberately set is only
 // ever rewritten once and never again.
-constexpr int kSettingsVersion = 2;
+//
+// 3 adds the generated glass section. A file at 2 has none of it, so the
+// migration appends it: the keys were always readable, but nobody could be
+// expected to know their names from a paragraph of prose that did not list half
+// of them.
+constexpr int kSettingsVersion = 3;
+
+// The whole file as it ships.
+//
+// Assembled rather than stored, because two of its parts must not be typed out
+// by hand: the version stamp, which has to be the number this build migrates to,
+// and the glass section, which is generated from the tables in glass_tune.h so
+// that a default written in the file is the default the binary holds.
+std::wstring DefaultIni() {
+    std::wstring text = kDefaultIniHead;
+    text += std::to_wstring(kSettingsVersion);
+    text += kDefaultIniBody;
+    text += glass::IniBlock();
+    return text;
+}
+
+// Write `text` over the settings file as UTF-16LE with a BOM, which is what the
+// profile APIs write and the only encoding they read back as Unicode.
+//
+// `createNew` is first-run: fail rather than truncate if something is already
+// there, so a file somebody has tuned cannot be lost to a race with a second
+// instance starting.
+bool WriteIni(const std::wstring& text, bool createNew) {
+    const UniqueHandle file(::CreateFileW(g_settingsPath.c_str(), GENERIC_WRITE, 0,
+                                          nullptr, createNew ? CREATE_NEW : CREATE_ALWAYS,
+                                          FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file || file.get() == INVALID_HANDLE_VALUE) {
+        if (!createNew)
+            MACTAB_WARN("config: could not open settings.ini for writing (err %lu)",
+                        ::GetLastError());
+        return false;
+    }
+
+    const wchar_t bom = 0xFEFF;
+    DWORD written = 0;
+    if (!::WriteFile(file.get(), &bom, sizeof(bom), &written, nullptr))
+        return false;
+
+    return ::WriteFile(file.get(), text.data(),
+                       static_cast<DWORD>(text.size() * sizeof(wchar_t)),
+                       &written, nullptr) != FALSE;
+}
 
 int ReadInt(const wchar_t* key, int fallback) {
     return static_cast<int>(::GetPrivateProfileIntW(kSection, key, fallback,
@@ -203,12 +220,34 @@ bool ReadFloat(const wchar_t* key, float& out) {
                                g_settingsPath.c_str());
     if (buffer[0] == L'\0') return false;
 
+    // A comma where the decimal point should be, which is what most of Europe
+    // types without thinking about it. wcstod works in the C locale here, so it
+    // would stop at the comma, hand back the whole-number part and report a
+    // successful parse: 0,45 would arrive as 0. Swapped rather than rejected,
+    // because the number the user meant is unambiguous.
+    for (wchar_t& c : buffer) {
+        if (c == L',') c = L'.';
+    }
+
     wchar_t* end = nullptr;
     const double v = ::wcstod(buffer, &end);
     if (end == buffer) {
         MACTAB_WARN("config: %s is not a number, ignoring", ToUtf8(key).c_str());
         return false;
     }
+
+    // Anything after the number that is not blank means the value was not what
+    // it looked like: 0.5px, 8;comment, 1.2.3. Reported for the same reason the
+    // unparseable case is, since a value quietly reinterpreted is a worse
+    // outcome for somebody tuning by hand than one that says it was wrong.
+    for (const wchar_t* rest = end; *rest; ++rest) {
+        if (*rest != L' ' && *rest != L'\t') {
+            MACTAB_WARN("config: %s has trailing text after the number, ignoring",
+                        ToUtf8(key).c_str());
+            return false;
+        }
+    }
+
     out = static_cast<float>(v);
     return true;
 }
@@ -248,7 +287,7 @@ void ReadGlass() {
 
     for (const ThemeKeys& t : themes) {
         for (const glass::Field& f : glass::kFields) apply(t, f.name);
-        for (const char* n : { "tintr", "tintg", "tintb", "tinta" }) apply(t, n);
+        for (const glass::TintField& f : glass::kTintFields) apply(t, f.name);
     }
 
     if (overrides > 0) {
@@ -301,69 +340,115 @@ std::wstring ThemeName(const std::wstring& exePath, const std::wstring& aumid) {
     return name;
 }
 
-void Migrate() {
-    if (ReadInt(L"SettingsVersion", 1) >= kSettingsVersion) return;
+// The settings file as text, or false if it is not the UTF-16LE the profile APIs
+// write. The BOM is not included in `out`.
+//
+// The encoding check is the whole point of this: the file belongs to the user
+// now, and an editor that re-saved it as UTF-8 or ANSI would turn an appended
+// wide string into a run of interleaved nulls in the middle of their settings.
+bool ReadIniUtf16(std::wstring& out) {
+    const UniqueHandle file(::CreateFileW(g_settingsPath.c_str(), GENERIC_READ,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file || file.get() == INVALID_HANDLE_VALUE) return false;
 
-    // Only the two whose meaning changed, and only when they still hold the
-    // value 0.7 wrote. Anything else is a choice somebody made.
-    wchar_t buffer[64] = L"";
-    ::GetPrivateProfileStringW(kSection, L"MissionBlurSigma", L"", buffer,
-                               ARRAYSIZE(buffer), g_settingsPath.c_str());
-    if (::lstrcmpW(buffer, L"18") == 0)
-        ::WritePrivateProfileStringW(kSection, L"MissionBlurSigma", L"0",
-                                     g_settingsPath.c_str());
+    LARGE_INTEGER size{};
+    if (!::GetFileSizeEx(file.get(), &size)) return false;
 
-    ::GetPrivateProfileStringW(kSection, L"MissionDim", L"", buffer,
-                               ARRAYSIZE(buffer), g_settingsPath.c_str());
-    if (::lstrcmpW(buffer, L"0.55") == 0)
-        ::WritePrivateProfileStringW(kSection, L"MissionDim", L"0.45",
-                                     g_settingsPath.c_str());
+    // Two bytes of BOM and nothing else is an empty file, and anything past a
+    // megabyte is not a settings file this program wrote.
+    if (size.QuadPart < 4 || size.QuadPart > 1024 * 1024) return false;
 
-    ::WritePrivateProfileStringW(kSection, L"SettingsVersion", L"2",
-                                 g_settingsPath.c_str());
-    MACTAB_DIAG("config: settings brought up to version %d", kSettingsVersion);
+    std::vector<wchar_t> buffer(static_cast<size_t>(size.QuadPart) / sizeof(wchar_t));
+    DWORD read = 0;
+    if (!::ReadFile(file.get(), buffer.data(),
+                    static_cast<DWORD>(buffer.size() * sizeof(wchar_t)), &read, nullptr))
+        return false;
+
+    const size_t chars = read / sizeof(wchar_t);
+    if (chars < 2 || buffer[0] != 0xFEFF) return false;
+
+    out.assign(buffer.begin() + 1, buffer.begin() + static_cast<ptrdiff_t>(chars));
+    return true;
 }
 
-} // namespace
-
-const Settings& Current() { return g_settings; }
-
-void ReloadGlass() {
-    if (g_settingsPath.empty()) return;
-    ReadGlass();
-}
-
-void Load() {
-    const std::wstring& dir = AppDataDir();
-    if (dir.empty()) {
-        MACTAB_WARN("config: no app data directory; using built-in defaults");
+// Give a file written before the glass section existed one.
+//
+// Comments only. Not a single value in the file changes, and a key the user has
+// set is not touched even when the block below documents a different default for
+// it, which is exactly the rule the version stamp exists to keep.
+void AppendGlassSection() {
+    std::wstring existing;
+    if (!ReadIniUtf16(existing)) {
+        MACTAB_WARN("config: settings.ini is not UTF-16, leaving it alone. "
+                    "Reset settings.ini from the tray menu to get the glass section");
         return;
     }
 
-    g_settingsPath = dir + L"\\settings.ini";
-    g_themesDir    = dir + L"\\themes";
+    // Belt and braces against a file that has the section but lost its stamp.
+    if (existing.find(glass::kIniMarker) != std::wstring::npos) return;
 
-    // Write the annotated default file on first run so the settings are
-    // discoverable without documentation.
-    if (::GetFileAttributesW(g_settingsPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        const UniqueHandle file(::CreateFileW(g_settingsPath.c_str(), GENERIC_WRITE, 0,
-                                              nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
-                                              nullptr));
-        if (file && file.get() != INVALID_HANDLE_VALUE) {
-            // UTF-16LE with a BOM, which is what the profile APIs write.
-            const wchar_t bom = 0xFEFF;
-            DWORD written = 0;
-            ::WriteFile(file.get(), &bom, sizeof(bom), &written, nullptr);
-            ::WriteFile(file.get(), kDefaultIni,
-                        static_cast<DWORD>(::lstrlenW(kDefaultIni) * sizeof(wchar_t)),
-                        &written, nullptr);
-        }
+    std::wstring block;
+    if (!existing.empty() && existing.back() != L'\n') block += L"\r\n";
+    block += L"\r\n";
+    block += glass::IniBlock();
+
+    const UniqueHandle file(::CreateFileW(g_settingsPath.c_str(), FILE_APPEND_DATA,
+                                          FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                          FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file || file.get() == INVALID_HANDLE_VALUE) {
+        MACTAB_WARN("config: could not append the glass section (err %lu)",
+                    ::GetLastError());
+        return;
     }
 
-    ::SHCreateDirectoryExW(nullptr, g_themesDir.c_str(), nullptr);
+    DWORD written = 0;
+    if (::WriteFile(file.get(), block.data(),
+                    static_cast<DWORD>(block.size() * sizeof(wchar_t)), &written, nullptr))
+        MACTAB_DIAG("config: glass section added to settings.ini");
+}
 
-    Migrate();
+void Migrate() {
+    const int version = ReadInt(L"SettingsVersion", 1);
+    if (version >= kSettingsVersion) return;
 
+    if (version < 2) {
+        // Only the two whose meaning changed, and only when they still hold the
+        // value 0.7 wrote. Anything else is a choice somebody made.
+        wchar_t buffer[64] = L"";
+        ::GetPrivateProfileStringW(kSection, L"MissionBlurSigma", L"", buffer,
+                                   ARRAYSIZE(buffer), g_settingsPath.c_str());
+        if (::lstrcmpW(buffer, L"18") == 0)
+            ::WritePrivateProfileStringW(kSection, L"MissionBlurSigma", L"0",
+                                         g_settingsPath.c_str());
+
+        ::GetPrivateProfileStringW(kSection, L"MissionDim", L"", buffer,
+                                   ARRAYSIZE(buffer), g_settingsPath.c_str());
+        if (::lstrcmpW(buffer, L"0.55") == 0)
+            ::WritePrivateProfileStringW(kSection, L"MissionDim", L"0.45",
+                                         g_settingsPath.c_str());
+    }
+
+    if (version < 3)
+        AppendGlassSection();
+
+    // Stamped last. An append that failed because an editor had the file open is
+    // then retried on the next run instead of being remembered as done, and the
+    // marker check above makes that retry harmless.
+    ::WritePrivateProfileStringW(kSection, L"SettingsVersion",
+                                 std::to_wstring(kSettingsVersion).c_str(),
+                                 g_settingsPath.c_str());
+    MACTAB_DIAG("config: settings brought from version %d up to %d",
+                version, kSettingsVersion);
+}
+
+// Everything in the file, into g_settings and the material.
+//
+// Split out of Load() because Reset() needs it and must NOT re-run the rest:
+// Load() assigns the themes directory string, which the icon worker reads on its
+// own thread, and reassigning a std::wstring under a concurrent reader is a real
+// race. Nothing here touches anything off the UI thread.
+void ReadSettings() {
     g_settings.revealDelayMs = static_cast<UINT>(
         (std::max)(0, (std::min)(2000, ReadInt(L"RevealDelayMs", 180))));
     g_settings.leftAltOnly = ReadInt(L"LeftAltOnly", 1) != 0;
@@ -381,6 +466,12 @@ void Load() {
     g_settings.missionRevealMs   = static_cast<UINT>(
         (std::max)(0, (std::min)(2000, ReadInt(L"MissionRevealMs", 260))));
     g_settings.missionThumbnails = ReadString(L"MissionThumbnails", L"auto");
+
+    g_settings.missionGap        = 26.0f;
+    g_settings.missionFan        = 30.0f;
+    g_settings.missionClusterGap = 88.0f;
+    g_settings.missionBlurSigma  = 0.0f;
+    g_settings.missionDim        = 0.45f;
 
     ReadFloat(L"MissionGap",        g_settings.missionGap);
     ReadFloat(L"MissionFan",        g_settings.missionFan);
@@ -415,6 +506,68 @@ void Load() {
                 g_settings.missionBlurSigma, g_settings.missionDim,
                 g_settings.missionRevealMs,
                 ToUtf8(g_settings.missionThumbnails).c_str());
+}
+
+} // namespace
+
+const Settings& Current() { return g_settings; }
+
+void ReloadGlass() {
+    if (g_settingsPath.empty()) return;
+    ReadGlass();
+}
+
+void Load() {
+    const std::wstring& dir = AppDataDir();
+    if (dir.empty()) {
+        MACTAB_WARN("config: no app data directory; using built-in defaults");
+        return;
+    }
+
+    g_settingsPath = dir + L"\\settings.ini";
+    g_themesDir    = dir + L"\\themes";
+
+    // Write the annotated default file on first run so the settings are
+    // discoverable without documentation.
+    if (::GetFileAttributesW(g_settingsPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+        WriteIni(DefaultIni(), true);
+
+    ::SHCreateDirectoryExW(nullptr, g_themesDir.c_str(), nullptr);
+
+    Migrate();
+    ReadSettings();
+}
+
+bool ResetSettings() {
+    if (g_settingsPath.empty()) {
+        MACTAB_WARN("config: no settings file to reset");
+        return false;
+    }
+
+    // The old file is kept, and its survival is a precondition rather than a
+    // nicety. This exists for somebody who has tuned the material into a state
+    // they cannot get out of, and overwriting the only copy of that tuning
+    // because a backup silently failed would be the same accident again, larger.
+    // A file that is not there at all is the one acceptable failure: there is
+    // nothing to lose and the reset is what writes it.
+    const std::wstring backup = g_settingsPath + L".bak";
+    if (::GetFileAttributesW(g_settingsPath.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        !::CopyFileW(g_settingsPath.c_str(), backup.c_str(), FALSE)) {
+        MACTAB_FAIL("config: could not write settings.ini.bak (err %lu), not resetting",
+                    ::GetLastError());
+        return false;
+    }
+
+    if (!WriteIni(DefaultIni(), false)) {
+        MACTAB_FAIL("config: could not rewrite settings.ini");
+        return false;
+    }
+
+    // Deliberately not Load(): the themes directory string is read by the icon
+    // worker on its own thread, and it has not changed anyway.
+    ReadSettings();
+    MACTAB_DIAG("config: settings.ini reset to defaults, old file kept as .bak");
+    return true;
 }
 
 bool SetPanelDisplay(PanelDisplay display) {

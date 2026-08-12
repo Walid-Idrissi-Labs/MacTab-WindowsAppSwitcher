@@ -152,6 +152,23 @@ void Load();
 // see the result at all. Now it means saving the file and picking a menu item.
 void ReloadGlass();
 
+// Put settings.ini back exactly as it ships, keeping what was there as
+// settings.ini.bak, and re-read everything from it.
+//
+// The escape hatch for the file this release opens up. Every number in the
+// material is now editable by hand, which is the point, and a material that can
+// be tuned into an unreadable panel by hand needs a way back that does not
+// involve knowing which of forty numbers did it.
+//
+// Refuses rather than proceeds if the backup cannot be written: the file being
+// replaced is the only copy of whatever tuning is being abandoned.
+//
+// UI thread only, and deliberately not Load(): it re-reads the settings and the
+// material without reassigning the themes directory string the icon worker reads
+// on its own thread. The caller owns re-applying anything the running process
+// took from the old file, which is what ApplySettings in main.cpp does.
+bool ResetSettings();
+
 // Change the display setting and persist it.
 //
 // Writes the single key with WritePrivateProfileString rather than rewriting
