@@ -76,7 +76,12 @@ UINT DisplayTickMs(HMONITOR monitor) {
             mode.dmDisplayFrequency > 1) {
             // Floored at 4 ms so a 480 Hz panel cannot ask for a grab every two
             // milliseconds, which would be a busy loop wearing a frame rate.
-            return (std::max)(4u, 1000u / mode.dmDisplayFrequency);
+            //
+            // dmDisplayFrequency is a DWORD, so the division is unsigned long
+            // and the literal is unsigned int; std::max deduces neither and MSVC
+            // says so. Both sides are made UINT rather than letting it pick.
+            const UINT tick = static_cast<UINT>(1000u / mode.dmDisplayFrequency);
+            return (std::max)(4u, tick);
         }
     }
     return kLiveBackdropFallbackMs;
