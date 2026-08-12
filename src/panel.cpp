@@ -200,6 +200,7 @@ struct Panel::Impl {
     void RecoverDevices();
     bool CreateVisualTree();
     void ExcludeFromCapture();
+    void AllowCapture();
     bool LiveBackdropWanted() const;
 
     // Whether this session can refresh the backdrop while the panel is up, which
@@ -209,6 +210,11 @@ struct Panel::Impl {
 
     // How often it refreshes, in milliseconds. 0 while the panel is down.
     UINT liveTickMs = 0;
+
+    // Whether the operating point has been worked out for this gesture. See the
+    // note in CollectFrame: it is derived once, from the first frame that has
+    // pixels in it, and held for as long as the panel is up.
+    bool materialSettled = false;
 
     // The captured desktop frame, in flight. Started when the gesture begins and
     // consumed when the panel is actually revealed.
@@ -437,44 +443,72 @@ bool Panel::Impl::CreatePanelWindow() {
     }
 
     ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-
-    ExcludeFromCapture();
     return true;
 }
 
-// Take this window out of what a screen grab can see.
+// Take this window out of what a screen grab can see, for as long as it is up.
 //
 // This is what makes a live backdrop possible at all. The panel is on screen
 // while it is open, so grabbing the desktop again grabs the panel too, and a
-// panel whose backdrop contains itself blurs into a feedback smear within a few
-// frames. That is why the backdrop has always been a frozen frame taken before
-// the panel was shown. Excluded, the grab sees the desktop as if MacTab were not
-// there, and it can be repeated as often as the display refreshes.
+// panel whose backdrop contains itself blurs into a feedback smear that gets
+// worse every frame. That is why the backdrop has always been a frozen frame
+// taken before the panel was shown. Excluded, the grab sees the desktop as if
+// MacTab were not there, and it can be repeated as often as the display
+// refreshes.
 //
-// WDA_EXCLUDEFROMCAPTURE needs Windows 10 2004. Below that the call fails and
-// liveBackdrop stays off for the session, which is the 0.9.2 behaviour and
-// nothing worse.
+// Set on show and cleared on hide rather than left on the window for the life of
+// the process. It costs one call per gesture and it keeps a property that makes
+// a window invisible to screen capture from applying at any moment when there is
+// nothing on screen to hide.
 //
-// The consequence worth stating: while this is in force the panel does not
-// appear in screen recordings or a shared screen either, because that is the
-// same machinery. LiveBackdrop=0 in settings.ini is the way to get it back, and
-// the note in the file says so.
+// TWO builds matter here, not one.
+//
+//   19041, Windows 10 2004, is where WDA_EXCLUDEFROMCAPTURE exists at all.
+//   Below it the call fails, which is the feature detect.
+//
+//   22000, Windows 11, is where the exclusion is dependable for a GDI screen
+//   copy. On Windows 10 builds it is honoured by desktop duplication but NOT
+//   reliably by BitBlt of the screen DC, and the live path here reads through
+//   exactly that. Honouring it only sometimes is the worst possible outcome:
+//   the panel would be composited into its own backdrop and smear. So the live
+//   refresh asks for 22000 and Windows 10 keeps the frozen frame, which is what
+//   0.9.2 does and is not a regression for anybody.
+//
+// The consequence worth stating out loud: while this is in force the panel does
+// not appear in screen recordings, in a shared screen, or in a screenshot,
+// because that is the same machinery it is being hidden from. LiveBackdrop=0 in
+// settings.ini brings it back, and the note in the file says so.
 void Panel::Impl::ExcludeFromCapture() {
-    liveBackdrop = false;
-    if (!config::Current().liveBackdrop || !hwnd) return;
+    if (!hwnd) return;
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
 
+    liveBackdrop = false;
+
+    if (!config::Current().liveBackdrop) return;
+
+    if (WindowsBuildNumber() < 22000) {
+        MACTAB_DIAG("panel: Windows build %u, the backdrop stays frozen "
+                    "(the live one needs 22000)", WindowsBuildNumber());
+        return;
+    }
+
     if (::SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
         liveBackdrop = true;
-        MACTAB_DIAG("panel: excluded from capture, the backdrop can be live");
+        MACTAB_DIAG("panel: hidden from screen capture, the backdrop can be live");
     } else {
         MACTAB_WARN("panel: SetWindowDisplayAffinity refused (err %lu); the "
-                    "backdrop stays frozen. Needs Windows 10 2004",
-                    ::GetLastError());
+                    "backdrop stays frozen", ::GetLastError());
     }
+}
+
+// Put it back the way every other window on the desktop is.
+void Panel::Impl::AllowCapture() {
+    if (!hwnd || !liveBackdrop) return;
+    ::SetWindowDisplayAffinity(hwnd, WDA_NONE);
+    liveBackdrop = false;
 }
 
 bool Panel::Impl::CreateVisualTree() {
@@ -846,8 +880,10 @@ void Panel::Impl::CollectFrame() {
     // beyond the old capture would get no backdrop at all, just tint over
     // nothing, visibly two-toned against the blurred middle.
     //
-    // Re-capturing is not an option, our own panel is on screen by then, so
-    // drop to the flat fallback instead. Shrinking is fine and stays blurred.
+    // Re-capturing is not an option in the frozen case, our own panel is on
+    // screen by then, so drop to the flat fallback instead. Shrinking is fine
+    // and stays blurred. With a live backdrop the panel is hidden from grabs and
+    // the next frame covers the new size on its own, one tick later.
     //
     // The test covers the capsule as well as the panel: it is the piece that
     // hangs lowest, so it is the one that leaves the frame first.
@@ -871,8 +907,21 @@ void Panel::Impl::CollectFrame() {
     // With no frame there is no mean, so the base parameters stand.
     if (lastFrame.pixels.Empty()) {
         material = theme.material;
+        materialSettled = false;
         return;
     }
+
+    // Worked out once per gesture, not once per frame.
+    //
+    // The operating point answers "what is behind the panel", which is a
+    // property of where the panel opened, not of what is moving behind it a
+    // moment later. Re-deriving it on every live frame makes the bias chase a
+    // video playing underneath, and the whole panel pulses in step with it:
+    // adaptation is meant to be invisible, and something that changes while you
+    // watch it is the one way it cannot be. The backdrop still moves; the glass
+    // it is seen through holds still.
+    if (materialSettled) return;
+    materialSettled = true;
 
     const uint32_t mean = MeanColourIn(lastFrame.pixels,
                                        panelRect.left - lastFrame.bounds.left,
@@ -954,13 +1003,20 @@ void Panel::Impl::WaitForCapture() {
     }
 
     BakeBackdrop();
-    BakeLabel();
 
     if (!live) {
+        BakeLabel();
         ::KillTimer(hwnd, kLateCaptureTimer);
         MACTAB_DIAG("panel: late capture landed, backdrop re-baked");
         return;
     }
+
+    // The backdrop only, on a live frame. The app name's capsule is glass cut
+    // from the same grab, but re-baking it means a DirectWrite layout and a new
+    // surface every frame, and BakeLabel clears the brush before it starts, so
+    // at sixty times a second the name would flicker. It keeps the glass it was
+    // baked with; it is a small capsule under a sigma-8 blur, and nobody is
+    // looking through it at the thing that is moving.
 
     // Straight into the next one. The timer paces how often a frame is taken;
     // the grab itself takes as long as it takes, and starting the next only
@@ -1464,6 +1520,9 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
     impl.items    = std::move(items);
     impl.selected = selectedIndex;
 
+    // A new gesture works out its own operating point.
+    if (!impl.visible) impl.materialSettled = false;
+
     // Re-resolve the theme once per gesture, so switching Windows between light
     // and dark, or picking a theme from the tray, takes effect on the next
     // Alt+Tab rather than on the next launch. Everything else on the panel is
@@ -1586,9 +1645,15 @@ void Panel::Show() {
     // as soon as the last one has been drawn.
     //
     // `visible` is set after this lambda returns, and LiveBackdropWanted tests
-    // it, so the live case is armed on the setting and the exclusion here and
-    // the tick itself does the rest once the panel is really up.
-    const bool live = impl.liveBackdrop && config::Current().liveBackdrop;
+    // it, so the timer is armed on the exclusion here and the tick itself does
+    // the rest once the panel is really up.
+    //
+    // The exclusion goes first, so that no grab taken from this point on can
+    // contain the panel. That matters even in the frozen case: the first grab
+    // can still be running when the panel appears.
+    impl.ExcludeFromCapture();
+
+    const bool live = impl.liveBackdrop;
 
     if (live) {
         const int hz = config::Current().liveBackdropHz;
@@ -1661,6 +1726,9 @@ void Panel::Hide() {
 
     // Nothing left to wait for now that the panel is gone.
     ::KillTimer(impl.hwnd, kLateCaptureTimer);
+    impl.liveTickMs      = 0;
+    impl.materialSettled = false;
+    impl.AllowCapture();
 
     // Abandon any capture that was still in flight. The detached thread
     // finishes harmlessly; dropping the future here keeps a stale frame from
