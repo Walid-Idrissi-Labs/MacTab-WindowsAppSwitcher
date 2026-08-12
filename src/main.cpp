@@ -988,6 +988,12 @@ void ShowTrayMenu(HWND hwnd, POINT screenPt) {
     ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_SETTINGS, L"Open settings.ini");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_RELOAD_GLASS, L"Reload glass from settings.ini");
+
+    // Disabled for the same reason the uninstall item is: a settings file that
+    // was never created is a case worth explaining rather than a menu item that
+    // does nothing.
+    ::AppendMenuW(menu, MF_STRING | (config::SettingsPath().empty() ? (MF_DISABLED | MF_GRAYED) : 0u),
+                  IDM_TRAY_RESET_SETTINGS, L"Reset settings.ini");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_LIST, L"Log current switcher list");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_DUMP_DESKTOPS, L"Log virtual desktops");
     ::AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_LOG, L"Open diagnostics log");
@@ -1055,6 +1061,71 @@ void OpenSettingsFile(HWND owner) {
 void ReloadGlassFromSettings() {
     config::ReloadGlass();
     g_app.mission.InvalidateBackdrop();
+}
+
+// Everything the running process took from settings.ini at startup, taken from
+// it again.
+//
+// Only the reset path needs this. An ordinary edit reaches the panel on its own,
+// because the material is read per gesture, but the hold delay went into the
+// hook's options once at Start and Mission Control's chord is registered rather
+// than polled, so those two have to be pushed rather than pulled.
+void ApplySettings() {
+    hotkey::SetTiming(config::Current().revealDelayMs, config::Current().leftAltOnly);
+
+    const bool mission = config::Current().missionEnabled;
+    if (mission) {
+        // Built on demand, exactly as switching it on from the menu does, since
+        // a reset can turn it on as well as off.
+        if (!EnsureMission()) config::SetMissionEnabled(false);
+    } else {
+        CloseMission();
+    }
+
+    hotkey::SetMissionGesture(MissionGesture());
+    g_app.mission.InvalidateBackdrop();
+}
+
+// Put settings.ini back the way it ships.
+//
+// Asks first, because it throws away tuning that may have taken a while, and
+// says where the old file went. The warning about an open editor is not
+// decoration: an editor holding the old text will happily write it back over
+// this, and the user would read that as the reset not working.
+void ResetSettingsFile(HWND owner) {
+    if (config::SettingsPath().empty()) {
+        ::MessageBoxW(owner,
+                      L"settings.ini has not been created yet.\n\n"
+                      L"It is written on first run; relaunch MacTab and try again.",
+                      L"MacTab", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    std::wstring prompt = L"Put settings.ini back the way MacTab ships it?\n\n"
+                          L"Everything you have changed in it, including the glass, "
+                          L"goes back to the shipped defaults. The file you have now "
+                          L"is kept as:\n\n";
+    prompt += config::SettingsPath();
+    prompt += L".bak\n\nClose any editor that has settings.ini open first, or saving "
+              L"from it afterwards will put the old file back.";
+
+    if (::MessageBoxW(owner, prompt.c_str(), L"MacTab",
+                      MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        return;
+
+    if (!config::ResetSettings()) {
+        ::MessageBoxW(owner,
+                      L"MacTab could not reset settings.ini.\n\n"
+                      L"Nothing has been changed. This usually means another program "
+                      L"has the file open; close it and try again.",
+                      L"MacTab", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    ApplySettings();
+    g_app.tray.ShowBalloon(L"MacTab",
+                           L"settings.ini is back to defaults. The old one is "
+                           L"settings.ini.bak.");
 }
 
 // --- Shutdown --------------------------------------------------------------
@@ -1287,6 +1358,10 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
         case IDM_TRAY_OPEN_SETTINGS:
             OpenSettingsFile(hwnd);
+            return 0;
+
+        case IDM_TRAY_RESET_SETTINGS:
+            ResetSettingsFile(hwnd);
             return 0;
 
         case IDM_TRAY_RELOAD_GLASS:

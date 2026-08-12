@@ -512,6 +512,13 @@ void SetMissionGesture(Gesture gesture) {
     MACTAB_DIAG("hotkey: Mission Control on %s", GestureName(gesture));
 }
 
+void SetTiming(UINT revealDelayMs, bool leftAltOnly) {
+    g_options.revealDelayMs = revealDelayMs;
+    g_options.leftAltOnly   = leftAltOnly;
+    MACTAB_DIAG("hotkey: revealDelay %u ms, leftAltOnly %d", revealDelayMs,
+                leftAltOnly ? 1 : 0);
+}
+
 bool IsRunning() {
     return ::InterlockedCompareExchange(&g_running, 0, 0) != 0;
 }

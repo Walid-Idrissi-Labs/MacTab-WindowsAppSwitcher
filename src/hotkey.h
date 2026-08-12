@@ -154,6 +154,15 @@ bool IsRunning();
 // through to Task View, which is exactly what turning it off asks for anyway.
 void SetMissionGesture(Gesture gesture);
 
+// Re-apply the two timing options without restarting the hook.
+//
+// For the settings being reset under a running hook, which is the only thing
+// that changes these after Start(). Written on the UI thread and read inside the
+// hook callback on its own, for the same reason SetMissionGesture is safe: a
+// UINT and a bool cannot tear, and the worst a stale read can do is give one
+// gesture the hold delay the user just stopped asking for.
+void SetTiming(UINT revealDelayMs, bool leftAltOnly);
+
 // Tell the hook that Mission Control is on screen.
 //
 // While it is, Ctrl+Win+Left and Ctrl+Win+Right are swallowed and posted back as
