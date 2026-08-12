@@ -44,11 +44,13 @@ struct Settings {
     // to be had, so it is a path that has always existed and is now reachable on
     // purpose rather than only by failure.
     //
-    // On by default, obviously. It is the product. But a switcher that is
-    // legible and costs nothing is a reasonable thing to want on a machine where
-    // the glass is slow, wrong, or simply not to taste, and until now the only
-    // way to get it was for the capture to fail.
-    bool glassEnabled = true;
+    // OFF by default, which wants saying plainly because the glass is what this
+    // project is mostly made of. The switcher is the product; the material is
+    // how it looks, and it is the part that depends on a desktop grab working on
+    // hardware nobody here can test. Defaulting to the plate means a first run
+    // that is legible and costs nothing on every machine, and the glass is one
+    // menu item away for anyone who wants it.
+    bool glassEnabled = false;
 
     // How the desktop behind the panel is grabbed: "auto", "duplication",
     // "bitblt" or "plain".

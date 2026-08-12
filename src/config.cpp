@@ -40,10 +40,12 @@ const wchar_t* kDefaultIniHead =
     L"; auto | dark | light\r\n"
     L"Theme=auto\r\n"
     L"\r\n"
-    L"; The glass itself. 0 gives a plain tinted plate instead: no grab of the\r\n"
-    L"; desktop, no blur, no refraction, nothing showing through. Also in the\r\n"
-    L"; tray menu under Settings.\r\n"
-    L"Glass=1\r\n"
+    L"; The glass itself. Off by default: the panel is a plain tinted plate,\r\n"
+    L"; with no grab of the desktop, no blur and no refraction, which is\r\n"
+    L"; legible everywhere and costs nothing. 1 turns the material on. Also in\r\n"
+    L"; the tray menu under Settings, where it takes effect on the next\r\n"
+    L"; Alt+Tab.\r\n"
+    L"Glass=0\r\n"
     L"\r\n"
     L"; How the desktop behind the panel is grabbed, which is what the glass is\r\n"
     L"; made of. If the panel is a flat grey slab with nothing showing through\r\n"
@@ -541,7 +543,7 @@ void ReadSettings() {
     g_settings.leftAltOnly = ReadInt(L"LeftAltOnly", 1) != 0;
     g_settings.tileSize    = (std::max)(48, (std::min)(256, ReadInt(L"TileSize", 128)));
     g_settings.theme       = ReadKeyword(L"Theme", L"auto");
-    g_settings.glassEnabled  = ReadInt(L"Glass", 1) != 0;
+    g_settings.glassEnabled  = ReadInt(L"Glass", 0) != 0;
     g_settings.captureSource = ReadKeyword(L"CaptureSource", L"auto");
     g_settings.groupByApp  = ReadInt(L"GroupByApp", 1) != 0;
     g_settings.panelDisplay = ParsePanelDisplay(ReadKeyword(L"PanelDisplay", L"active"));
