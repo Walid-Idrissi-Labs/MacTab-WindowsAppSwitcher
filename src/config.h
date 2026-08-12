@@ -36,6 +36,25 @@ struct Settings {
     // "auto" follows the system app theme; "dark" and "light" pin it.
     std::wstring theme = L"auto";
 
+    // Keep the backdrop behind the panel live while the panel is up, instead of
+    // freezing the desktop as it was when the gesture started.
+    //
+    // On by default. The frozen frame was never the intent, it was what a panel
+    // that cannot capture the desktop from underneath itself could manage: the
+    // moment the panel is on screen, grabbing the screen again grabs the panel
+    // too. What makes this possible is excluding our own window from capture,
+    // which needs Windows 10 2004. Below that, and any time the exclusion is
+    // refused, the backdrop stays frozen and everything else is unchanged.
+    bool liveBackdrop = true;
+
+    // Ceiling on how often that refresh happens, in frames per second. 0 follows
+    // the display, which is what the desktop itself does.
+    //
+    // Here because the refresh is the one part of MacTab that does continuous
+    // work while it is on screen, and on a laptop on battery that is a choice
+    // somebody may want to make differently.
+    int liveBackdropHz = 0;
+
     // How the desktop behind the panel is grabbed: "auto", "duplication",
     // "bitblt" or "plain".
     //

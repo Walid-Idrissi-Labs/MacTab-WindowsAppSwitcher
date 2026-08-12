@@ -54,6 +54,22 @@ const wchar_t* kDefaultIniHead =
     L";                sync, which is the one most likely to come back black\r\n"
     L"CaptureSource=auto\r\n"
     L"\r\n"
+    L"; Keep the desktop behind the panel live while the panel is up, instead of\r\n"
+    L"; freezing it as it was when you pressed Alt+Tab. Needs Windows 10 2004 or\r\n"
+    L"; later, because it works by taking MacTab's own window out of what the\r\n"
+    L"; screen grab can see; below that the backdrop stays frozen.\r\n"
+    L";\r\n"
+    L"; That has one consequence worth knowing: while this is on, the panel does\r\n"
+    L"; not appear in screen recordings or in a shared screen, because it is\r\n"
+    L"; hidden from exactly the same machinery. Set this to 0 if you need to\r\n"
+    L"; record or demonstrate it.\r\n"
+    L"LiveBackdrop=1\r\n"
+    L"\r\n"
+    L"; Ceiling on how often it refreshes, in frames per second. 0 follows the\r\n"
+    L"; display. Lower it if you would rather the panel did less work while it\r\n"
+    L"; is on screen.\r\n"
+    L"LiveBackdropHz=0\r\n"
+    L"\r\n"
     L"; 1 = one tile per application (macOS). 0 = one tile per window.\r\n"
     L"GroupByApp=1\r\n"
     L"\r\n"
@@ -537,6 +553,9 @@ void ReadSettings() {
     g_settings.tileSize    = (std::max)(48, (std::min)(256, ReadInt(L"TileSize", 128)));
     g_settings.theme       = ReadKeyword(L"Theme", L"auto");
     g_settings.captureSource = ReadKeyword(L"CaptureSource", L"auto");
+    g_settings.liveBackdrop   = ReadInt(L"LiveBackdrop", 1) != 0;
+    g_settings.liveBackdropHz =
+        (std::max)(0, (std::min)(240, ReadInt(L"LiveBackdropHz", 0)));
     g_settings.groupByApp  = ReadInt(L"GroupByApp", 1) != 0;
     g_settings.panelDisplay = ParsePanelDisplay(ReadKeyword(L"PanelDisplay", L"active"));
     g_settings.glassRefraction = ReadInt(L"GlassRefraction", 1) != 0;

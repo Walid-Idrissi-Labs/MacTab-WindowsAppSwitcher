@@ -82,7 +82,17 @@ struct Frame {
 //
 // Safe to call from a worker thread. Never throws; on total failure returns a
 // Frame with source == None.
-Frame GrabRegion(const RECT& rect);
+//
+// `repeating` is the live-backdrop path, where this is called once per display
+// refresh for as long as the panel is up rather than once per gesture. It skips
+// desktop duplication, which is not a per-frame source in this shape: the device
+// and the duplication object are built and thrown away inside every call, which
+// costs tens of milliseconds, and its contract is to hand over a frame only when
+// the desktop changed since that object was made. The blits are stateless, cost
+// a couple of milliseconds and answer every time. The first grab of a gesture
+// still tries everything, so the panel opens on the best source available and
+// then follows the desktop with a cheap one.
+Frame GrabRegion(const RECT& rect, bool repeating = false);
 
 // Release cached devices. Desktop duplication is deliberately not kept open
 // between gestures: whether an idle open duplication makes DWM do extra

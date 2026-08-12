@@ -366,6 +366,11 @@ bool Blank(const Content& content) {
 
 Source g_forced = Source::None;
 
+// The source that last came back with a picture in it. Read and written only on
+// the capture worker, and only one grab is ever in flight, so it needs no more
+// protection than that.
+Source g_preferred = Source::None;
+
 } // namespace
 
 const char* SourceName(Source source) {
@@ -393,7 +398,7 @@ Source ParseSource(const wchar_t* keyword) {
     return Source::None;   // "auto", and anything unrecognised
 }
 
-Frame GrabRegion(const RECT& rect) {
+Frame GrabRegion(const RECT& rect, bool repeating) {
     const double started = NowMs();
 
     // In preference order. Duplication first because it is the only one that
@@ -410,9 +415,25 @@ Frame GrabRegion(const RECT& rect) {
     // flush and takes a different path inside it. It stays as the third try
     // rather than being deleted, because a machine where it is the one that
     // works is exactly the kind of thing nobody here can rule out.
-    const Source order[] = { Source::DesktopDuplication,
-                             Source::GdiPlain,
-                             Source::GdiBitBlt };
+    Source order[] = { Source::DesktopDuplication,
+                       Source::GdiPlain,
+                       Source::GdiBitBlt };
+
+    // Whatever worked last time goes first.
+    //
+    // This is what makes a live backdrop affordable. Walking the cascade costs
+    // 20 ms of duplication timeouts before the blit that was always going to be
+    // the answer on this machine, which is fine once per gesture and impossible
+    // sixty times a second. The winner is remembered, tried first, and the full
+    // cascade is still there behind it for the frame where it stops working.
+    if (g_preferred != Source::None) {
+        for (size_t i = 1; i < std::size(order); ++i) {
+            if (order[i] == g_preferred) {
+                std::swap(order[0], order[i]);
+                break;
+            }
+        }
+    }
 
     const bool remote = InRemoteSession();
     if (remote)
@@ -422,7 +443,7 @@ Frame GrabRegion(const RECT& rect) {
 
     for (const Source source : order) {
         if (g_forced != Source::None && source != g_forced) continue;
-        if (source == Source::DesktopDuplication && remote) continue;
+        if (source == Source::DesktopDuplication && (remote || repeating)) continue;
 
         Frame frame;
         switch (source) {
@@ -443,6 +464,7 @@ Frame GrabRegion(const RECT& rect) {
 
         if (!Blank(content)) {
             frame.blank = false;
+            g_preferred = frame.source;
             MACTAB_DIAG("capture: %s, %dx%d at (%ld,%ld) in %.2f ms",
                         SourceName(frame.source),
                         frame.pixels.width, frame.pixels.height,
