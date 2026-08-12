@@ -57,6 +57,13 @@ struct Frame {
     Bitmap pixels;
     Source source = Source::None;
 
+    // Set when every path came back with no picture in it: black, featureless,
+    // or nothing at all. The frame is still handed over, because a desktop that
+    // really is black is a case the material handles honestly, but the panel
+    // uses this to say out loud that there is no glass to be had rather than
+    // leaving a grey rectangle to be read as bad tuning.
+    bool blank = true;
+
     // Where `pixels` actually came from, in virtual-screen coordinates.
     //
     // This is NOT always the rect that was asked for: the inflated capture

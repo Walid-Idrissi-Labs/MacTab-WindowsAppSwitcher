@@ -12,12 +12,19 @@ namespace {
 
 // Total time we are willing to spend waiting for a duplicated frame.
 //
-// One attempt, not six. AcquireNextFrame hands over a frame when the desktop has
-// CHANGED since the duplication was opened, and returns DXGI_ERROR_WAIT_TIMEOUT
-// when it has not. On a still desktop, which is most of the time somebody
-// presses Alt+Tab, nothing is ever going to arrive, so the five extra attempts
-// were 40 ms spent proving a negative and then going the slow way round through
-// BitBlt anyway.
+// Twenty milliseconds, not forty-eight and not eight. AcquireNextFrame hands
+// over a frame when the desktop has CHANGED since the duplication was opened,
+// and returns DXGI_ERROR_WAIT_TIMEOUT when it has not. On a still desktop, which
+// is most of the time somebody presses Alt+Tab, nothing is ever going to arrive,
+// so six attempts were 48 ms spent proving a negative and then going the slow
+// way round through BitBlt anyway.
+//
+// One attempt at 8 ms, which 0.9.0 cut it to, went too far the other way. A
+// screen that IS presenting does so every 16.7 ms at 60 Hz, so a single 8 ms
+// window catches it about half the time: that is the coin toss behind a panel
+// that is glass in fullscreen only SOMETIMES. Two attempts at 10 ms clears a
+// frame interval and turns that into nearly always, and the cost when nothing
+// arrives is 20 ms on a path that no longer loses the reveal when it overruns.
 //
 // That 40 ms was not free. The panel is revealed after RevealDelayMs, 180 by
 // default, and a grab that misses that shows the near-opaque fallback coat
@@ -29,8 +36,8 @@ namespace {
 //
 // The reveal is no longer lost when this does overrun: Panel::WaitForCapture
 // takes the frame whenever it lands and re-bakes.
-constexpr DWORD kAcquireTimeoutMs = 8;
-constexpr int   kAcquireAttempts  = 1;
+constexpr DWORD kAcquireTimeoutMs = 10;
+constexpr int   kAcquireAttempts  = 2;
 
 bool InRemoteSession() {
     // Explicit check rather than trying to detect black frames: desktop
@@ -235,11 +242,18 @@ Frame GrabWithBitBlt(const RECT& rect, bool captureBlt) {
     const int height = static_cast<int>(rect.bottom - rect.top);
     if (width <= 0 || height <= 0) return frame;
 
+    // Every failure below is reported. None of them were, which is most of why
+    // a panel with no backdrop went five releases without anybody being able to
+    // say why: the only trace of a failed blit was the absence of a frame.
     const HDC screen = ::GetDC(nullptr);
-    if (!screen) return frame;
+    if (!screen) {
+        MACTAB_WARN("capture: GetDC(screen) failed (err %lu)", ::GetLastError());
+        return frame;
+    }
 
     const HDC memory = ::CreateCompatibleDC(screen);
     if (!memory) {
+        MACTAB_WARN("capture: CreateCompatibleDC failed (err %lu)", ::GetLastError());
         ::ReleaseDC(nullptr, screen);
         return frame;
     }
@@ -255,22 +269,25 @@ Frame GrabWithBitBlt(const RECT& rect, bool captureBlt) {
     void* bits = nullptr;
     const HBITMAP dib = ::CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
 
+    if (!dib || !bits)
+        MACTAB_WARN("capture: CreateDIBSection %dx%d failed (err %lu)", width, height,
+                    ::GetLastError());
+
     if (dib && bits) {
         const HGDIOBJ previous = ::SelectObject(memory, dib);
 
-        // CAPTUREBLT includes layered windows above the desktop, which is worth
-        // having: without it the backdrop is missing exactly the translucent
-        // surfaces that make a blur look convincing.
-        //
-        // It is also the flag most likely to be the reason a blit comes back
-        // black. It forces a DWM sync and has never been the well-trodden path
-        // on a composited desktop, where every window is already in the redirect
-        // surface the plain blit reads. So both are tried, in that order, and
-        // whichever returns something that is not blank wins. The two are not
-        // the same call: they go through different paths in the compositor.
+        // CAPTUREBLT picks up layered windows above the desktop, which was the
+        // right call before Windows 8. Under DWM every window is already
+        // composited into the surface a plain SRCCOPY reads, so it buys nothing
+        // there, and it is the flag most likely to be why a blit comes back
+        // black: it forces a synchronous compositor flush and takes a different
+        // path inside it. GrabRegion tries the plain one first for that reason.
         const DWORD rop = captureBlt ? (SRCCOPY | CAPTUREBLT) : SRCCOPY;
 
-        if (::BitBlt(memory, 0, 0, width, height, screen, rect.left, rect.top, rop)) {
+        if (!::BitBlt(memory, 0, 0, width, height, screen, rect.left, rect.top, rop)) {
+            MACTAB_WARN("capture: BitBlt%s failed (err %lu)",
+                        captureBlt ? " with CAPTUREBLT" : "", ::GetLastError());
+        } else {
             frame.pixels = Bitmap::Create(width, height);
             std::memcpy(frame.pixels.pixels.data(), bits,
                         static_cast<size_t>(width) * height * 4);
@@ -384,9 +401,18 @@ Frame GrabRegion(const RECT& rect) {
     // the two blits after it are there because on some machines it never
     // delivers, and on a still desktop it CANNOT: it has nothing to hand over
     // until something on screen changes.
+    // The plain blit before the CAPTUREBLT one, which is the opposite of the
+    // order this shipped in for five releases. CAPTUREBLT was here to pick up
+    // layered windows, which was the right call before Windows 8; under DWM
+    // every window is already composited into the surface a plain SRCCOPY
+    // reads, so the flag buys nothing and it is the one most likely to be the
+    // reason a blit comes back black, since it forces a synchronous compositor
+    // flush and takes a different path inside it. It stays as the third try
+    // rather than being deleted, because a machine where it is the one that
+    // works is exactly the kind of thing nobody here can rule out.
     const Source order[] = { Source::DesktopDuplication,
-                             Source::GdiBitBlt,
-                             Source::GdiPlain };
+                             Source::GdiPlain,
+                             Source::GdiBitBlt };
 
     const bool remote = InRemoteSession();
     if (remote)
@@ -416,6 +442,7 @@ Frame GrabRegion(const RECT& rect) {
                     Blank(content) ? " (blank, trying the next path)" : "");
 
         if (!Blank(content)) {
+            frame.blank = false;
             MACTAB_DIAG("capture: %s, %dx%d at (%ld,%ld) in %.2f ms",
                         SourceName(frame.source),
                         frame.pixels.width, frame.pixels.height,

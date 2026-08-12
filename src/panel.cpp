@@ -341,7 +341,12 @@ LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return ::DefWindowProcW(hwnd, msg, wParam, lParam);
 
     if (msg == WM_TIMER && wParam == kLateCaptureTimer) {
-        impl->WaitForCapture();
+        // Guarded like every other entry point that touches the compositor.
+        // WaitForCapture re-bakes, every C++/WinRT call in a bake throws on
+        // failure, and an hresult_error escaping a window procedure unwinds
+        // straight past wWinMain into std::terminate. 0.9.0 called this raw and
+        // turned a device loss during a late re-bake into a crash.
+        GuardPanel(*impl, "WaitForCapture", [&] { impl->WaitForCapture(); });
         return 0;
     }
 
@@ -552,7 +557,12 @@ void Panel::PrepareLayout(int itemCount) {
 
 bool Panel::Ready() const   { return m_impl->ready; }
 bool Panel::Visible() const { return m_impl->visible; }
-bool Panel::BackdropIsFlat() const { return m_impl->lastFrame.pixels.Empty(); }
+bool Panel::BackdropIsFlat() const {
+    // Blank counts as flat. A grab that came back black is drawn rather than
+    // discarded, so the panel has "a backdrop" in every sense the code can see,
+    // and it still looks like a grey slab to the person in front of it.
+    return m_impl->lastFrame.pixels.Empty() || m_impl->lastFrame.blank;
+}
 HWND Panel::Hwnd() const    { return m_impl->hwnd; }
 int  Panel::TileSizePx() const {
     return static_cast<int>(std::lround(m_impl->tilePx));
