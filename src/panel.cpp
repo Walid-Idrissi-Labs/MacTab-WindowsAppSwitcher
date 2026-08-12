@@ -57,36 +57,6 @@ constexpr UINT     kLateCaptureTickMs  = 16;
 // of the gesture.
 constexpr UINT     kLateCaptureGiveUpMs = 1000;
 
-// How often the backdrop refreshes while the panel is up, when the display's own
-// rate cannot be read. 60 Hz.
-constexpr UINT     kLiveBackdropFallbackMs = 16;
-
-// The refresh interval for a monitor, in milliseconds.
-//
-// The display's own rate, because the thing being redrawn is a picture of that
-// display and there is no sense in redrawing it more often than it changes, nor
-// in redrawing it less often and calling it live.
-UINT DisplayTickMs(HMONITOR monitor) {
-    MONITORINFOEXW info{};
-    info.cbSize = sizeof(info);
-    if (::GetMonitorInfoW(monitor, &info)) {
-        DEVMODEW mode{};
-        mode.dmSize = sizeof(mode);
-        if (::EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) &&
-            mode.dmDisplayFrequency > 1) {
-            // Floored at 4 ms so a 480 Hz panel cannot ask for a grab every two
-            // milliseconds, which would be a busy loop wearing a frame rate.
-            //
-            // dmDisplayFrequency is a DWORD, so the division is unsigned long
-            // and the literal is unsigned int; std::max deduces neither and MSVC
-            // says so. Both sides are made UINT rather than letting it pick.
-            const UINT tick = static_cast<UINT>(1000u / mode.dmDisplayFrequency);
-            return (std::max)(4u, tick);
-        }
-    }
-    return kLiveBackdropFallbackMs;
-}
-
 // Tile size, gap, padding, corner radius and the shrink-to-fit rule live in
 // panel_layout.h, which is free of windows.h so tools/preview can render the
 // real geometry natively. The material and everything that draws it live in
@@ -204,22 +174,6 @@ struct Panel::Impl {
     bool CreatePanelWindow();
     void RecoverDevices();
     bool CreateVisualTree();
-    void ExcludeFromCapture();
-    void AllowCapture();
-    bool LiveBackdropWanted() const;
-
-    // Whether this session can refresh the backdrop while the panel is up, which
-    // is true only when the window is genuinely hidden from screen grabs. Set
-    // once, when the window is made.
-    bool liveBackdrop = false;
-
-    // How often it refreshes, in milliseconds. 0 while the panel is down.
-    UINT liveTickMs = 0;
-
-    // Whether the operating point has been worked out for this gesture. See the
-    // note in CollectFrame: it is derived once, from the first frame that has
-    // pixels in it, and held for as long as the panel is up.
-    bool materialSettled = false;
 
     // The captured desktop frame, in flight. Started when the gesture begins and
     // consumed when the panel is actually revealed.
@@ -451,71 +405,6 @@ bool Panel::Impl::CreatePanelWindow() {
     return true;
 }
 
-// Take this window out of what a screen grab can see, for as long as it is up.
-//
-// This is what makes a live backdrop possible at all. The panel is on screen
-// while it is open, so grabbing the desktop again grabs the panel too, and a
-// panel whose backdrop contains itself blurs into a feedback smear that gets
-// worse every frame. That is why the backdrop has always been a frozen frame
-// taken before the panel was shown. Excluded, the grab sees the desktop as if
-// MacTab were not there, and it can be repeated as often as the display
-// refreshes.
-//
-// Set on show and cleared on hide rather than left on the window for the life of
-// the process. It costs one call per gesture and it keeps a property that makes
-// a window invisible to screen capture from applying at any moment when there is
-// nothing on screen to hide.
-//
-// TWO builds matter here, not one.
-//
-//   19041, Windows 10 2004, is where WDA_EXCLUDEFROMCAPTURE exists at all.
-//   Below it the call fails, which is the feature detect.
-//
-//   22000, Windows 11, is where the exclusion is dependable for a GDI screen
-//   copy. On Windows 10 builds it is honoured by desktop duplication but NOT
-//   reliably by BitBlt of the screen DC, and the live path here reads through
-//   exactly that. Honouring it only sometimes is the worst possible outcome:
-//   the panel would be composited into its own backdrop and smear. So the live
-//   refresh asks for 22000 and Windows 10 keeps the frozen frame, which is what
-//   0.9.2 does and is not a regression for anybody.
-//
-// The consequence worth stating out loud: while this is in force the panel does
-// not appear in screen recordings, in a shared screen, or in a screenshot,
-// because that is the same machinery it is being hidden from. LiveBackdrop=0 in
-// settings.ini brings it back, and the note in the file says so.
-void Panel::Impl::ExcludeFromCapture() {
-    if (!hwnd) return;
-
-#ifndef WDA_EXCLUDEFROMCAPTURE
-#define WDA_EXCLUDEFROMCAPTURE 0x00000011
-#endif
-
-    liveBackdrop = false;
-
-    if (!config::Current().liveBackdrop) return;
-
-    if (WindowsBuildNumber() < 22000) {
-        MACTAB_DIAG("panel: Windows build %u, the backdrop stays frozen "
-                    "(the live one needs 22000)", WindowsBuildNumber());
-        return;
-    }
-
-    if (::SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
-        liveBackdrop = true;
-        MACTAB_DIAG("panel: hidden from screen capture, the backdrop can be live");
-    } else {
-        MACTAB_WARN("panel: SetWindowDisplayAffinity refused (err %lu); the "
-                    "backdrop stays frozen", ::GetLastError());
-    }
-}
-
-// Put it back the way every other window on the desktop is.
-void Panel::Impl::AllowCapture() {
-    if (!hwnd || !liveBackdrop) return;
-    ::SetWindowDisplayAffinity(hwnd, WDA_NONE);
-    liveBackdrop = false;
-}
-
 bool Panel::Impl::CreateVisualTree() {
     auto interop = compositor.as<ABI::Windows::UI::Composition::Desktop::ICompositorDesktopInterop>();
     if (FAILED(interop->CreateDesktopWindowTarget(
@@ -739,13 +628,8 @@ void Panel::Impl::StartCapture() {
     ::InflateRect(&captureRect, margin, margin);
     captureRect.bottom += static_cast<int>(std::ceil(labelBandPx));
 
-    // Live grabs are the repeating kind: cheap, stateless, every frame. The
-    // first one of a gesture is not, so the panel opens on the best source the
-    // machine has rather than on the fastest.
-    const bool repeating = visible && LiveBackdropWanted();
-
     auto task = std::make_shared<std::packaged_task<capture::Frame()>>(
-        [captureRect, repeating] { return capture::GrabRegion(captureRect, repeating); });
+        [captureRect] { return capture::GrabRegion(captureRect); });
 
     pendingCapture = task->get_future();
     std::thread([task] { (*task)(); }).detach();
@@ -885,10 +769,8 @@ void Panel::Impl::CollectFrame() {
     // beyond the old capture would get no backdrop at all, just tint over
     // nothing, visibly two-toned against the blurred middle.
     //
-    // Re-capturing is not an option in the frozen case, our own panel is on
-    // screen by then, so drop to the flat fallback instead. Shrinking is fine
-    // and stays blurred. With a live backdrop the panel is hidden from grabs and
-    // the next frame covers the new size on its own, one tick later.
+    // Re-capturing is not an option, our own panel is on screen by then, so
+    // drop to the flat fallback instead. Shrinking is fine and stays blurred.
     //
     // The test covers the capsule as well as the panel: it is the piece that
     // hangs lowest, so it is the one that leaves the frame first.
@@ -912,21 +794,8 @@ void Panel::Impl::CollectFrame() {
     // With no frame there is no mean, so the base parameters stand.
     if (lastFrame.pixels.Empty()) {
         material = theme.material;
-        materialSettled = false;
         return;
     }
-
-    // Worked out once per gesture, not once per frame.
-    //
-    // The operating point answers "what is behind the panel", which is a
-    // property of where the panel opened, not of what is moving behind it a
-    // moment later. Re-deriving it on every live frame makes the bias chase a
-    // video playing underneath, and the whole panel pulses in step with it:
-    // adaptation is meant to be invisible, and something that changes while you
-    // watch it is the one way it cannot be. The backdrop still moves; the glass
-    // it is seen through holds still.
-    if (materialSettled) return;
-    materialSettled = true;
 
     const uint32_t mean = MeanColourIn(lastFrame.pixels,
                                        panelRect.left - lastFrame.bounds.left,
@@ -963,29 +832,14 @@ void Panel::Impl::CollectFrame() {
 // of it is new machinery: collect the frame, bake the backdrop, bake the label,
 // in that order, because the app name's capsule is glass cut from the same frame.
 void Panel::Impl::WaitForCapture() {
-    if (!visible) {
+    if (!pendingCapture.valid() || !visible) {
         ::KillTimer(hwnd, kLateCaptureTimer);
-        return;
-    }
-
-    const bool live = LiveBackdropWanted();
-
-    if (!pendingCapture.valid()) {
-        // Nothing in flight. In the frozen case there is nothing left to do; in
-        // the live case this is where the next frame is asked for, which is what
-        // makes the backdrop follow the desktop instead of the moment the
-        // gesture started.
-        if (!live) {
-            ::KillTimer(hwnd, kLateCaptureTimer);
-            return;
-        }
-        StartCapture();
         return;
     }
 
     if (pendingCapture.wait_for(std::chrono::milliseconds(0)) !=
         std::future_status::ready) {
-        lateCaptureWaitedMs += liveTickMs ? liveTickMs : kLateCaptureTickMs;
+        lateCaptureWaitedMs += kLateCaptureTickMs;
         if (lateCaptureWaitedMs >= kLateCaptureGiveUpMs) {
             ::KillTimer(hwnd, kLateCaptureTimer);
             // Left valid on purpose. Hide() and the next StartCapture own it,
@@ -996,48 +850,15 @@ void Panel::Impl::WaitForCapture() {
         return;
     }
 
-    lateCaptureWaitedMs = 0;
+    ::KillTimer(hwnd, kLateCaptureTimer);
 
     CollectFrame();
-    if (lastFrame.pixels.Empty()) {
-        // Nothing usable. Stop rather than spin: a machine that cannot grab the
-        // desktop once will not do better sixty times a second, and the panel
-        // has its flat coat.
-        ::KillTimer(hwnd, kLateCaptureTimer);
-        return;
-    }
+    if (lastFrame.pixels.Empty()) return;   // nothing usable came back
 
     BakeBackdrop();
-
-    if (!live) {
-        BakeLabel();
-        ::KillTimer(hwnd, kLateCaptureTimer);
-        MACTAB_DIAG("panel: late capture landed, backdrop re-baked");
-        return;
-    }
-
-    // The backdrop only, on a live frame. The app name's capsule is glass cut
-    // from the same grab, but re-baking it means a DirectWrite layout and a new
-    // surface every frame, and BakeLabel clears the brush before it starts, so
-    // at sixty times a second the name would flicker. It keeps the glass it was
-    // baked with; it is a small capsule under a sigma-8 blur, and nobody is
-    // looking through it at the thing that is moving.
-
-    // Straight into the next one. The timer paces how often a frame is taken;
-    // the grab itself takes as long as it takes, and starting the next only
-    // after this one has been drawn means the queue can never grow.
-    StartCapture();
-}
-
-// Whether the backdrop should be following the desktop right now.
-//
-// Three things have to hold: the user asked for it, this window is genuinely
-// hidden from screen grabs, and the panel is on screen. The middle one is the
-// load-bearing one. Without the exclusion, a grab taken while the panel is up
-// contains the panel, and feeding that back in blurs the panel into itself a
-// little more every frame until the whole thing is a smear.
-bool Panel::Impl::LiveBackdropWanted() const {
-    return liveBackdrop && visible && config::Current().liveBackdrop;
+    BakeLabel();
+    MACTAB_DIAG("panel: late capture landed after %u ms, backdrop re-baked",
+                lateCaptureWaitedMs);
 }
 
 // Every piece of glass gets its own operating point: the panel and the app
@@ -1525,9 +1346,6 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
     impl.items    = std::move(items);
     impl.selected = selectedIndex;
 
-    // A new gesture works out its own operating point.
-    if (!impl.visible) impl.materialSettled = false;
-
     // Re-resolve the theme once per gesture, so switching Windows between light
     // and dark, or picking a theme from the tray, takes effect on the next
     // Alt+Tab rather than on the next launch. Everything else on the panel is
@@ -1638,45 +1456,15 @@ void Panel::Show() {
     impl.BakeBackdrop();
     impl.BakeLabel();
 
-    // One timer, two jobs, because they are the same job at different rates:
-    // take the frame that is in flight and put it on the screen.
-    //
-    // Frozen: it runs only while a grab that missed the reveal is outstanding.
-    // On a still desktop that slow path is the NORMAL one, and without this the
-    // panel spends the whole gesture as a slab with none of the material
-    // visible through it.
-    //
-    // Live: it runs for as long as the panel is up, asking for the next frame
-    // as soon as the last one has been drawn.
-    //
-    // `visible` is set after this lambda returns, and LiveBackdropWanted tests
-    // it, so the timer is armed on the exclusion here and the tick itself does
-    // the rest once the panel is really up.
-    //
-    // The exclusion goes first, so that no grab taken from this point on can
-    // contain the panel. That matters even in the frozen case: the first grab
-    // can still be running when the panel appears.
-    impl.ExcludeFromCapture();
-
-    const bool live = impl.liveBackdrop;
-
-    if (live) {
-        const int hz = config::Current().liveBackdropHz;
-        impl.liveTickMs = hz > 0
-            ? (std::max)(4u, 1000u / static_cast<UINT>(hz))
-            : DisplayTickMs(::MonitorFromWindow(impl.hwnd, MONITOR_DEFAULTTONEAREST));
-    } else {
-        impl.liveTickMs = 0;
-    }
-
-    if (live || impl.pendingCapture.valid()) {
+    // The grab was not back in time, so what was just baked is the flat coat.
+    // Keep asking for it: on a still desktop the slow path through desktop
+    // duplication's timeouts and a CAPTUREBLT blit is the NORMAL one, and
+    // without this the panel spends the whole gesture as a slab with none of the
+    // material visible through it.
+    if (impl.pendingCapture.valid()) {
         impl.lateCaptureWaitedMs = 0;
-        ::SetTimer(impl.hwnd, kLateCaptureTimer,
-                   live ? impl.liveTickMs : kLateCaptureTickMs, nullptr);
+        ::SetTimer(impl.hwnd, kLateCaptureTimer, kLateCaptureTickMs, nullptr);
     }
-
-    if (live)
-        MACTAB_DIAG("panel: live backdrop, refreshing every %u ms", impl.liveTickMs);
 
     // SW_SHOWNA: show without activating, so the panel never becomes the
     // foreground window and never competes with the window we are about to
@@ -1731,9 +1519,6 @@ void Panel::Hide() {
 
     // Nothing left to wait for now that the panel is gone.
     ::KillTimer(impl.hwnd, kLateCaptureTimer);
-    impl.liveTickMs      = 0;
-    impl.materialSettled = false;
-    impl.AllowCapture();
 
     // Abandon any capture that was still in flight. The detached thread
     // finishes harmlessly; dropping the future here keeps a stale frame from

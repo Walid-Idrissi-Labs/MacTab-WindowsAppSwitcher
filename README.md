@@ -511,40 +511,6 @@ is dimmed before the material sees it, by the same amount the backdrop is, so th
 glass adapts to the scene you are actually looking at instead of to a brighter one
 that only exists in a file.
 
-### The backdrop, live
-
-The panel's backdrop used to be a single frozen frame, grabbed just before the
-panel appeared, and the reason was circular: the panel is on screen while it is
-open, so grabbing the desktop again grabs the panel, and a backdrop containing
-the panel blurs into itself a little more every frame until the whole thing is a
-smear.
-
-`SetWindowDisplayAffinity` with `WDA_EXCLUDEFROMCAPTURE` breaks the circle. It
-takes the window out of what a screen grab can see while leaving it on screen,
-so the grab comes back as if MacTab were not there and can be repeated as often
-as the display refreshes. The refresh rides the timer that already existed to
-collect a late grab, at the display's own rate, and asks for the next frame only
-once the last one has been drawn, so the queue cannot grow.
-
-Two builds matter. 19041 is where the flag exists at all. 22000, Windows 11, is
-where the exclusion is dependable for a GDI screen copy, which is what the live
-path reads through: on Windows 10 it is honoured by desktop duplication but not
-reliably by a blit, and honoured-sometimes is the worst case here, because what
-gets composited into the backdrop is the panel. So the live backdrop asks for
-22000 and Windows 10 keeps the frozen frame.
-
-**While it is on, the panel is invisible to screenshots and screen recording**,
-because that is the same machinery it is being hidden from. Set `LiveBackdrop=0`
-before capturing a picture of the glass, which on this project is how the glass
-gets looked at at all.
-
-Two things deliberately do not follow the live frame. The operating point in
-`Adapt()` is worked out once per gesture: a bias that chases a video playing
-underneath makes the whole panel pulse, and adaptation is meant to be invisible.
-And the app name's capsule keeps the glass it was baked with, because re-baking
-it means clearing its brush and re-running a DirectWrite layout, which at sixty
-frames a second flickers the name.
-
 **The background is the wallpaper, not the screen.** Mission Control lifts the
 windows off and leaves the desktop, so capturing the screen would put every
 window into the blurred backdrop as well as into the arrangement, and each one
@@ -611,8 +577,6 @@ defaults and comments on first run:
 | `TileSize` | 128 | Icon size in logical pixels at 100% scaling |
 | `Theme` | auto | `auto`, `light` or `dark` |
 | `CaptureSource` | auto | How the desktop behind the panel is grabbed: `auto`, `duplication`, `bitblt` or `plain`. **If the panel is a flat grey slab, this is the key to try**, in the order `plain`, `bitblt`, `duplication` |
-| `LiveBackdrop` | 1 | Keep the desktop behind the panel moving instead of freezing it when the gesture starts. Needs Windows 11. **While it is on, the panel does not appear in screenshots or screen recordings** |
-| `LiveBackdropHz` | 0 | Ceiling on how often that refreshes. 0 follows the display |
 | `GroupByApp` | 1 | 0 gives one tile per window instead of one per application |
 | `PanelDisplay` | active | `active`, `mouse` or `main` |
 | `GlassRefraction` | 1 | Bend the desktop at the panel's rim. Set to 0 if the edge looks doubled or smeared on your machine |
