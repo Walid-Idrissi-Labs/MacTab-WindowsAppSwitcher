@@ -576,6 +576,7 @@ defaults and comments on first run:
 | `LeftAltOnly` | 1 | Ignore Right Alt and anything with Ctrl held. Keep this on if AltGr types `@ # { } [ ]` on your layout |
 | `TileSize` | 128 | Icon size in logical pixels at 100% scaling |
 | `Theme` | auto | `auto`, `light` or `dark` |
+| `CaptureSource` | auto | How the desktop behind the panel is grabbed: `auto`, `duplication`, `bitblt` or `plain`. **If the panel is a flat grey slab, this is the key to try**, in the order `plain`, `bitblt`, `duplication` |
 | `GroupByApp` | 1 | 0 gives one tile per window instead of one per application |
 | `PanelDisplay` | active | `active`, `mouse` or `main` |
 | `GlassRefraction` | 1 | Bend the desktop at the panel's rim. Set to 0 if the edge looks doubled or smeared on your machine |
@@ -614,19 +615,27 @@ associated with `.ini` (Notepad on a machine with no override). Saving it
 re-reads the file on its own; *Reload settings.ini* does the same from the menu
 and reports what it found. *Reset settings.ini* is the way back.
 
-There is a second reason tuning could look inert, and it is worth checking
-before touching a number. The panel needs a picture of the desktop behind it,
-grabbed while the panel is still hidden, and if that grab misses the reveal the
-panel draws a fallback coat that is 96% opaque. Nothing in the material shows
-through that, so every value in the file becomes invisible at once. Up to 0.9 a
-late grab was thrown away and the whole gesture stayed flat, and the grab was
-slowest exactly when the desktop was still: desktop duplication has nothing to
-hand over until something on screen changes, so a still desktop spent 48 ms
-proving that before falling back to a slower blit, while a window animating
-behind the panel returned in one. Glass while something moves and a grey slab
-otherwise. A late grab is now taken whenever it lands and the backdrop is
-re-baked, and the duplication attempt no longer waits six times to learn what it
-knows after one.
+**If the panel is a flat grey slab, do not tune anything yet.** It means the
+panel has no picture of the desktop behind it, so it is drawing a coat that is
+96% opaque and there is nothing there for any of these numbers to act on. MacTab
+now says so with a balloon the first time it happens in a session, and
+`CaptureSource` in `settings.ini` is the way out: try `plain`, then `bitblt`,
+then `duplication`, saving after each.
+
+That state has two causes, both fixed in 0.9 and 0.9.1 as far as they can be
+fixed from a machine that cannot run the program. A grab that arrived after the
+panel was revealed used to be thrown away, leaving the whole gesture flat; it is
+now taken whenever it lands and the backdrop is re-baked. And nothing ever
+looked at the captured pixels, so a blit that succeeded and returned black,
+which is a known state under DWM, was treated as a genuinely black desktop and
+blurred into a grey slab. Grabs are now assessed for whether there is a picture
+in them, and three paths are tried in order until one comes back with something.
+
+Desktop duplication deserves a note of its own, because it explains the shape of
+the complaint. It hands over a frame when the desktop has *changed* and never
+otherwise, so on a still screen it cannot deliver at all, while a window
+animating behind the panel makes it return at once. Glass while something moves
+and grey the rest of the time is what that looks like from the outside.
 
 Until 0.9 the reloading did not work either, and it is worth being precise about
 why, because the file was documented as tunable for four releases while most of
