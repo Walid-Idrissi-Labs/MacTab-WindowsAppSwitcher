@@ -43,6 +43,20 @@ namespace {
 
 constexpr wchar_t kPanelClass[] = L"MacTabPanelWindow";
 
+// Polls for a desktop grab that missed the reveal. See Impl::WaitForCapture.
+//
+// 16 ms is one frame: the grab is already finished or nearly so by the time this
+// arms, and anything slower would be visible as the panel sitting flat for a
+// beat before turning to glass. It stops on the first frame that lands, on the
+// deadline below, and when the panel hides.
+constexpr UINT_PTR kLateCaptureTimer   = 1;
+constexpr UINT     kLateCaptureTickMs  = 16;
+
+// How long to keep asking. A grab that has not come back within this has hit
+// something worse than a slow path, and the flat coat is the answer for the rest
+// of the gesture.
+constexpr UINT     kLateCaptureGiveUpMs = 1000;
+
 // Tile size, gap, padding, corner radius and the shrink-to-fit rule live in
 // panel_layout.h, which is free of windows.h so tools/preview can render the
 // real geometry natively. The material and everything that draws it live in
@@ -166,10 +180,14 @@ struct Panel::Impl {
     std::future<capture::Frame> pendingCapture;
     capture::Frame              lastFrame;   // reused when relaying out while visible
 
+    // How long the late-capture timer has been asking, in milliseconds.
+    UINT lateCaptureWaitedMs = 0;
+
     void Layout(int count);
     void BakeSelection();
     void StartCapture();
     void CollectFrame();
+    void WaitForCapture();
     void DrawGlass(ID2D1DeviceContext* dc, POINT surfaceOffset,
                    const RECT& screenRect, float radius);
     void BakeBackdrop();
@@ -321,6 +339,11 @@ LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     auto* impl = reinterpret_cast<Panel::Impl*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (!impl)
         return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+
+    if (msg == WM_TIMER && wParam == kLateCaptureTimer) {
+        impl->WaitForCapture();
+        return 0;
+    }
 
     if (msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP) {
         POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -700,15 +723,31 @@ void Panel::Impl::CollectFrame() {
     if (pendingCapture.valid()) {
         if (pendingCapture.wait_for(std::chrono::milliseconds(10)) ==
             std::future_status::ready) {
-            lastFrame = pendingCapture.get();
+            lastFrame      = pendingCapture.get();
+            pendingCapture = {};
         } else {
             // Do NOT fall through to the previous lastFrame: after the first
             // gesture that holds a stale desktop, and a visibly outdated blur
             // reads worse than no blur at all.
-            MACTAB_WARN("panel: capture not ready at reveal, using the flat fallback");
+            //
+            // The grab is KEPT, though, and that is the whole difference between
+            // a panel that is glass and one that is a grey slab. Up to 0.9 this
+            // dropped the future on the floor, so a grab that came in one
+            // millisecond late meant the fallback coat, which is 96% opaque, for
+            // the entire gesture, and no number in the material could be seen
+            // through it. On a still desktop that was the normal case rather
+            // than the rare one: desktop duplication has nothing to hand over
+            // until something on screen changes, so the grab took its timeouts
+            // and then went the slow way round through BitBlt, while a window
+            // animating behind the panel made it return at once. Glass while
+            // something moves and grey the rest of the time is exactly what that
+            // looks like from the outside.
+            //
+            // WaitForCapture below picks it up and re-bakes.
+            MACTAB_WARN("panel: capture not ready at reveal, showing the flat "
+                        "fallback and waiting for it");
             lastFrame = {};
         }
-        pendingCapture = {};
     }
 
     // A relayout while the panel is already up reuses the frame captured at
@@ -769,6 +808,46 @@ void Panel::Impl::CollectFrame() {
                 glass::PanelLuma(material, backdropLuma),
                 optics.bezel, glass::Displacement(optics.bezel * 0.05f, optics),
                 config::Current().glassRefraction ? "on" : "off");
+}
+
+// A grab that missed the reveal, brought in as soon as it lands.
+//
+// Called on a timer while the panel is up. The frame it is waiting for was taken
+// before the panel was shown, so it is still a picture of the desktop without us
+// in it and is exactly as good late as it would have been on time; the only cost
+// of it arriving late is that the panel was a flat coat until it did.
+//
+// Everything re-run here is already re-run by a relayout while visible, so none
+// of it is new machinery: collect the frame, bake the backdrop, bake the label,
+// in that order, because the app name's capsule is glass cut from the same frame.
+void Panel::Impl::WaitForCapture() {
+    if (!pendingCapture.valid() || !visible) {
+        ::KillTimer(hwnd, kLateCaptureTimer);
+        return;
+    }
+
+    if (pendingCapture.wait_for(std::chrono::milliseconds(0)) !=
+        std::future_status::ready) {
+        lateCaptureWaitedMs += kLateCaptureTickMs;
+        if (lateCaptureWaitedMs >= kLateCaptureGiveUpMs) {
+            ::KillTimer(hwnd, kLateCaptureTimer);
+            // Left valid on purpose. Hide() and the next StartCapture own it,
+            // and the thread behind it must not be waited on here: this runs on
+            // the UI thread inside a gesture.
+            MACTAB_WARN("panel: capture never came back, staying on the flat coat");
+        }
+        return;
+    }
+
+    ::KillTimer(hwnd, kLateCaptureTimer);
+
+    CollectFrame();
+    if (lastFrame.pixels.Empty()) return;   // nothing usable came back
+
+    BakeBackdrop();
+    BakeLabel();
+    MACTAB_DIAG("panel: late capture landed after %u ms, backdrop re-baked",
+                lateCaptureWaitedMs);
 }
 
 // Every piece of glass gets its own operating point: the panel and the app
@@ -1366,6 +1445,16 @@ void Panel::Show() {
     impl.BakeBackdrop();
     impl.BakeLabel();
 
+    // The grab was not back in time, so what was just baked is the flat coat.
+    // Keep asking for it: on a still desktop the slow path through desktop
+    // duplication's timeouts and a CAPTUREBLT blit is the NORMAL one, and
+    // without this the panel spends the whole gesture as a slab with none of the
+    // material visible through it.
+    if (impl.pendingCapture.valid()) {
+        impl.lateCaptureWaitedMs = 0;
+        ::SetTimer(impl.hwnd, kLateCaptureTimer, kLateCaptureTickMs, nullptr);
+    }
+
     // SW_SHOWNA: show without activating, so the panel never becomes the
     // foreground window and never competes with the window we are about to
     // switch to.
@@ -1416,6 +1505,9 @@ void Panel::Hide() {
     ::ShowWindow(impl.hwnd, SW_HIDE);
     impl.visible      = false;
     impl.hoveredIndex = -1;
+
+    // Nothing left to wait for now that the panel is gone.
+    ::KillTimer(impl.hwnd, kLateCaptureTimer);
 
     // Abandon any capture that was still in flight. The detached thread
     // finishes harmlessly; dropping the future here keeps a stale frame from

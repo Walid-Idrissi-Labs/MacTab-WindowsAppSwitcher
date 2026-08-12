@@ -614,8 +614,23 @@ associated with `.ini` (Notepad on a machine with no override). Saving it
 re-reads the file on its own; *Reload settings.ini* does the same from the menu
 and reports what it found. *Reset settings.ini* is the way back.
 
-Until 0.9 this did not work, and it is worth being precise about why, because
-the file was documented as tunable for four releases while most of it was not.
+There is a second reason tuning could look inert, and it is worth checking
+before touching a number. The panel needs a picture of the desktop behind it,
+grabbed while the panel is still hidden, and if that grab misses the reveal the
+panel draws a fallback coat that is 96% opaque. Nothing in the material shows
+through that, so every value in the file becomes invisible at once. Up to 0.9 a
+late grab was thrown away and the whole gesture stayed flat, and the grab was
+slowest exactly when the desktop was still: desktop duplication has nothing to
+hand over until something on screen changes, so a still desktop spent 48 ms
+proving that before falling back to a slower blit, while a window animating
+behind the panel returned in one. Glass while something moves and a grey slab
+otherwise. A late grab is now taken whenever it lands and the backdrop is
+re-baked, and the duplication attempt no longer waits six times to learn what it
+knows after one.
+
+Until 0.9 the reloading did not work either, and it is worth being precise about
+why, because the file was documented as tunable for four releases while most of
+it was not.
 The panel copies the material into its own theme, and that copy was only
 refreshed when Windows switched between light and dark. Reloading changed the
 numbers in the settings and nothing else, so the six shared `Glass*` optics,
@@ -829,7 +844,10 @@ useful with the log attached than without it.
    Settings, and a second virtual desktop are the interesting cases.
 5. **Which capture path won.** The log names it: `desktop-duplication` is the
    good one, `gdi-bitblt` is the fallback, `none` means a flat tint. Hybrid-GPU
-   laptops and HDR displays are the likely failures.
+   laptops and HDR displays are the likely failures. `capture none` on the
+   `panel: backdrop baked` line is the one to watch for: it means the panel is
+   showing its fallback coat, which is 96% opaque, so the material is not being
+   applied at all and no amount of tuning will show through it.
 6. **The glass over extremes.** A pure white wallpaper and a pure black one. The
    material compresses the backdrop's range specifically so neither blows
    through, and the app name has to stay readable over both.

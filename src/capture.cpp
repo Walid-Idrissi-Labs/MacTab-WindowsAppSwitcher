@@ -10,11 +10,27 @@
 namespace mactab::capture {
 namespace {
 
-// Total time we are willing to spend waiting for a duplicated frame. The reveal
-// is never blocked on this; the panel shows with a flat tint and crossfades the
-// blur in if it arrives late, so this only bounds the worker.
+// Total time we are willing to spend waiting for a duplicated frame.
+//
+// One attempt, not six. AcquireNextFrame hands over a frame when the desktop has
+// CHANGED since the duplication was opened, and returns DXGI_ERROR_WAIT_TIMEOUT
+// when it has not. On a still desktop, which is most of the time somebody
+// presses Alt+Tab, nothing is ever going to arrive, so the five extra attempts
+// were 40 ms spent proving a negative and then going the slow way round through
+// BitBlt anyway.
+//
+// That 40 ms was not free. The panel is revealed after RevealDelayMs, 180 by
+// default, and a grab that misses that shows the near-opaque fallback coat
+// instead of glass. Add an uncached D3D11CreateDevice, a DuplicateOutput and a
+// CAPTUREBLT blit, which forces a DWM sync, and a still desktop could go over
+// the line while a moving one came back inside 8 ms. Glass while something
+// animates behind the panel and a grey slab the rest of the time is exactly what
+// that looks like to the person using it.
+//
+// The reveal is no longer lost when this does overrun: Panel::WaitForCapture
+// takes the frame whenever it lands and re-bakes.
 constexpr DWORD kAcquireTimeoutMs = 8;
-constexpr int   kAcquireAttempts  = 6;
+constexpr int   kAcquireAttempts  = 1;
 
 bool InRemoteSession() {
     // Explicit check rather than trying to detect black frames: desktop
@@ -140,6 +156,9 @@ Frame GrabWithDuplication(const RECT& rect) {
     }
 
     if (FAILED(acquireHr)) {
+        // DXGI_ERROR_WAIT_TIMEOUT (0x887A0027) here is the ordinary answer on a
+        // desktop that has not changed, not a fault: BitBlt picks it up and the
+        // panel is none the wiser. Anything else is worth reading.
         MACTAB_WARN("capture: AcquireNextFrame failed (hr 0x%08lX)",
                     static_cast<unsigned long>(acquireHr));
         return frame;
