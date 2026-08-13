@@ -48,7 +48,6 @@ const char* SourceName(Source source);
 // it cannot tear, and a stale read costs one gesture the path it would have
 // preferred.
 void Force(Source source);
-Source Forced();
 
 // Parse the settings keyword: "auto", "duplication", "bitblt" or "plain".
 Source ParseSource(const wchar_t* keyword);
@@ -83,11 +82,5 @@ struct Frame {
 // Safe to call from a worker thread. Never throws; on total failure returns a
 // Frame with source == None.
 Frame GrabRegion(const RECT& rect);
-
-// Release cached devices. Desktop duplication is deliberately not kept open
-// between gestures: whether an idle open duplication makes DWM do extra
-// per-frame work is undocumented, and a 0%-idle budget cannot absorb
-// "probably fine".
-void ReleaseCachedResources();
 
 } // namespace mactab::capture

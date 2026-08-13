@@ -47,7 +47,4 @@ bool Acquire(const Request& request, Bitmap& out);
 // read without the shell. Empty until resolved.
 std::wstring DisplayName(const std::wstring& key);
 
-// Drop cached tiles. Used when DPI changes make every cached size wrong.
-void ClearMemoryCache();
-
 } // namespace mactab::icons

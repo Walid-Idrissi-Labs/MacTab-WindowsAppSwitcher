@@ -462,10 +462,6 @@ void QualifyForeground() {
     ::SendInput(2, tap, sizeof(INPUT));
 }
 
-bool IsOwnInjection(ULONG_PTR extraInfo) {
-    return extraInfo == kInjectionTag;
-}
-
 void NeutralizeAlt(WORD altVirtualKey) {
     if (altVirtualKey == 0) altVirtualKey = VK_MENU;
 

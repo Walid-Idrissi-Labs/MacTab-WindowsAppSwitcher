@@ -102,15 +102,4 @@ std::vector<HWND> Snapshot() {
     return live;
 }
 
-HWND Previous() {
-    const std::vector<HWND> live = Snapshot();
-    if (live.empty()) return nullptr;
-
-    const HWND current = ::GetForegroundWindow();
-    for (HWND hwnd : live) {
-        if (hwnd != current) return hwnd;
-    }
-    return nullptr;
-}
-
 } // namespace mactab::foreground

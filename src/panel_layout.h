@@ -83,9 +83,6 @@ struct Metrics {
     float labelHeight = kLabelHeight;
     float labelGap    = kLabelGap;
 
-    // Everything the window has to contain: the glass, the gap, the label.
-    float TotalHeight() const { return panelHeight + labelGap + labelHeight; }
-
     // Left edge of tile `index`, relative to the panel's origin.
     float TileX(int index) const {
         return padding + static_cast<float>(index) * (tileSize + gap);

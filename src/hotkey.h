@@ -214,9 +214,4 @@ void NeutralizeAlt(WORD altVirtualKey);
 // than a window.
 void QualifyForeground();
 
-// True if the key event currently being processed was injected by us. Exposed
-// for the activation path, which must not treat its own synthetic input as a
-// user gesture.
-bool IsOwnInjection(ULONG_PTR extraInfo);
-
 } // namespace mactab::hotkey

@@ -14,15 +14,6 @@ std::string ToUtf8(std::wstring_view w) {
     return out;
 }
 
-std::wstring FromUtf8(std::string_view s) {
-    if (s.empty()) return {};
-    const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    if (n <= 0) return {};
-    std::wstring out(static_cast<size_t>(n), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
-    return out;
-}
-
 const std::wstring& AppDataDir() {
     // Resolved once; every later call is a cheap reference return.
     static const std::wstring dir = []() -> std::wstring {

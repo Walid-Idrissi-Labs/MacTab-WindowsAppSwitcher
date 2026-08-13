@@ -26,8 +26,4 @@ void Stop();
 // transient UI object in the session and would be a constant CPU drip.
 std::vector<HWND> Snapshot();
 
-// The window a quick Alt+Tab should land on: the most recent one that is not
-// currently in the foreground. Returns nullptr if there is nothing to switch to.
-HWND Previous();
-
 } // namespace mactab::foreground

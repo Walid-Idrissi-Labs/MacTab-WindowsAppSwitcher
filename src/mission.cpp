@@ -115,14 +115,6 @@ constexpr double kSharpBudgetMs   = 500.0;
 constexpr float kCloseSize   = 0.26f;
 constexpr float kCloseInset  = 0.16f;
 
-// How far outside the window the hover outline's texture reaches.
-//
-// Its own number, and small. Reusing the shadow's spread put the nine-grid's
-// fixed corner region at 24 plus the corner radius, which on a window under
-// about seventy pixels leaves no stretchable middle at all and the outline
-// comes out crushed. This only has to cover the stroke.
-constexpr float kOutlinePad   = 10.0f;
-
 // The shadow under each window, as a nine-grid texture baked once.
 //
 // One texture stretched to every size rather than a Composition drop shadow per

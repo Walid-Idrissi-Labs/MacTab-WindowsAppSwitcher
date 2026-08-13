@@ -302,8 +302,7 @@ Bitmap DecodeImageMemory(const void* data, size_t bytes) {
     return DecodeThroughWic(decoder.Get(), factory.Get());
 }
 
-Bitmap FromExecutableResource(const std::wstring& path, int* nativePixels) {
-    if (nativePixels) *nativePixels = 0;
+Bitmap FromExecutableResource(const std::wstring& path) {
     if (path.empty()) return {};
 
     // AS_DATAFILE|AS_IMAGE_RESOURCE maps the file for resource reads only: no
@@ -376,9 +375,6 @@ Bitmap FromExecutableResource(const std::wstring& path, int* nativePixels) {
     }
 
     if (out.Empty()) return {};
-
-    if (nativePixels)
-        *nativePixels = (std::max)(out.width, out.height);
 
     MACTAB_DIAG("icon_source: %s carries a %dx%d frame",
                 ToUtf8(path).c_str(), out.width, out.height);

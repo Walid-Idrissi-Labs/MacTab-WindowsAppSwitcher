@@ -383,8 +383,6 @@ void Force(Source source) {
     MACTAB_DIAG("capture: source forced to %s", SourceName(source));
 }
 
-Source Forced() { return g_forced; }
-
 Source ParseSource(const wchar_t* keyword) {
     if (!keyword) return Source::None;
     if (::lstrcmpiW(keyword, L"duplication") == 0) return Source::DesktopDuplication;
@@ -459,12 +457,6 @@ Frame GrabRegion(const RECT& rect) {
     MACTAB_WARN("capture: no path returned a usable frame (%s after %.2f ms)",
                 SourceName(best.source), NowMs() - started);
     return best;
-}
-
-void ReleaseCachedResources() {
-    // Nothing cached yet: devices and the duplication object are created and
-    // destroyed per grab, on purpose. If profiling later shows device creation
-    // dominating, cache the device but never the duplication.
 }
 
 } // namespace mactab::capture

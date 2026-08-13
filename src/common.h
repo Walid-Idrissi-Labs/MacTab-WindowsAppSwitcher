@@ -14,10 +14,9 @@
 
 namespace mactab {
 
-// UTF-16 <-> UTF-8. The diag log is UTF-8 on disk so it opens cleanly
+// UTF-16 to UTF-8. The diag log is UTF-8 on disk so it opens cleanly
 // everywhere; everything else in the process stays UTF-16.
-std::string  ToUtf8(std::wstring_view w);
-std::wstring FromUtf8(std::string_view s);
+std::string ToUtf8(std::wstring_view w);
 
 // %LOCALAPPDATA%\MacTab, created on first call. Returns an empty string if the
 // directory could not be resolved or created; callers must handle that rather

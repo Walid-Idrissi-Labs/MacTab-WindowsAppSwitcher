@@ -1145,34 +1145,24 @@ void OpenSettingsFile(HWND owner) {
     ::ShellExecuteW(owner, L"open", config::SettingsPath().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-// The whole material, re-read, without a restart.
-//
-// Not config::Load(), which reassigns the themes directory string the icon
-// worker reads on its own thread. This touches only the two Params and the
-// shared optics, and nothing off this thread reads either.
-//
-// The panel picks them up at the next gesture, because it copies the theme's
-// material when it lays out rather than caching one at startup. Mission
-// Control's bar does not: it is baked once and kept, precisely so that walking
-// the desktops does not re-run a full-width displacement map, so it has to be
-// thrown away by hand or a reload would reach everything except the piece most
-// likely to be tuned.
-//
-// UI thread only, which is the reason the file watcher posts a message instead
-// of calling this itself.
-void ReloadGlassFromSettings() {
-    config::ReloadGlass();
-    g_app.mission.InvalidateBackdrop();
-}
-
 void ApplySettings();
 
 // The whole file, re-read and put into effect.
 //
-// What saving settings.ini runs, and what the tray item runs. It used to be
-// ReloadGlassFromSettings above, which re-read the material and nothing else, so
-// changing the hold delay or the Mission Control keys in the file did nothing
-// until a restart and looked exactly like a key that does not work.
+// What saving settings.ini runs, and what the tray item runs. It used to re-read
+// the material and nothing else, so changing the hold delay or the Mission
+// Control keys in the file did nothing until a restart and looked exactly like a
+// key that does not work.
+//
+// The panel picks the material up at the next gesture, because it copies the
+// theme's when it lays out rather than caching one at startup. Mission Control's
+// bar does not: it is baked once and kept, precisely so that walking the
+// desktops does not re-run a full-width displacement map, so ApplySettings
+// throws it away by hand or a reload would reach everything except the piece
+// most likely to be tuned.
+//
+// UI thread only, which is the reason the file watcher posts a message instead
+// of calling this itself.
 void ReloadSettingsFromFile() {
     config::Reload();
     ApplySettings();
@@ -1423,7 +1413,7 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     // --- Tray ---------------------------------------------------------------
     case WM_MACTAB_TRAY: {
         const UINT event = LOWORD(lParam);
-        if (event == WM_CONTEXTMENU || event == NIN_SELECT || event == WM_LBUTTONUP) {
+        if (event == WM_CONTEXTMENU || event == NIN_SELECT) {
             POINT pt{ static_cast<LONG>(GET_X_LPARAM(wParam)),
                       static_cast<LONG>(GET_Y_LPARAM(wParam)) };
             ShowTrayMenu(hwnd, pt);

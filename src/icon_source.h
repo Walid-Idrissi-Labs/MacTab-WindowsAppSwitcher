@@ -37,10 +37,7 @@ Bitmap FromHIcon(HICON icon);
 // meant to look like that. And a Vista-era 256 frame is stored as PNG, decoded
 // here through WIC with its alpha intact, where the shell's route to the same
 // bytes goes through a GDI bitmap that regularly loses it.
-//
-// `nativePixels` reports the size the icon was actually authored at, which is
-// what decides whether it can be enlarged to fill a tile.
-Bitmap FromExecutableResource(const std::wstring& path, int* nativePixels = nullptr);
+Bitmap FromExecutableResource(const std::wstring& path);
 
 // Decode an image file, and the same from a block of memory.
 //

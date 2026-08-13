@@ -488,11 +488,4 @@ std::wstring DisplayName(const std::wstring& key) {
     return (found != g_displayNames.end()) ? found->second : std::wstring{};
 }
 
-void ClearMemoryCache() {
-    std::lock_guard<std::mutex> guard(g_lock);
-    g_tiles.clear();
-    g_lru.clear();
-    g_inFlight.clear();
-}
-
 } // namespace mactab::icons
