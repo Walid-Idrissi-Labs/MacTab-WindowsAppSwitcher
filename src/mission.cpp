@@ -284,7 +284,21 @@ struct Mission::Impl {
     // arrive in a batch AFTER the overlays have been brought back across, and
     // dismissing on them would close Mission Control the instant it was put
     // right. They are not a user leaving, so they are not listened to.
-    DWORD ignoreFocusUntil = 0;
+    // When the overlay started ignoring focus changes, and for how long.
+    //
+    // Stored as a start plus a span rather than a deadline so the comparison can
+    // be an unsigned subtraction, which is the only form that survives
+    // GetTickCount wrapping every 49.7 days. Comparing against a deadline the
+    // way this used to either lets a focus change through for three seconds or
+    // holds the overlay open past one, depending on which side of the wrap the
+    // two readings fall.
+    DWORD ignoreFocusFrom = 0;
+    DWORD ignoreFocusMs   = 0;
+
+    bool IgnoringFocus() const {
+        return ignoreFocusMs != 0 &&
+               ::GetTickCount() - ignoreFocusFrom < ignoreFocusMs;
+    }
 
     void FinishHide();
 
@@ -820,8 +834,7 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     // pointer moved to another monitor. WM_KILLFOCUS carries the window gaining
     // focus, and for a same-thread transfer that handle is reliable.
     case WM_KILLFOCUS:
-        if (impl->visible && impl->notifyWindow &&
-            ::GetTickCount() >= impl->ignoreFocusUntil &&
+        if (impl->visible && impl->notifyWindow && !impl->IgnoringFocus() &&
             !impl->IsOwnWindow(reinterpret_cast<HWND>(wParam)))
             ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
         return 0;
@@ -832,7 +845,7 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     // null. Dismissal is idempotent, so both firing is harmless.
     case WM_ACTIVATEAPP:
         if (wParam == FALSE && impl->visible && impl->notifyWindow &&
-            ::GetTickCount() >= impl->ignoreFocusUntil)
+            !impl->IgnoringFocus())
             ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 0, 0);
         return 0;
 
@@ -3141,7 +3154,8 @@ void Mission::BeginDesktopChurn() {
     // afterwards. Squelching only on the way back out works by that argument
     // alone, which is a thin thing to rely on for the difference between the
     // overlay staying up and it closing the moment a desktop is added.
-    m_impl->ignoreFocusUntil = ::GetTickCount() + 3000;
+    m_impl->ignoreFocusFrom = ::GetTickCount();
+    m_impl->ignoreFocusMs   = 3000;
 }
 
 void Mission::FollowDesktop(const GUID& desktop) {
@@ -3155,7 +3169,8 @@ void Mission::FollowDesktop(const GUID& desktop) {
     // Everything the switch made Windows say about our activation is now stale,
     // and it has been queued rather than delivered, because the message loop was
     // not running while we waited for the shell.
-    impl.ignoreFocusUntil = ::GetTickCount() + 800;
+    impl.ignoreFocusFrom = ::GetTickCount();
+    impl.ignoreFocusMs   = 800;
 
     for (Impl::Screen& screen : impl.screens) {
         desktops::MoveWindowTo(screen.hwnd, desktop);
@@ -3252,7 +3267,8 @@ void Mission::Impl::FinishHide() {
 
     visible = false;
     closing = false;
-    ignoreFocusUntil = 0;
+    ignoreFocusFrom = 0;
+    ignoreFocusMs   = 0;
 
     for (Screen& screen : screens) {
         GuardMission(*this, "Hide", [&] {
