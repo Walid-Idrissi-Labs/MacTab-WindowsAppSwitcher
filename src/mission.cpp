@@ -384,6 +384,13 @@ struct Mission::Impl {
         // windows of the same size does not redraw it.
         float outlineW = 0.0f;
         float outlineH = 0.0f;
+
+        // The wallpaper reduced to one miniature, at the size the chips are
+        // drawn at. Depends on the picture and the monitor, like the backdrop,
+        // and is dropped with it. See BakeBar for what it costs to work out.
+        Bitmap chipPaper;
+        int    chipPaperW = 0;
+        int    chipPaperH = 0;
         WUC::CompositionDrawingSurface barSurface{ nullptr };
 
         // How far the glass runs past the screen on the left, right and top, so
@@ -1151,6 +1158,9 @@ void Mission::InvalidateBackdrop() {
     for (Impl::Screen& screen : impl.screens) {
         screen.backdropSurface = nullptr;
         screen.barGlassSurface = nullptr;
+        screen.chipPaper       = {};
+        screen.chipPaperW      = 0;
+        screen.chipPaperH      = 0;
     }
     MACTAB_DIAG("mission: backdrops invalidated");
 }
@@ -1488,6 +1498,14 @@ void Mission::Impl::BakeBar(Screen& screen) {
     // resized here rather than read again. Asking the cache for a second size
     // means a second decode of what can be a 4K photograph, and it happened on
     // every single invocation.
+    //
+    // The reduction itself is then kept, because it was not cheap either. With
+    // the blur off, which is how this ships, the backdrop is decoded at the
+    // screen's own size, so this was box-filtering eight megapixels down to
+    // about a hundred and sixty by ninety, and doing it again on every reveal,
+    // every arrow press and every rearrangement. The result depends on the
+    // picture and the monitor and nothing else, exactly like the backdrop it
+    // comes from, and it is dropped alongside it.
     ComPtr<ID2D1BitmapBrush1> paperBrush;
     if (!screen.chips.empty()) {
         const float scale   = BackdropScale();
@@ -1496,9 +1514,18 @@ void Mission::Impl::BakeBar(Screen& screen) {
         const int chipW = (std::max)(1, static_cast<int>(screen.chips[0].w));
         const int chipH = (std::max)(1, static_cast<int>(screen.chips[0].h));
 
-        Bitmap paper = wallpaper::ForMonitor(screen.monitor, backdropW, backdropH);
-        if (!paper.Empty()) {
-            Bitmap chip = Resize(paper, chipW, chipH);
+        if (screen.chipPaper.Empty() ||
+            screen.chipPaperW != chipW || screen.chipPaperH != chipH) {
+            Bitmap paper = wallpaper::ForMonitor(screen.monitor, backdropW, backdropH);
+            if (!paper.Empty()) {
+                screen.chipPaper  = Resize(paper, chipW, chipH);
+                screen.chipPaperW = chipW;
+                screen.chipPaperH = chipH;
+            }
+        }
+
+        if (!screen.chipPaper.Empty()) {
+            Bitmap chip = screen.chipPaper;   // the upload takes ownership
             if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(chip))) {
                 D2D1_BITMAP_BRUSH_PROPERTIES1 props{};
                 props.extendModeX       = D2D1_EXTEND_MODE_CLAMP;
