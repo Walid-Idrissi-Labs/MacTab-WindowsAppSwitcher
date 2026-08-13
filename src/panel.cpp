@@ -341,6 +341,18 @@ LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return ::DefWindowProcW(hwnd, msg, wParam, lParam);
 
     if (msg == WM_TIMER && wParam == kLateCaptureTimer) {
+        // Killed here rather than inside the guard, because the guard declines
+        // to run at all once the panel is not ready, and it is the guard that
+        // owns every other KillTimer for this timer. A device loss that
+        // recovery cannot undo would otherwise leave this ticking every 16 ms
+        // for the rest of the process's life: Hide() is the only other place
+        // that kills it, and Hide() returns early while the panel is not
+        // visible, which after a failed Show it never is again.
+        if (!impl->ready || !impl->visible) {
+            ::KillTimer(hwnd, kLateCaptureTimer);
+            return 0;
+        }
+
         // Guarded like every other entry point that touches the compositor.
         // WaitForCapture re-bakes, every C++/WinRT call in a bake throws on
         // failure, and an hresult_error escaping a window procedure unwinds
@@ -1523,6 +1535,10 @@ void Panel::Show() {
         // topmost at zero opacity, swallowing every click over the middle of the
         // screen, and Hide() would never run, because `visible` is still false.
         ::ShowWindow(impl.hwnd, SW_HIDE);
+
+        // Armed earlier in the same lambda, and for the same reason Hide() is
+        // unreachable, nothing else would take it back down.
+        ::KillTimer(impl.hwnd, kLateCaptureTimer);
         return;
     }
     impl.visible = true;
