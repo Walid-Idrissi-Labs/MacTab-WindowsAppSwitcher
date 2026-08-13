@@ -47,6 +47,7 @@ HHOOK    g_hook          = nullptr;
 State    g_state         = State::Idle;
 UINT_PTR g_revealTimer   = 0;
 WORD     g_gestureAltVk  = 0;   // which Alt key opened the gesture
+DWORD    g_missionKeyVk  = 0;   // the Mission Control chord key, while it is down
 
 const char* GestureName(Gesture gesture) {
     switch (gesture) {
@@ -120,6 +121,12 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     const bool up   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
     const DWORD vk  = key->vkCode;
 
+    // Cleared in any state, not just Idle, so that an Alt gesture started while
+    // the Mission Control chord key is still down cannot leave this set and lock
+    // the chord out for the rest of the session.
+    if (up && vk == g_missionKeyVk)
+        g_missionKeyVk = 0;
+
     if (g_state == State::Idle) {
         // Win+Tab opens Mission Control.
         //
@@ -139,6 +146,16 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
                                g_options.missionGesture == Gesture::Both)));
 
         if (down && missionChord) {
+            // Auto-repeat delivers a fresh key-down about thirty times a second
+            // while the chord is held. This posts a toggle, so every one of
+            // those would close the overlay and open it again, rebuilding the
+            // whole payload each time, and the user holding Win+Tab for a second
+            // gets a strobe. Fire on the first down and swallow the repeats
+            // until the key comes back up.
+            if (g_missionKeyVk == vk)
+                return 1;
+            g_missionKeyVk = vk;
+
             PostToUi(WM_MACTAB_MISSION);
 
             // Two jobs, one injection.
