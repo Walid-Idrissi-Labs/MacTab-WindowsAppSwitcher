@@ -394,7 +394,15 @@ BorderFill RemoveBorderFill(Bitmap& bitmap) {
         }
 
         const int distance = ColourDistance(pixel, key);
-        if (distance >= kSoft) return;   // artwork, stop here
+        if (distance >= kSoft) {
+            // Artwork, so the fill stops. Marked anyway: it keeps its own alpha
+            // and is never pushed, and without the mark every pixel along the
+            // whole boundary between the fill and the artwork is tested again
+            // from each of its neighbours in turn.
+            seen[static_cast<size_t>(index)] = 1;
+            alpha[static_cast<size_t>(index)] = AlphaOf(pixel);
+            return;
+        }
 
         const double ramp = (distance <= kFlat)
             ? 0.0
