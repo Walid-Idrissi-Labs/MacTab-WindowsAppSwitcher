@@ -21,6 +21,23 @@ std::wstring g_themesDir;
 // How many glass values the last read took out of the file. See ReadGlass.
 int g_glassOverrides = 0;
 
+// The last write time settings.ini had when its contents were taken. See
+// ChangedOnDisk.
+ULONGLONG g_settingsStamp = 0;
+
+ULONGLONG WriteStamp() {
+    if (g_settingsPath.empty()) return 0;
+
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!::GetFileAttributesExW(g_settingsPath.c_str(), GetFileExInfoStandard, &data))
+        return 0;
+
+    ULARGE_INTEGER value{};
+    value.LowPart  = data.ftLastWriteTime.dwLowDateTime;
+    value.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    return value.QuadPart;
+}
+
 // Everything above the glass section, which is generated. See DefaultIni().
 const wchar_t* kDefaultIniHead =
     L"; MacTab settings. Delete this file to restore defaults, or use Reset\r\n"
@@ -619,6 +636,20 @@ void Reload() {
     if (g_settingsPath.empty()) return;
     FlushIniCache();
     ReadSettings();
+    g_settingsStamp = WriteStamp();
+}
+
+bool ChangedOnDisk() {
+    const ULONGLONG stamp = WriteStamp();
+
+    // Nothing to compare against, so read it. Covers both a file that is not
+    // there yet and one we could not stat.
+    if (stamp == 0) return true;
+
+    if (stamp == g_settingsStamp) return false;
+
+    g_settingsStamp = stamp;
+    return true;
 }
 
 void Load() {
@@ -645,6 +676,7 @@ void Load() {
     // Migrate was reading the old file is stale by now.
     FlushIniCache();
     ReadSettings();
+    g_settingsStamp = WriteStamp();
 }
 
 bool ResetSettings() {

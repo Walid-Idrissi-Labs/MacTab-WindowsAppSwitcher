@@ -302,6 +302,22 @@ const std::wstring& ThemesDir();
 // until Load() has run.
 const std::wstring& SettingsPath();
 
+// True when settings.ini has been written since the last time its contents were
+// taken, which is what tells a real edit apart from any other write to the
+// folder it lives in.
+//
+// The watcher has to be on the folder rather than the file, because most editors
+// save by writing a temporary file and renaming it over the target. That means
+// it also fires for everything else we keep in there: diag.log, which --diag
+// writes to constantly, and the icon cache directory, which the icon worker
+// touches every time it caches a tile. Reloading on those is wasted work at
+// best, and with --diag it is a loop, since the reload writes diag lines which
+// change the folder which asks for another reload.
+//
+// Consumes the answer: two calls in a row are true then false. Fails open, so a
+// file it cannot stat still gets read.
+bool ChangedOnDisk();
+
 // How many glass values the last read actually took out of settings.ini.
 //
 // Reported by the tray's reload. Somebody whose edit appeared to do nothing

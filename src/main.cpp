@@ -1285,6 +1285,14 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // One-shot: Win32 timers repeat, and this one has nothing to do
             // until the file changes again.
             ::KillTimer(hwnd, kSettingsReloadTimer);
+
+            // The watch is on the folder, so most of what wakes it is not an
+            // edit. Anything else we keep in there asks for a reload it does not
+            // need, and with --diag that is a loop rather than an annoyance,
+            // because the reload logs and the log is in the watched folder.
+            if (!config::ChangedOnDisk())
+                return 0;
+
             MACTAB_DIAG("host: settings.ini changed, re-reading it");
             ReloadSettingsFromFile();
         }
