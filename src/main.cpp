@@ -569,8 +569,18 @@ struct MissionPayload {
     bool                      known   = false;
 };
 
+// One per app in the payload the overlay is currently showing.
+//
+// Kept so that a tile finishing later can be delivered without enumerating
+// anything. The overlay is built from every desktop's windows, so the switcher's
+// own list is the wrong set to look in, and rebuilding it is a full EnumWindows
+// with an identity resolution per window, which is a lot of work to do on a
+// message that arrives in batches while the icons warm up.
+std::vector<icons::Request> g_missionIcons;
+
 MissionPayload BuildMissionPayload() {
     MissionPayload payload;
+    g_missionIcons.clear();
 
     // Every desktop's windows, not just this one's, so the strip can be walked
     // from inside without leaving.
@@ -591,7 +601,9 @@ MissionPayload BuildMissionPayload() {
         // WM_MACTAB_ICON_READY brings it back, so an app seen for the first
         // time gets its icon a moment later rather than never.
         Bitmap icon;
-        icons::Acquire(MakeIconRequest(app, kMissionIconSize), icon);
+        const icons::Request request = MakeIconRequest(app, kMissionIconSize);
+        icons::Acquire(request, icon);
+        g_missionIcons.push_back(request);
 
         const std::wstring resolved = icons::DisplayName(app.key);
 
@@ -823,6 +835,11 @@ void StopWatchingWindows() {
         g_missionDestroy = nullptr;
     }
     g_missionWindows.clear();
+
+    // Holds a window handle per app as its last-resort icon source, and those
+    // outlive nothing once the overlay is down.
+    g_missionIcons.clear();
+
     ::KillTimer(g_app.host, kMissionWatchTimer);
 }
 
@@ -1347,11 +1364,15 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_MACTAB_ICON_READY:
         if (g_app.mission.Visible()) {
-            for (const SwitcherApp& app : BuildSwitcherList()) {
+            // The apps the overlay is showing, which is not the switcher's list:
+            // that one is this desktop only, and the overlay holds every
+            // desktop's windows. Anything living entirely on another desktop
+            // never matched, so it kept its placeholder for as long as the
+            // overlay was open.
+            for (const icons::Request& request : g_missionIcons) {
                 Bitmap icon;
-                if (icons::Acquire(MakeIconRequest(app, kMissionIconSize), icon) &&
-                    !icon.Empty())
-                    g_app.mission.UpdateIcon(app.key, icon);
+                if (icons::Acquire(request, icon) && !icon.Empty())
+                    g_app.mission.UpdateIcon(request.key, icon);
             }
         }
         // Tiles usually finish during the hold delay, before the panel is
