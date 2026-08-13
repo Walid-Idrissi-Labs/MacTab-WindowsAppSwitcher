@@ -1250,6 +1250,14 @@ void ShutdownSubsystems() {
     hotkey::Stop();
     settings_watch::Stop();
     foreground::Stop();
+
+    // The overlay's own watch, which is separate from the two above and only
+    // running while it is open. Teardown can be reached with it on screen, and
+    // WM_ENDSESSION leaves the message loop running afterwards, so without this
+    // two WinEvent hooks and a timer go on firing into a process that has
+    // already dismantled everything they talk to.
+    StopWatchingWindows();
+
     icons::Stop();
     g_app.mission.Shutdown();
     g_app.panel.Shutdown();
