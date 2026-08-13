@@ -298,8 +298,13 @@ Frame GrabWithBitBlt(const RECT& rect, bool captureBlt) {
         }
 
         ::SelectObject(memory, previous);
-        ::DeleteObject(dib);
     }
+
+    // Outside the guard above, which tests the bits pointer as well as the
+    // bitmap. CreateDIBSection is documented to fill both or neither, so this
+    // should not be reachable, but a bitmap that exists and is never deleted is
+    // a leak on a path that runs once per gesture.
+    if (dib) ::DeleteObject(dib);
 
     ::DeleteDC(memory);
     ::ReleaseDC(nullptr, screen);
