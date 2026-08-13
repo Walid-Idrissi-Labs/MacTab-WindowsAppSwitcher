@@ -320,4 +320,16 @@ void Invalidate() {
     MACTAB_DIAG("wallpaper: cache dropped");
 }
 
+void Trim() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_cache.empty()) return;
+
+    size_t bytes = 0;
+    for (const Entry& entry : g_cache)
+        bytes += entry.pixels.pixels.size() * sizeof(uint32_t);
+
+    g_cache.clear();
+    MACTAB_DIAG("wallpaper: released %zu KB of decoded pixels", bytes / 1024);
+}
+
 } // namespace mactab::wallpaper

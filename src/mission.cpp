@@ -2464,6 +2464,15 @@ void Mission::Impl::BuildForDesktop(int desktop, int slide) {
         BakeBar(screen);
         BuildTiles(screen, members[s], slide);
     }
+
+    // Every surface cut from the wallpaper now exists, and each of those is
+    // kept for the life of the process, so the decoded pixels behind them are
+    // finished with. They are the largest thing this program ever holds: with
+    // the blur off the decode is at the display's native size, which is
+    // thirty-three megabytes on a 4K monitor, per monitor, and they were
+    // sitting there from the prewarm at startup onward against an idle budget
+    // of twenty. Anything that invalidates a surface decodes again.
+    wallpaper::Trim();
 }
 
 namespace {

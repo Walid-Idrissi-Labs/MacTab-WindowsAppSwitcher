@@ -53,4 +53,14 @@ uint32_t SolidColour();
 // WM_SETTINGCHANGE with SPI_SETDESKWALLPAPER.
 void Invalidate();
 
+// Drop the cache because everything that wanted it has taken its copy.
+//
+// The same clear as Invalidate for a different reason, and worth doing on its
+// own: these are full-screen bitmaps, and with the blur off they are decoded at
+// the display's native size, so a 4K monitor is thirty-three megabytes and two
+// of them are sixty-six. They are only ever needed to bake a surface from, and
+// once that surface exists nothing reads them again until something invalidates
+// it, which decodes afresh anyway.
+void Trim();
+
 } // namespace mactab::wallpaper
