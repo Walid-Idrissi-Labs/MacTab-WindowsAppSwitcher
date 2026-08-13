@@ -122,8 +122,8 @@ Bitmap Decode(const std::wstring& path, int width, int height, const RECT& regio
     if (path.empty() || width <= 0 || height <= 0 || keepW <= 0 || keepH <= 0)
         return {};
 
-    ComApartment apartment(COINIT_APARTMENTTHREADED);
-
+    // The apartment belongs to Region, which is the only caller and needs one
+    // before this is reached anyway.
     ComPtr<IWICImagingFactory> factory;
     if (FAILED(::CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_PPV_ARGS(factory.Put()))))
@@ -246,6 +246,18 @@ Bitmap Region(HMONITOR monitor, int width, int height, RECT region) {
             }
         }
     }
+
+    // Covers the lookup as well as the decode. It used to sit inside Decode,
+    // which left PathForMonitor running outside any apartment: harmless on the
+    // UI thread, which the panel has already put in an STA, but the first
+    // caller here is Mission's prewarm thread, which initialises nothing. There
+    // CoCreateInstance returned CO_E_NOTINITIALIZED and the per-monitor lookup
+    // fell through to SPI_GETDESKWALLPAPER every time, which is exactly the two
+    // cases IDesktopWallpaper is here for: one picture per monitor, and a
+    // slideshow, whose reported path is whichever file was current some time
+    // ago. The wrong pixels then went into the cache under a key that does not
+    // mention the path, so the UI thread could never correct it later.
+    ComApartment apartment(COINIT_APARTMENTTHREADED);
 
     // Decoding outside the lock. It reads a file and can take tens of
     // milliseconds on a 4K JPEG, and holding the lock across that would make a
