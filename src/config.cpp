@@ -786,12 +786,22 @@ bool SetGlassEnabled(bool enabled) {
 }
 
 bool SetMissionEnabled(bool enabled) {
-    if (g_settingsPath.empty()) return false;
+    // Applied first, persisted second, like the four setters above it. This one
+    // returned before setting anything when there was nowhere to write, so on a
+    // machine where the app data directory could not be created, the tray item
+    // said Mission Control had been switched off and Current() went on saying it
+    // was on.
+    g_settings.missionEnabled = enabled;
+
+    if (g_settingsPath.empty()) {
+        MACTAB_WARN("config: no settings file, MissionEnabled will not survive "
+                    "a restart");
+        return false;
+    }
 
     const bool ok = ::WritePrivateProfileStringW(kSection, L"MissionEnabled",
                                                  enabled ? L"1" : L"0",
                                                  g_settingsPath.c_str()) != FALSE;
-    g_settings.missionEnabled = enabled;
     MACTAB_DIAG("config: MissionEnabled -> %d (persisted %d)",
                 enabled ? 1 : 0, ok ? 1 : 0);
     return ok;
