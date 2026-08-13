@@ -421,10 +421,24 @@ Frame GrabRegion(const RECT& rect) {
     if (remote)
         MACTAB_DIAG("capture: remote session, skipping desktop duplication");
 
+    // Read once, and let go of a forced source that cannot run here.
+    //
+    // CaptureSource=duplication in a remote session used to skip every path in
+    // the loop: duplication because the session is remote, and the two GDI ones
+    // because they are not the forced source. Nothing ran, the panel fell back
+    // to the flat coat, and the only thing said about it was that no path
+    // returned a usable frame, which reads like all three were tried and failed.
+    Source forced = g_forced;
+    if (forced == Source::DesktopDuplication && remote) {
+        MACTAB_WARN("capture: CaptureSource=duplication cannot run in a remote "
+                    "session; using the other paths instead");
+        forced = Source::None;
+    }
+
     Frame best;   // the last thing that came back at all, blank or not
 
     for (const Source source : order) {
-        if (g_forced != Source::None && source != g_forced) continue;
+        if (forced != Source::None && source != forced) continue;
         if (source == Source::DesktopDuplication && remote) continue;
 
         Frame frame;
