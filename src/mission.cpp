@@ -2552,11 +2552,17 @@ void Mission::Impl::ApplySharpened(const SharpBatch& batch) {
         // Swapped rather than cross-faded. It is the same picture, only
         // honest, so there is nothing to fade between.
         //
-        // Opacity rather than IsVisible on purpose. Both would do, and Opacity
-        // is in the very first version of this API, where IsVisible is one of
-        // the ones this project has to check the build number for before it can
-        // use. Not worth finding out the hard way on somebody else's Windows 10.
-        tile.live.Opacity(0.0f);
+        // The live one is taken out of the tree and its registration released,
+        // rather than being left at zero opacity. Opacity hides a thumbnail; it
+        // does not disconnect one, and DWM goes on maintaining the relation to
+        // the source window for as long as it is registered. Every sharpened
+        // tile was leaving one of those behind for as long as the overlay
+        // stayed open.
+        tile.holder.Children().Remove(tile.live);
+        tile.live = nullptr;
+        thumbnail::ReleaseSharedVisual(tile.thumbnail);
+        tile.thumbnail = nullptr;
+
         tile.sharpened = true;
         ++done;
     }
