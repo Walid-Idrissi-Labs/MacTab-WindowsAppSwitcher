@@ -901,8 +901,9 @@ void StartWatchingWindows() {
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     // Desktops have no notification of any kind, public or otherwise, so the
-    // only way to notice one appearing is to look. Twice a second, two registry
-    // reads each time, and only while the overlay is on screen.
+    // only way to notice one appearing is to look. Twice a second, and only
+    // while the overlay is on screen: a registry read for the desktops, and,
+    // when those have not changed, an enumeration for the window handles.
     ::SetTimer(g_app.host, kMissionWatchTimer, 500, nullptr);
 
     // Anything that died between the list being built and the hooks going in.
@@ -934,11 +935,16 @@ void ForgetMissionWindow(HWND hwnd) {
 // arrivals are noticed by looking, which is affordable at twice a second and
 // only while the overlay is up.
 std::vector<HWND> EligibleWindows(const desktops::State& state) {
-    std::vector<HWND> handles;
+    // Handles only. This ran the full list build twice a second, which reads a
+    // title, a rect and a virtual desktop id per window, the last of those being
+    // a COM call, and then groups and sorts the result into strings, all to
+    // answer a question about which handles exist.
+    std::vector<HWND> handles =
+        EligibleWindowHandles(state.known && state.all.size() > 1);
 
-    for (const SwitcherApp& app : BuildWindowList(state.known && state.all.size() > 1))
-        for (const SwitcherWindow& window : app.windows)
-            if (!window.minimized) handles.push_back(window.hwnd);
+    handles.erase(std::remove_if(handles.begin(), handles.end(),
+                                 [](HWND hwnd) { return ::IsIconic(hwnd) != FALSE; }),
+                  handles.end());
 
     std::sort(handles.begin(), handles.end());
     return handles;

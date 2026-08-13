@@ -183,6 +183,23 @@ std::vector<SwitcherApp> BuildSwitcherList() {
     return BuildWindowList(false);
 }
 
+std::vector<HWND> EligibleWindowHandles(bool includeOtherDesktops) {
+    Enumeration enumeration;
+    enumeration.includeOtherDesktops = includeOtherDesktops;
+    ::EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&enumeration));
+
+    // ResolveApp stays, because a window whose process cannot be opened is
+    // dropped from the real list too and leaving it in here would look like a
+    // change that never resolves. It is also the one call in this loop that
+    // answers from a cache.
+    std::vector<HWND> handles;
+    handles.reserve(enumeration.windows.size());
+    for (HWND hwnd : enumeration.windows)
+        if (ResolveApp(hwnd)) handles.push_back(hwnd);
+
+    return handles;
+}
+
 std::vector<SwitcherApp> BuildWindowList(bool includeOtherDesktops) {
     MACTAB_DIAG_TIMER("window_model: BuildWindowList");
 

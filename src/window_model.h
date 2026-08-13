@@ -63,6 +63,17 @@ std::vector<SwitcherApp> BuildSwitcherList();
 // inside it without leaving it.
 std::vector<SwitcherApp> BuildWindowList(bool includeOtherDesktops);
 
+// Just the handles BuildWindowList would return windows for, in no order.
+//
+// The membership is identical to BuildWindowList's, including dropping windows
+// whose process cannot be opened, and that is the point: this exists to notice
+// that the list has changed, so a set that disagreed with the real one would
+// either miss every change or report one on every single look.
+//
+// What it skips is everything needed only to DRAW that list: titles, bounds,
+// which virtual desktop each window is on, the MRU ranking and the grouping.
+std::vector<HWND> EligibleWindowHandles(bool includeOtherDesktops);
+
 // Exposed for the diag dump and for unit-style spot checks: does this window
 // belong in the switcher at all?
 bool IsSwitcherWindow(HWND hwnd, bool includeOtherDesktops = false);
