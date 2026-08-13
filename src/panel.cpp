@@ -1227,9 +1227,23 @@ void Panel::Impl::Layout(int count) {
     if (!visible || !monitor)
         monitor = ChooseMonitor(hwnd);
 
+    // A monitor kept from an earlier layout can be gone by now: the panel holds
+    // it for the whole gesture, and a relayout runs on every window expansion
+    // and every app quit. When the handle is stale this fails and leaves the
+    // rect all zeroes, which makes the available width negative, and a negative
+    // width reaches SetWindowPos, the radius clamp and the backdrop bake. Pick
+    // again rather than lay out against a monitor that is not there.
     MONITORINFO monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
-    ::GetMonitorInfoW(monitor, &monitorInfo);
+    if (!::GetMonitorInfoW(monitor, &monitorInfo)) {
+        monitor = ChooseMonitor(hwnd);
+        monitorInfo = MONITORINFO{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        if (!::GetMonitorInfoW(monitor, &monitorInfo)) {
+            MACTAB_WARN("panel: no usable monitor for the layout");
+            return;
+        }
+    }
 
     UINT dpiX = 96, dpiY = 96;
     ::GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);

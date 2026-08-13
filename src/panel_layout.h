@@ -116,6 +116,13 @@ inline Metrics Compute(int count, float availableWidth, float dpiScale,
         return m;
     }
 
+    // A caller that could not read its monitor hands us a negative width, and
+    // everything downstream of that is nonsense: a negative panel width reaches
+    // SetWindowPos, and the radius clamp below turns it into a negative corner.
+    // One tile is the smallest thing worth drawing, so that is the floor.
+    availableWidth = (std::max)(availableWidth,
+                                kMinTileSize * dpiScale + m.padding * 2);
+
     auto widthFor = [&](float tile) {
         return m.padding * 2 + tile * count + m.gap * (count - 1);
     };
