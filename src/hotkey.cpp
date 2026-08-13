@@ -220,6 +220,28 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
 
     // --- A gesture is in flight (Armed or Panel) ---------------------------
 
+    // Nothing at all arrives from the secure desktop.
+    //
+    // A UAC prompt during a gesture takes the input desktop away, and an Alt
+    // released over there produces no event here. The state machine stays in
+    // flight with no Alt outstanding, the panel is on screen, and from then on
+    // every key-down system-wide is sunk by the return 1 at the bottom of this
+    // function. Tapping Alt or pressing Escape both recover it, but nothing
+    // tells the user that, so what it looks like is a dead keyboard. The session
+    // notifications cover lock, unlock and RDP disconnect; no session event
+    // fires for UAC.
+    //
+    // Returning from the secure desktop does update the async key table, so an
+    // event for some other key while the gesture's Alt is no longer physically
+    // down is the tell. Cancel rather than commit: the gesture was interrupted
+    // rather than finished, and quietly activating whatever tile was selected,
+    // seconds later, after the user has dealt with an elevation prompt, is a
+    // worse answer than leaving them where they are.
+    if (!IsAltKey(vk) && !KeyDown(g_gestureAltVk ? g_gestureAltVk : VK_MENU)) {
+        EndGesture(WM_MACTAB_CANCEL);
+        return ::CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
     // Alt released: commit.
     //
     // Only the Alt that actually opened the gesture counts. With leftAltOnly,
