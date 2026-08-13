@@ -427,9 +427,40 @@ void HandleActionKey(WORD virtualKey) {
         PopulatePanel();
         return;
 
-    case 'W':
-        CloseFrontWindow(app);
+    case 'W': {
+        // From the app row this is the window a commit would land on. Once the
+        // app has been expanded, it is the one under the highlight instead,
+        // which is the only reading of "close this window" that matches what
+        // the user is looking at.
+        const size_t target = g.windowMode ? static_cast<size_t>(g.index) : 0;
+        CloseWindow(app, target);
+
+        if (target >= app.windows.size()) return;
+
+        // The window leaves the gesture with it, exactly as Q drops a whole
+        // app, and for the same reason: the panel would otherwise keep showing
+        // a window count that includes it, the key above Tab would cycle onto a
+        // handle that is closing, and committing on it would land nowhere.
+        //
+        // It may refuse to go, on an unsaved-changes prompt. macOS is equally
+        // optimistic here, and the next gesture enumerates the truth.
+        app.windows.erase(app.windows.begin() + static_cast<ptrdiff_t>(target));
+
+        if (app.windows.empty()) {
+            g.apps.erase(g.apps.begin() + appSlot);
+            g.windowMode = false;
+            if (g.apps.empty()) {
+                g_app.panel.Hide();
+                return;
+            }
+            g.index = (std::min)(appSlot, static_cast<int>(g.apps.size()) - 1);
+        } else if (g.windowMode) {
+            g.index = (std::min)(g.index, static_cast<int>(app.windows.size()) - 1);
+        }
+
+        PopulatePanel();
         return;
+    }
 
     case 'H':
         HideApp(app);

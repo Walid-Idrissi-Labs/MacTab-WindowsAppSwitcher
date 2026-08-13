@@ -29,11 +29,12 @@ void QuitApp(const SwitcherApp& app) {
         RequestClose(window.hwnd);
 }
 
-void CloseFrontWindow(const SwitcherApp& app) {
-    if (app.windows.empty()) return;
+void CloseWindow(const SwitcherApp& app, size_t index) {
+    if (index >= app.windows.size()) return;
 
-    MACTAB_DIAG("actions: close front window of %s", ToUtf8(app.displayName).c_str());
-    RequestClose(app.windows.front().hwnd);
+    MACTAB_DIAG("actions: close window %zu of %zu of %s", index + 1,
+                app.windows.size(), ToUtf8(app.displayName).c_str());
+    RequestClose(app.windows[index].hwnd);
 }
 
 void HideApp(const SwitcherApp& app) {

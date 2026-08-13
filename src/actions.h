@@ -15,8 +15,10 @@ namespace mactab {
 // Apps with unsaved work will put up their own save prompt, which is correct.
 void QuitApp(const SwitcherApp& app);
 
-// W  closes only the frontmost window of the application.
-void CloseFrontWindow(const SwitcherApp& app);
+// W  closes one window of the application: the frontmost from the app row, or
+// the highlighted one when the app has been expanded into its windows, which is
+// the one the user is actually looking at. Out-of-range indices do nothing.
+void CloseWindow(const SwitcherApp& app, size_t index);
 
 // H  macOS hides the application. Windows has no equivalent concept, so this
 // minimises every window instead. Documented as an approximation rather than
