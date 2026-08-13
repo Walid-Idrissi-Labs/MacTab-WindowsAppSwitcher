@@ -120,6 +120,18 @@ void AppendKey(std::vector<INPUT>& inputs, WORD vk, bool up) {
 // overlay, Ctrl+Win+D arrives as something the shell ignores. And every event
 // carries our injection tag so the keyboard hook passes it through instead of
 // feeding it back into its own state machine.
+//
+// What deliberately does NOT happen is putting those modifiers back afterwards.
+// It looks like an omission, because the user may well still be holding Win
+// while the system now believes it is up, and their next chord will not be read
+// as one until they release and press again.
+//
+// Restoring them is worse. A Win we press again is a Win the user then releases
+// with nothing in between, which is the definition of a Win tap, and the Start
+// menu opens on top of the overlay. Alt has the same shape and lands on the
+// menu bar instead. Leaving them logically up costs a chord nobody is trying to
+// type in the middle of Mission Control, and the stray key-up that arrives when
+// they let go is ignored for want of a matching key-down.
 bool SendChord(WORD key) {
     std::vector<INPUT> inputs;
     inputs.reserve(10);
