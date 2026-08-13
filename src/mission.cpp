@@ -81,6 +81,11 @@ constexpr UINT_PTR kCloseTimerId = 1;
 // And the one that sharpens the previews once the flight has landed.
 constexpr UINT_PTR kSharpenTimerId = 2;
 
+// Posted by the sharpen worker when it has pixels to hand back. lParam owns a
+// heap SharpBatch, and the window procedure takes that ownership before any of
+// its own early returns.
+constexpr UINT kMsgSharpReady = WM_APP + 1;
+
 // Above this reduction, a live thumbnail is replaced by a still of the same
 // window taken at a sensible resolution and filtered properly.
 //
@@ -432,6 +437,43 @@ struct Mission::Impl {
     // The app icons, uploaded once each rather than once per window.
     std::map<std::wstring, ComPtr<ID2D1Bitmap1>> iconBitmaps;
 
+    // --- Sharpening, which happens off this thread ---------------------------
+    //
+    // Everything that crosses is plain data. The worker never touches a Screen,
+    // a Tile or anything belonging to the compositor: it is handed window
+    // handles and sizes, and hands back pixels.
+
+    struct SharpJob {
+        size_t screen = 0;
+        size_t tile   = 0;
+        HWND   window = nullptr;
+        int    bakeW  = 0;
+        int    bakeH  = 0;
+    };
+
+    struct SharpResult {
+        size_t screen = 0;
+        size_t tile   = 0;
+        HWND   window = nullptr;
+        int    bakeW  = 0;
+        int    bakeH  = 0;
+        Bitmap picture;   // empty when the window would not be printed
+    };
+
+    struct SharpBatch {
+        uint32_t                 epoch = 0;
+        std::vector<SharpResult> results;
+    };
+
+    // Bumped whenever the tiles are torn down, so a batch that was taken
+    // against an arrangement which no longer exists is recognised and dropped
+    // rather than applied to whatever now sits at those indices.
+    uint32_t tileEpoch = 0;
+
+    // One pass at a time. Without this, browsing the desktops while a pass is
+    // out would start a second one over the same windows.
+    bool sharpInFlight = false;
+
     bool CreateDevices();
     bool BakeTextures();
     bool BuildScreens();
@@ -445,6 +487,7 @@ struct Mission::Impl {
     float BarHeight(const Screen& screen) const;
     void BakeChrome(Screen& screen, Tile& tile);
     void SharpenTiles();
+    void ApplySharpened(const SharpBatch& batch);
     void ScheduleSharpen();
     void BuildTiles(Screen& screen, const std::vector<int>& members, int slide);
     void BuildForDesktop(int desktop, int slide);
@@ -564,6 +607,17 @@ namespace {
 
 LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* impl = reinterpret_cast<Mission::Impl*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    // Ahead of every early return below, because lParam carries ownership of a
+    // heap batch and it has to be freed even when there is no longer anything
+    // to apply it to.
+    if (msg == kMsgSharpReady) {
+        const std::unique_ptr<Mission::Impl::SharpBatch> batch(
+            reinterpret_cast<Mission::Impl::SharpBatch*>(lParam));
+        if (impl && batch) impl->ApplySharpened(*batch);
+        return 0;
+    }
+
     if (!impl) return ::DefWindowProcW(hwnd, msg, wParam, lParam);
 
     Mission::Impl::Screen* screen = impl->ScreenFor(hwnd);
@@ -1253,6 +1307,10 @@ HWND Mission::ItemWindow(int index) const {
 }
 
 void Mission::Impl::ReleaseTiles(Screen& screen) {
+    // Any sharpening pass that is out was taken against the arrangement being
+    // torn down here, and its indices mean nothing once this returns.
+    ++tileEpoch;
+
     if (screen.tileLayer)   screen.tileLayer.Children().RemoveAll();
     if (screen.chromeLayer) screen.chromeLayer.Children().RemoveAll();
 
@@ -2346,19 +2404,19 @@ int Mission::Impl::Neighbour(const Screen& screen, int from, int dx, int dy) con
 void Mission::Impl::SharpenTiles() {
     if (!visible || closing) return;
     if (!config::Current().missionSharpPreviews) return;
+    if (sharpInFlight) return;
 
-    const double started = NowMs();
-    int done = 0, skipped = 0;
+    // Which windows want one. Nothing is captured here except handles and
+    // sizes, because the loop that reads them runs on another thread.
+    std::vector<SharpJob> jobs;
 
-    for (Screen& screen : screens) {
-        for (Tile& tile : screen.tiles) {
+    for (size_t s = 0; s < screens.size(); ++s) {
+        Screen& screen = screens[s];
+        for (size_t t = 0; t < screen.tiles.size(); ++t) {
+            const Tile& tile = screen.tiles[t];
             if (tile.sharpened || !tile.live) continue;
             if (tile.reduction <= kSharpRatio) continue;
             if (tile.item < 0 || tile.item >= static_cast<int>(items.size())) continue;
-
-            if (NowMs() - started >= kSharpBudgetMs) { ++skipped; continue; }
-
-            const MissionItem& item = items[static_cast<size_t>(tile.item)];
 
             const float w = static_cast<float>(tile.screenRect.right - tile.screenRect.left);
             const float h = static_cast<float>(tile.screenRect.bottom - tile.screenRect.top);
@@ -2367,67 +2425,146 @@ void Mission::Impl::SharpenTiles() {
             // Never above the window's own resolution: there is nothing there to
             // find, and asking for it would only cost memory.
             const float over = (std::min)(kSharpOversample, tile.reduction);
-            const int   bakeW = (std::max)(1, static_cast<int>(w * over));
-            const int   bakeH = (std::max)(1, static_cast<int>(h * over));
 
-            Bitmap picture = thumbnail::Snapshot(item.hwnd, bakeW, bakeH);
-            if (picture.Empty()) {
-                // A window that will not be printed keeps its live thumbnail,
-                // which is exactly what it had before and better than nothing.
-                ++skipped;
-                tile.sharpened = true;
-                continue;
-            }
-
-            auto surface = graphics.CreateDrawingSurface(
-                { static_cast<float>(bakeW), static_cast<float>(bakeH) },
-                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
-
-            {
-                SurfaceDraw draw(surface);
-                if (!draw.ok) continue;
-
-                ID2D1DeviceContext* dc = draw.dc.Get();
-                dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-
-                if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(picture)))
-                    dc->DrawBitmap(bitmap.Get(),
-                                   D2D1::RectF(0.0f, 0.0f, static_cast<float>(bakeW),
-                                               static_cast<float>(bakeH)),
-                                   1.0f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                                   nullptr);
-            }
-
-            auto brush = compositor.CreateSurfaceBrush(surface);
-            brush.Stretch(WUC::CompositionStretch::Fill);
-
-            auto still = compositor.CreateSpriteVisual();
-            still.Brush(brush);
-            still.Size({ w, h });
-
-            tile.contentSurface = surface;
-            tile.content        = still;
-            tile.holder.Children().InsertAtTop(still);
-
-            // Swapped rather than cross-faded. It is the same picture, only
-            // honest, so there is nothing to fade between; and taking the live
-            // one to nothing stops DWM composing a window nobody can see.
-            //
-            // Opacity rather than IsVisible on purpose. Both would do, and
-            // Opacity is in the very first version of this API, where IsVisible
-            // is one of the ones this project has to check the build number for
-            // before it can use. Not worth finding out the hard way on somebody
-            // else's Windows 10.
-            tile.live.Opacity(0.0f);
-            tile.sharpened = true;
-            ++done;
+            SharpJob job;
+            job.screen = s;
+            job.tile   = t;
+            job.window = items[static_cast<size_t>(tile.item)].hwnd;
+            job.bakeW  = (std::max)(1, static_cast<int>(w * over));
+            job.bakeH  = (std::max)(1, static_cast<int>(h * over));
+            jobs.push_back(job);
         }
+    }
+
+    if (jobs.empty() || screens.empty()) return;
+
+    sharpInFlight = true;
+
+    // PrintWindow drives the target application's own paint path, so a window
+    // that is busy holds the caller for the fifty millisecond guard, and thirty
+    // of those is a stall the compositor cannot hide. This used to run right
+    // here, on the thread that answers the mouse and the keyboard, which is why
+    // Mission Control went deaf for up to half a second shortly after opening.
+    //
+    // If the post fails the overlay is already gone, and the batch is dropped
+    // by the only thing still holding it.
+    const HWND     target = screens.front().hwnd;
+    const uint32_t epoch  = tileEpoch;
+
+    std::thread([jobs, target, epoch] {
+        auto* batch  = new SharpBatch();
+        batch->epoch = epoch;
+
+        const double started = NowMs();
+        for (const SharpJob& job : jobs) {
+            if (NowMs() - started >= kSharpBudgetMs) break;
+
+            SharpResult result;
+            result.screen  = job.screen;
+            result.tile    = job.tile;
+            result.window  = job.window;
+            result.bakeW   = job.bakeW;
+            result.bakeH   = job.bakeH;
+            result.picture = thumbnail::Snapshot(job.window, job.bakeW, job.bakeH);
+            batch->results.push_back(std::move(result));
+        }
+
+        if (!::PostMessageW(target, kMsgSharpReady, 0,
+                            reinterpret_cast<LPARAM>(batch)))
+            delete batch;
+    }).detach();
+}
+
+// The pixels, back on the thread that owns the visual tree.
+void Mission::Impl::ApplySharpened(const SharpBatch& batch) {
+    sharpInFlight = false;
+
+    if (!visible || closing) return;
+    if (batch.epoch != tileEpoch) {
+        MACTAB_DIAG("mission: %zu sharpened preview(s) arrived for an arrangement "
+                    "that is gone", batch.results.size());
+        return;
+    }
+
+    // Guarded because this is now reached from the window procedure directly,
+    // and everything below it that talks to the compositor throws on failure.
+    GuardMission(*this, "ApplySharpened", [&] {
+
+    const double started = NowMs();
+    int done = 0, skipped = 0;
+
+    for (const SharpResult& result : batch.results) {
+        if (result.screen >= screens.size()) continue;
+        Screen& screen = screens[result.screen];
+        if (result.tile >= screen.tiles.size()) continue;
+
+        Tile& tile = screen.tiles[result.tile];
+        if (tile.sharpened || !tile.live) continue;
+        if (tile.item < 0 || tile.item >= static_cast<int>(items.size())) continue;
+        if (items[static_cast<size_t>(tile.item)].hwnd != result.window) continue;
+
+        if (result.picture.Empty()) {
+            // A window that will not be printed keeps its live thumbnail,
+            // which is exactly what it had before and better than nothing.
+            ++skipped;
+            tile.sharpened = true;
+            continue;
+        }
+
+        const float w = static_cast<float>(tile.screenRect.right - tile.screenRect.left);
+        const float h = static_cast<float>(tile.screenRect.bottom - tile.screenRect.top);
+
+        const int bakeW = result.bakeW;
+        const int bakeH = result.bakeH;
+        Bitmap picture  = result.picture;
+
+        auto surface = graphics.CreateDrawingSurface(
+            { static_cast<float>(bakeW), static_cast<float>(bakeH) },
+            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+
+        {
+            SurfaceDraw draw(surface);
+            if (!draw.ok) continue;
+
+            ID2D1DeviceContext* dc = draw.dc.Get();
+            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+            if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(picture)))
+                dc->DrawBitmap(bitmap.Get(),
+                               D2D1::RectF(0.0f, 0.0f, static_cast<float>(bakeW),
+                                           static_cast<float>(bakeH)),
+                               1.0f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                               nullptr);
+        }
+
+        auto brush = compositor.CreateSurfaceBrush(surface);
+        brush.Stretch(WUC::CompositionStretch::Fill);
+
+        auto still = compositor.CreateSpriteVisual();
+        still.Brush(brush);
+        still.Size({ w, h });
+
+        tile.contentSurface = surface;
+        tile.content        = still;
+        tile.holder.Children().InsertAtTop(still);
+
+        // Swapped rather than cross-faded. It is the same picture, only
+        // honest, so there is nothing to fade between.
+        //
+        // Opacity rather than IsVisible on purpose. Both would do, and Opacity
+        // is in the very first version of this API, where IsVisible is one of
+        // the ones this project has to check the build number for before it can
+        // use. Not worth finding out the hard way on somebody else's Windows 10.
+        tile.live.Opacity(0.0f);
+        tile.sharpened = true;
+        ++done;
     }
 
     if (done || skipped)
         MACTAB_DIAG("mission: sharpened %d preview(s), skipped %d, in %.1f ms",
                     done, skipped, NowMs() - started);
+    });
 }
 
 void Mission::Impl::ScheduleSharpen() {
