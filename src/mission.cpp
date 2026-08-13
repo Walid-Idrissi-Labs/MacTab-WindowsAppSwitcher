@@ -8,6 +8,7 @@
 #include <dxgi1_2.h>
 #include <shellscalingapi.h>
 
+#include <future>
 #include <map>
 #include <thread>
 #include <vector>
@@ -479,6 +480,9 @@ struct Mission::Impl {
     // One pass at a time. Without this, browsing the desktops while a pass is
     // out would start a second one over the same windows.
     bool sharpInFlight = false;
+
+    // The wallpaper prewarm, so shutdown can wait for it. See Prewarm.
+    std::future<void> prewarm;
 
     bool CreateDevices();
     bool BakeTextures();
@@ -1198,7 +1202,15 @@ void Mission::Prewarm() {
         jobs.push_back(job);
     }
 
-    std::thread([jobs] {
+    // Waited on at shutdown rather than abandoned. It touches wallpaper's own
+    // mutex and cache, both of which are namespace-scope statics, so a process
+    // exiting while a decode is in flight would run their destructors out from
+    // under it. Panel::Shutdown holds the same line for its capture thread.
+    //
+    // A packaged_task rather than std::async, for the reason panel.cpp gives:
+    // an async future blocks in its own destructor, which would turn every
+    // display change into a stall while the previous prewarm finished.
+    std::packaged_task<void()> task([jobs] {
         for (const Job& job : jobs) {
             wallpaper::ForMonitor(job.monitor, job.width, job.height);
 
@@ -1208,7 +1220,10 @@ void Mission::Prewarm() {
             wallpaper::Region(job.monitor, job.screenW, job.screenH,
                               RECT{ 0, 0, job.screenW, job.band });
         }
-    }).detach();
+    });
+
+    impl.prewarm = task.get_future();
+    std::thread(std::move(task)).detach();
 }
 
 void Mission::InvalidateBackdrop() {
@@ -1273,6 +1288,11 @@ void Mission::Shutdown() {
 
     impl.FinishHide();
     impl.ready = false;
+
+    // A wallpaper decode may still be running on a detached thread, and it uses
+    // statics of its own. Let it finish before the CRT starts destroying them.
+    if (impl.prewarm.valid())
+        impl.prewarm.wait_for(std::chrono::milliseconds(500));
 
     for (Impl::Screen& screen : impl.screens) {
         impl.ReleaseTiles(screen);
