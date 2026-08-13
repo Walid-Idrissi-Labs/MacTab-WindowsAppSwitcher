@@ -63,6 +63,97 @@ int ColourDistance(uint32_t a, uint32_t b) {
     return (std::max)(dr, (std::max)(dg, db));
 }
 
+// A box filter is an average, and an average of premultiplied bytes is integer
+// arithmetic. This exists because the float path below materialises the entire
+// source as four floats per pixel before it writes a single output pixel, and
+// the things asking to be shrunk are not icons: a snapshot of a maximised window
+// on a 4K display is a hundred and thirty megabytes of temporary, allocated and
+// thrown away, where the picture itself is thirty-three.
+//
+// Only for the case where neither axis grows, which is every one of those
+// callers. Growing wants Catmull-Rom and its negative lobe, which does not fit
+// in bytes.
+//
+// The intermediate holds premultiplied bytes rather than floats, so a channel is
+// rounded once on the way in and once on the way out instead of staying exact
+// throughout. That is a quantisation of a two hundred and fifty sixth on a
+// picture being reduced by a factor of five or more, and nobody can see it.
+Bitmap ShrinkBox(const Bitmap& source, int width, int height) {
+    const int inW = source.width;
+    const int inH = source.height;
+
+    const double scaleX = static_cast<double>(inW) / width;
+    const double scaleY = static_cast<double>(inH) / height;
+
+    // Horizontal first, into premultiplied bytes.
+    std::vector<uint32_t> mid(static_cast<size_t>(width) * inH);
+
+    for (int y = 0; y < inH; ++y) {
+        const uint32_t* src = source.pixels.data() + static_cast<size_t>(y) * inW;
+        uint32_t* dst = mid.data() + static_cast<size_t>(y) * width;
+
+        for (int i = 0; i < width; ++i) {
+            const int from = static_cast<int>(i * scaleX);
+            int to = static_cast<int>((i + 1) * scaleX);
+            to = (std::min)((std::max)(to, from + 1), inW);
+
+            uint32_t r = 0, g = 0, b = 0, a = 0;
+            for (int s = from; s < to; ++s) {
+                const uint32_t p  = src[s];
+                const uint32_t pa = AlphaOf(p);
+                r += (RedOf(p)   * pa + 127) / 255;
+                g += (GreenOf(p) * pa + 127) / 255;
+                b += (BlueOf(p)  * pa + 127) / 255;
+                a += pa;
+            }
+
+            const uint32_t n = static_cast<uint32_t>(to - from);
+            dst[i] = MakePixel(static_cast<uint8_t>((r + n / 2) / n),
+                               static_cast<uint8_t>((g + n / 2) / n),
+                               static_cast<uint8_t>((b + n / 2) / n),
+                               static_cast<uint8_t>((a + n / 2) / n));
+        }
+    }
+
+    Bitmap out = Bitmap::Create(width, height);
+
+    for (int j = 0; j < height; ++j) {
+        const int from = static_cast<int>(j * scaleY);
+        int to = static_cast<int>((j + 1) * scaleY);
+        to = (std::min)((std::max)(to, from + 1), inH);
+
+        for (int i = 0; i < width; ++i) {
+            uint32_t r = 0, g = 0, b = 0, a = 0;
+            for (int s = from; s < to; ++s) {
+                const uint32_t p = mid[static_cast<size_t>(s) * width + i];
+                r += RedOf(p); g += GreenOf(p); b += BlueOf(p); a += AlphaOf(p);
+            }
+
+            const uint32_t n  = static_cast<uint32_t>(to - from);
+            const uint32_t pa = (a + n / 2) / n;
+
+            if (pa == 0) {
+                out.pixels[static_cast<size_t>(j) * width + i] = 0;
+                continue;
+            }
+
+            // Unpremultiply, clamping so rounding cannot put a channel above
+            // alpha, which is the same guard the float path applies.
+            const uint32_t pr = (r + n / 2) / n;
+            const uint32_t pg = (g + n / 2) / n;
+            const uint32_t pb = (b + n / 2) / n;
+
+            out.pixels[static_cast<size_t>(j) * width + i] = MakePixel(
+                static_cast<uint8_t>((std::min)(255u, (pr * 255 + pa / 2) / pa)),
+                static_cast<uint8_t>((std::min)(255u, (pg * 255 + pa / 2) / pa)),
+                static_cast<uint8_t>((std::min)(255u, (pb * 255 + pa / 2) / pa)),
+                static_cast<uint8_t>(pa));
+        }
+    }
+
+    return out;
+}
+
 } // namespace
 
 Bitmap Resize(const Bitmap& source, int width, int height) {
@@ -71,6 +162,9 @@ Bitmap Resize(const Bitmap& source, int width, int height) {
 
     if (source.width == width && source.height == height)
         return source;
+
+    if (width <= source.width && height <= source.height)
+        return ShrinkBox(source, width, height);
 
     // Two separable passes rather than one two-dimensional filter, because the
     // two axes do not always want the same filter. Cropping to a mark's bounding
