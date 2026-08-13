@@ -128,6 +128,20 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         g_missionKeyVk = 0;
 
     if (g_state == State::Idle) {
+        // Idle is where this callback spends essentially all of its life, and it
+        // runs for every keystroke on the machine, so what it costs here is what
+        // the program costs somebody who is just typing. Two cheap tests before
+        // any syscall keep that at nothing.
+        //
+        // Nothing below acts on a key-up, and nothing below can fire for a key
+        // outside this set, whereas GetAsyncKeyState is a syscall and the
+        // chord tests used to run three of them for every character typed.
+        if (!down)
+            return ::CallNextHookEx(nullptr, code, wParam, lParam);
+
+        if (vk != VK_TAB && vk != VK_UP && vk != VK_LEFT && vk != VK_RIGHT)
+            return ::CallNextHookEx(nullptr, code, wParam, lParam);
+
         // Win+Tab opens Mission Control.
         //
         // Checked before the Alt gesture because the two chords share their
@@ -145,7 +159,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
              (vk == VK_UP  && (g_options.missionGesture == Gesture::WinUp ||
                                g_options.missionGesture == Gesture::Both)));
 
-        if (down && missionChord) {
+        if (missionChord) {
             // Auto-repeat delivers a fresh key-down about thirty times a second
             // while the chord is held. This posts a toggle, so every one of
             // those would close the overlay and open it again, rebuilding the
@@ -189,7 +203,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         // looking at. So they are swallowed. But they are still exactly the
         // right gesture, so the hook posts them onward: the overlay cannot
         // receive a key that never reached it.
-        if (down && g_missionOpen && (vk == VK_LEFT || vk == VK_RIGHT) &&
+        if (g_missionOpen && (vk == VK_LEFT || vk == VK_RIGHT) &&
             KeyDown(VK_CONTROL) && winHeld) {
             PostToUi(WM_MACTAB_MISSION_STEP,
                      static_cast<WPARAM>(vk == VK_RIGHT ? 1 : -1));
@@ -202,7 +216,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         // Alt-down itself is never swallowed: at Alt-down time we cannot know a
         // gesture is coming, and eating it globally would break menu access and
         // every Alt mnemonic in every app.
-        if (down && vk == VK_TAB && SwitcherAltHeld() && !KeyDown(VK_CONTROL)) {
+        if (vk == VK_TAB && SwitcherAltHeld() && !KeyDown(VK_CONTROL)) {
             g_state        = State::Armed;
             g_gestureAltVk = static_cast<WORD>(KeyDown(VK_LMENU) ? VK_LMENU : VK_RMENU);
             ::InterlockedExchange(&g_sharedAltVk, g_gestureAltVk);
