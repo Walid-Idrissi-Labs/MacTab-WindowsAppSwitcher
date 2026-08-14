@@ -1,100 +1,151 @@
 #!/usr/bin/env python3
-"""Generate res/mactab.ico, the tray/app icon.
+"""Cut res/mactab.ico from the source frames in res/icon/.
 
-The mark is a squircle inside a squircle, which is the whole point of the
-project: Apple's continuous-corner shape rather than a plain rounded rect.
+This used to draw the icon procedurally, because there was not one. There is
+now, so this reads it instead. See res/icon/README.md for where those frames
+come from and why the set is the shape it is.
 
-Icon entries at 48px and below are stored as classic BMP (BITMAPINFOHEADER +
-BGRA XOR data + 1bpp AND mask), because some Windows shell surfaces still
-mis-handle PNG-compressed entries at small sizes. The 256px entry is PNG, which
-is the documented Vista+ path and keeps the file small.
+Four of the seven .ico frames have a source rendered at exactly that size. The
+other three are reduced from a larger one by a whole number, which is the only
+kind of reduction a box filter does without argument: every output pixel is the
+average of a whole number of input pixels, with nothing weighted fractionally.
 
-Stdlib only. Run from the repo root:  python3 tools/make_icon.py
+Entries at 64px and below are stored as classic BMP (BITMAPINFOHEADER + BGRA XOR
+data + 1bpp AND mask), because some Windows shell surfaces still mis-handle
+PNG-compressed entries at small sizes. The 256px entry is PNG, which is the
+documented Vista+ path and keeps the file small.
+
+The sources must be 8 bit sRGB. A .ico frame carries no colour management, so
+the shell reads its bytes as sRGB whatever they were tagged as, and mixing
+colour spaces across frames makes the icon change colour as the shell picks
+between them. res/icon/README.md has the conversion command.
+
+Stdlib only. Run from anywhere:  python3 tools/make_icon.py
 """
 
 import os
 import struct
 import zlib
 
-OUT = os.path.join(os.path.dirname(__file__), "..", "res", "mactab.ico")
-SIZES = [16, 20, 24, 32, 48, 64, 256]
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(HERE, "..", "res", "icon")
+OUT = os.path.join(HERE, "..", "res", "mactab.ico")
 
-# Superellipse exponent. n=5 is the usual close approximation of Apple's
-# continuous-corner curve; n=4 is visibly rounder, n=6 visibly boxier.
-SQUIRCLE_N = 5.0
-
-# Vertical gradient for the outer squircle (top RGB -> bottom RGB).
-GRAD_TOP = (94, 137, 245)
-GRAD_BOTTOM = (58, 88, 205)
-
-# The inner "app tile" glyph.
-TILE_COLOR = (255, 255, 255)
-TILE_SCALE = 0.46      # fraction of the canvas
-TILE_ALPHA = 0.94
-
-SS = 4  # supersampling factor per axis (4x4 = 16 samples per pixel)
+# (frame size, source file, reduction factor). A factor of 1 means the source
+# was rendered at this size and is used as it is.
+FRAMES = [
+    (16,  "mactab-16.png",  1),
+    (20,  "mactab-40.png",  2),
+    (24,  "mactab-192.png", 8),
+    (32,  "mactab-32.png",  1),
+    (48,  "mactab-192.png", 4),
+    (64,  "mactab-64.png",  1),
+    (256, "mactab-256.png", 1),
+]
 
 
-def squircle_coverage(px, py, size, half_extent, n=SQUIRCLE_N):
-    """Fractional coverage of pixel (px, py) by a centred superellipse.
+def read_png(path):
+    """Decode an 8 bit RGBA PNG to (size, [(r, g, b, a), ...]) top-down."""
+    data = open(path, "rb").read()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise SystemExit("%s is not a PNG" % path)
 
-    half_extent is the shape's half-width in pixels. Computed by point-sampling
-    an SS x SS grid inside the pixel, which is plenty for static art.
-    """
-    cx = cy = size / 2.0
-    hit = 0
-    for sy in range(SS):
-        for sx in range(SS):
-            x = px + (sx + 0.5) / SS - cx
-            y = py + (sy + 0.5) / SS - cy
-            # |x/a|^n + |y/a|^n <= 1
-            v = (abs(x) / half_extent) ** n + (abs(y) / half_extent) ** n
-            if v <= 1.0:
-                hit += 1
-    return hit / float(SS * SS)
+    pos = 8
+    idat = b""
+    width = height = depth = ctype = None
+
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        tag = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + length]
+        if tag == b"IHDR":
+            width, height, depth, ctype, _, _, interlace = struct.unpack(">IIBBBBB", body)
+            if depth != 8 or ctype != 6 or interlace != 0:
+                raise SystemExit(
+                    "%s must be 8 bit RGBA and not interlaced (got depth %d, "
+                    "colour type %d, interlace %d). See res/icon/README.md."
+                    % (path, depth, ctype, interlace))
+            if width != height:
+                raise SystemExit("%s is %dx%d, expected a square" % (path, width, height))
+        elif tag == b"IDAT":
+            idat += body
+        elif tag == b"IEND":
+            break
+        pos += 12 + length
+
+    raw = zlib.decompress(idat)
+    stride = width * 4
+    out = bytearray()
+    prev = bytearray(stride)
+    p = 0
+
+    for _ in range(height):
+        filt = raw[p]
+        p += 1
+        line = bytearray(raw[p:p + stride])
+        p += stride
+        for i in range(stride):
+            a = line[i - 4] if i >= 4 else 0
+            b = prev[i]
+            c = prev[i - 4] if i >= 4 else 0
+            if filt == 1:
+                line[i] = (line[i] + a) & 255
+            elif filt == 2:
+                line[i] = (line[i] + b) & 255
+            elif filt == 3:
+                line[i] = (line[i] + (a + b) // 2) & 255
+            elif filt == 4:
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                line[i] = (line[i] + pred) & 255
+            elif filt != 0:
+                raise SystemExit("%s uses PNG filter %d" % (path, filt))
+        out += line
+        prev = line
+
+    px = [tuple(out[i:i + 4]) for i in range(0, len(out), 4)]
+    return width, px
 
 
-def lerp(a, b, t):
-    return a + (b - a) * t
+def reduce_by(px, size, factor):
+    """Box filter by a whole factor, averaging premultiplied so that a colour
+    behind a transparent pixel cannot leak into the result."""
+    if factor == 1:
+        return px
 
+    n = size // factor
+    area = factor * factor
+    out = []
 
-def render_rgba(size):
-    """Render the icon at `size` as a flat list of (r, g, b, a) top-down."""
-    px = [None] * (size * size)
-
-    # Outer squircle fills the canvas with a hair of padding so the
-    # antialiased edge is never clipped.
-    outer_half = (size / 2.0) * 0.96
-    inner_half = (size / 2.0) * TILE_SCALE
-
-    for y in range(size):
-        t = y / max(1.0, size - 1.0)
-        gr = int(round(lerp(GRAD_TOP[0], GRAD_BOTTOM[0], t)))
-        gg = int(round(lerp(GRAD_TOP[1], GRAD_BOTTOM[1], t)))
-        gb = int(round(lerp(GRAD_TOP[2], GRAD_BOTTOM[2], t)))
-
-        for x in range(size):
-            outer = squircle_coverage(x, y, size, outer_half)
-            if outer <= 0.0:
-                px[y * size + x] = (0, 0, 0, 0)
+    for j in range(n):
+        for i in range(n):
+            r = g = b = a = 0
+            for dy in range(factor):
+                row = (j * factor + dy) * size + i * factor
+                for dx in range(factor):
+                    sr, sg, sb, sa = px[row + dx]
+                    r += sr * sa
+                    g += sg * sa
+                    b += sb * sa
+                    a += sa
+            a //= area
+            if a == 0:
+                out.append((0, 0, 0, 0))
                 continue
 
-            inner = squircle_coverage(x, y, size, inner_half) * TILE_ALPHA
-
-            # Composite the white tile over the gradient, then apply the
-            # outer shape as the overall alpha.
-            r = int(round(lerp(gr, TILE_COLOR[0], inner)))
-            g = int(round(lerp(gg, TILE_COLOR[1], inner)))
-            b = int(round(lerp(gb, TILE_COLOR[2], inner)))
-            a = int(round(outer * 255))
-            px[y * size + x] = (r, g, b, a)
-
-    return px
+            # Unpremultiply. The sums hold colour times alpha, so the averaged
+            # product divided by the averaged alpha gives the colour back.
+            # Clamped, because rounding must not lift a channel above its own
+            # alpha and come back brighter than anything in the source.
+            out.append((min(255, ((r // area) + a // 2) // a),
+                        min(255, ((g // area) + a // 2) // a),
+                        min(255, ((b // area) + a // 2) // a),
+                        a))
+    return out
 
 
 def encode_bmp_entry(size, px):
     """Classic icon BMP: header, bottom-up BGRA, then a 1bpp AND mask."""
-    # BITMAPINFOHEADER with doubled height (XOR image + AND mask).
     header = struct.pack(
         "<IiiHHIIiiII",
         40,            # biSize
@@ -135,8 +186,7 @@ def encode_png_entry(size, px):
     for y in range(size):
         raw.append(0)  # filter type 0 (None)
         for x in range(size):
-            r, g, b, a = px[y * size + x]
-            raw += bytes((r, g, b, a))
+            raw += bytes(px[y * size + x])
 
     def chunk(tag, data):
         out = struct.pack(">I", len(data)) + tag + data
@@ -152,11 +202,24 @@ def encode_png_entry(size, px):
 
 
 def main():
+    cache = {}
     entries = []
-    for size in SIZES:
-        px = render_rgba(size)
-        blob = encode_png_entry(size, px) if size >= 256 else encode_bmp_entry(size, px)
+
+    for size, source, factor in FRAMES:
+        if source not in cache:
+            cache[source] = read_png(os.path.join(SRC, source))
+        src_size, px = cache[source]
+
+        if src_size != size * factor:
+            raise SystemExit(
+                "%s is %dpx, but frame %d wants %d at a factor of %d"
+                % (source, src_size, size, size * factor, factor))
+
+        frame = reduce_by(px, src_size, factor)
+        blob = encode_png_entry(size, frame) if size >= 256 else encode_bmp_entry(size, frame)
         entries.append((size, blob))
+        print("  %3d  from %-16s %s"
+              % (size, source, "as exported" if factor == 1 else "reduced by %d" % factor))
 
     # ICONDIR + ICONDIRENTRY table, then the image blobs.
     offset = 6 + 16 * len(entries)
@@ -175,7 +238,6 @@ def main():
         )
         offset += len(blob)
 
-    os.makedirs(os.path.dirname(os.path.abspath(OUT)), exist_ok=True)
     with open(OUT, "wb") as f:
         f.write(directory)
         for _, blob in entries:
