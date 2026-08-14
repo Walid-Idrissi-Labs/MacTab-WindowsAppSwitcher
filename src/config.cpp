@@ -212,6 +212,33 @@ std::wstring ReadKeyword(const wchar_t* key, const wchar_t* fallback) {
     return value;
 }
 
+// A key whose value is on or off.
+//
+// Not ReadInt, which is GetPrivateProfileIntW, which returns the default only
+// when the key is ABSENT. A key that is present with a value it cannot parse
+// comes back as 0, so GroupByApp=true switched grouping off, Glass=true left the
+// panel a flat plate, and nothing anywhere said the value had been rejected.
+// Every one of those reads as the opposite of what somebody typing it meant.
+//
+// Same reasoning as ReadKeyword above: the profile APIs already match key names
+// without regard to case, so a file whose keys tolerate anything and whose
+// values tolerate one spelling is a trap we built ourselves. Anything
+// unrecognised keeps the shipped default and says so in the log, rather than
+// quietly becoming false.
+bool ReadBool(const wchar_t* key, bool fallback) {
+    const std::wstring value = ReadKeyword(key, fallback ? L"1" : L"0");
+    if (value.empty()) return fallback;
+
+    if (value == L"1" || value == L"true" || value == L"yes" || value == L"on")
+        return true;
+    if (value == L"0" || value == L"false" || value == L"no" || value == L"off")
+        return false;
+
+    MACTAB_WARN("config: %s=%s is not a yes or no value, keeping the default (%d)",
+                ToUtf8(key).c_str(), ToUtf8(value).c_str(), fallback ? 1 : 0);
+    return fallback;
+}
+
 // Settings whose SHIPPED default has changed, in a file that was written before
 // it changed.
 //
@@ -562,21 +589,21 @@ void Migrate() {
 void ReadSettings() {
     g_settings.revealDelayMs = static_cast<UINT>(
         (std::max)(0, (std::min)(2000, ReadInt(L"RevealDelayMs", 180))));
-    g_settings.leftAltOnly = ReadInt(L"LeftAltOnly", 1) != 0;
+    g_settings.leftAltOnly = ReadBool(L"LeftAltOnly", true);
     g_settings.tileSize    = (std::max)(48, (std::min)(256, ReadInt(L"TileSize", 128)));
     g_settings.theme       = ReadKeyword(L"Theme", L"auto");
-    g_settings.glassEnabled  = ReadInt(L"Glass", 0) != 0;
-    g_settings.selectionAnimation = ReadInt(L"SelectionAnimation", 1) != 0;
+    g_settings.glassEnabled  = ReadBool(L"Glass", false);
+    g_settings.selectionAnimation = ReadBool(L"SelectionAnimation", true);
     g_settings.captureSource = ReadKeyword(L"CaptureSource", L"auto");
-    g_settings.groupByApp  = ReadInt(L"GroupByApp", 1) != 0;
+    g_settings.groupByApp  = ReadBool(L"GroupByApp", true);
     g_settings.panelDisplay = ParsePanelDisplay(ReadKeyword(L"PanelDisplay", L"active"));
-    g_settings.glassRefraction = ReadInt(L"GlassRefraction", 1) != 0;
-    g_settings.glassRimTap     = ReadInt(L"GlassRimTap", 1) != 0;
+    g_settings.glassRefraction = ReadBool(L"GlassRefraction", true);
+    g_settings.glassRimTap     = ReadBool(L"GlassRimTap", true);
 
-    g_settings.missionEnabled    = ReadInt(L"MissionEnabled", 0) != 0;
+    g_settings.missionEnabled    = ReadBool(L"MissionEnabled", false);
     g_settings.missionGesture    = ReadKeyword(L"MissionGesture", L"wintab");
-    g_settings.missionGroupByApp = ReadInt(L"MissionGroupByApp", 1) != 0;
-    g_settings.missionSharpPreviews = ReadInt(L"MissionSharpPreviews", 1) != 0;
+    g_settings.missionGroupByApp = ReadBool(L"MissionGroupByApp", true);
+    g_settings.missionSharpPreviews = ReadBool(L"MissionSharpPreviews", true);
     g_settings.missionRevealMs   = static_cast<UINT>(
         (std::max)(0, (std::min)(2000, ReadInt(L"MissionRevealMs", 260))));
     g_settings.missionThumbnails = ReadKeyword(L"MissionThumbnails", L"auto");
