@@ -180,23 +180,66 @@ def encode_bmp_entry(size, px):
     return bytes(header) + bytes(xor) + bytes(and_mask)
 
 
-def encode_png_entry(size, px):
-    """Minimal RGBA PNG."""
-    raw = bytearray()
-    for y in range(size):
-        raw.append(0)  # filter type 0 (None)
-        for x in range(size):
-            raw += bytes(px[y * size + x])
+def filter_row(cur, prev, kind):
+    """One PNG scanline filter. `prev` is the UNFILTERED row above."""
+    out = bytearray(len(cur))
+    for i in range(len(cur)):
+        a = cur[i - 4] if i >= 4 else 0     # left
+        b = prev[i]                          # above
+        c = prev[i - 4] if i >= 4 else 0     # above left
+        if kind == 0:
+            out[i] = cur[i]
+        elif kind == 1:
+            out[i] = (cur[i] - a) & 255
+        elif kind == 2:
+            out[i] = (cur[i] - b) & 255
+        elif kind == 3:
+            out[i] = (cur[i] - (a + b) // 2) & 255
+        else:
+            pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+            pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            out[i] = (cur[i] - pred) & 255
+    return out
 
-    def chunk(tag, data):
-        out = struct.pack(">I", len(data)) + tag + data
-        return out + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+def encode_png_entry(size, px):
+    """RGBA PNG, filtered per row.
+
+    The filter is picked by the usual minimum sum of absolute differences
+    heuristic, treating each byte as signed. It is worth the trouble here
+    because this frame is a photographic gradient rather than flat colour:
+    leaving every row unfiltered costs about a third of the file, and this
+    frame is most of the icon's size.
+    """
+    stride = size * 4
+    data = bytearray()
+    prev = bytearray(stride)
+
+    for y in range(size):
+        row = bytearray()
+        for x in range(size):
+            row += bytes(px[y * size + x])
+
+        best = None
+        for kind in range(5):
+            candidate = filter_row(row, prev, kind)
+            score = sum(v if v < 128 else 256 - v for v in candidate)
+            if best is None or score < best[0]:
+                best = (score, kind, candidate)
+
+        data.append(best[1])
+        data += best[2]
+        prev = row
+
+    def chunk(tag, body):
+        out = struct.pack(">I", len(body)) + tag + body
+        return out + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
 
     ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", ihdr)
-        + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+        + chunk(b"IDAT", zlib.compress(bytes(data), 9))
         + chunk(b"IEND", b"")
     )
 
