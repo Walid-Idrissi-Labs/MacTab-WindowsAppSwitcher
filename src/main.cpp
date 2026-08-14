@@ -1058,6 +1058,12 @@ HMENU CreateSettingsMenu() {
     ::AppendMenuW(settings, MF_STRING | (config::Current().selectionAnimation ? MF_CHECKED : 0u),
                   IDM_TRAY_SELECTION_ANIM, L"Animate the selection");
 
+    // Here so the state is visible. Unchecked is one tile per window, which is
+    // a legitimate preference and also what a mistyped GroupByApp used to leave
+    // you with, silently, and with no way to see it short of reading the file.
+    ::AppendMenuW(settings, MF_STRING | (config::Current().groupByApp ? MF_CHECKED : 0u),
+                  IDM_TRAY_GROUP_BY_APP, L"Group windows by application");
+
     ::AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
     // Named after the chord that is actually configured, so somebody who has set
     // MissionGesture is not told about a key that no longer opens anything.
@@ -1470,6 +1476,17 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             g_app.tray.ShowBalloon(L"MacTab",
                                    animate ? L"The selection springs across again."
                                            : L"The selection moves without animating.");
+            return 0;
+        }
+
+        case IDM_TRAY_GROUP_BY_APP: {
+            // Next gesture: the list is built when the gesture starts and this
+            // is read while building it.
+            const bool group = !config::Current().groupByApp;
+            config::SetGroupByApp(group);
+            g_app.tray.ShowBalloon(L"MacTab",
+                                   group ? L"One tile per application again."
+                                         : L"One tile per window.");
             return 0;
         }
 

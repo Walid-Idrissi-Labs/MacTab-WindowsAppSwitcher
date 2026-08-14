@@ -30,3 +30,5 @@
 #define IDM_TRAY_THEME_AUTO     220
 #define IDM_TRAY_THEME_LIGHT    221
 #define IDM_TRAY_THEME_DARK     222
+
+#define IDM_TRAY_GROUP_BY_APP   223

@@ -812,6 +812,22 @@ bool SetGlassEnabled(bool enabled) {
     return ok;
 }
 
+bool SetGroupByApp(bool enabled) {
+    // Applied first, persisted second, for the reason on SetPanelDisplay.
+    g_settings.groupByApp = enabled;
+
+    if (g_settingsPath.empty()) {
+        MACTAB_WARN("config: no settings file, GroupByApp will not survive a restart");
+        return false;
+    }
+
+    const bool ok = ::WritePrivateProfileStringW(kSection, L"GroupByApp",
+                                                 enabled ? L"1" : L"0",
+                                                 g_settingsPath.c_str()) != FALSE;
+    MACTAB_DIAG("config: GroupByApp -> %d (persisted %d)", enabled ? 1 : 0, ok ? 1 : 0);
+    return ok;
+}
+
 bool SetMissionEnabled(bool enabled) {
     // Applied first, persisted second, like the four setters above it. This one
     // returned before setting anything when there was nowhere to write, so on a

@@ -256,6 +256,11 @@ bool SetSelectionAnimation(bool enabled);
 // desktop when the gesture starts, so there is nothing to rebuild here.
 bool SetGlassEnabled(bool enabled);
 
+// One tile per application, or one per window. Also in settings.ini, where it
+// is the key most likely to be edited by hand and the one whose effect is
+// hardest to attribute when it is wrong.
+bool SetGroupByApp(bool enabled);
+
 // --- Uninstall --------------------------------------------------------------
 //
 // Inno Setup writes an UninstallString under
