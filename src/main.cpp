@@ -249,7 +249,15 @@ void PopulatePanel() {
 
         // A packaged app's friendly name only becomes available once the icon
         // worker has read its manifest; until then the window title stands in.
-        const std::wstring resolved = icons::DisplayName(app.key);
+        //
+        // Not once the list has been split into one tile per window, though.
+        // BuildWindowList has already put each window's own title in
+        // displayName there, and the package's name is the same string for
+        // every window it owns, so preferring it labelled a row of tiles
+        // identically in the one mode whose whole purpose is telling them apart.
+        const std::wstring resolved = config::Current().groupByApp
+            ? icons::DisplayName(app.key)
+            : std::wstring{};
         item.label = resolved.empty() ? app.displayName : resolved;
 
         icons::Acquire(MakeIconRequest(app, tileSize), item.icon);   // false = not yet
