@@ -144,6 +144,13 @@ void BeginGesture(bool reverse) {
     g.active     = true;
     g.panelShown = false;
 
+    // Belt and braces. Every path that ends a gesture clears these already, so
+    // this is unreachable today, but a gesture that began in window mode would
+    // show one application's windows and nothing else, which from the outside
+    // is indistinguishable from the switcher having lost most of the list.
+    g.windowMode = false;
+    g.appIndex   = 0;
+
     if (g.apps.empty()) {
         // Nothing at all to show. Stay armed so the keys are still swallowed:
         // falling back to the built-in switcher mid-gesture would be worse.
