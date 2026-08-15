@@ -1678,6 +1678,14 @@ int Panel::Impl::HitTestScreen(POINT screenPoint) const {
     // Only what is actually under the glass. A scrolled strip has tiles sitting
     // either side of the panel that the clip removes, and a click landing where
     // one of those would have been must not select it.
+    //
+    // This reads the scroll's destination, not where the strip has got to. For
+    // the couple of hundred milliseconds a slide takes to settle, a click can
+    // therefore land on the neighbour of the tile under the pointer. It cannot
+    // oscillate, because at rest every hit-testable tile is wholly visible, so
+    // hovering never moves the strip; and it is the same transient the
+    // selection highlight has always had. Chasing the animated value would mean
+    // reading a property off the compositor thread on every mouse move.
     const float panelWidth = static_cast<float>(panelRect.right - panelRect.left);
     if (x < padding || x > panelWidth - padding) return -1;
 
