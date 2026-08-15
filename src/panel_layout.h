@@ -67,7 +67,12 @@ inline constexpr float kLabelGap     = 10.0f;
 inline constexpr float kPanelCornerExponent = 2.24f;
 
 // Floor for the shrink-to-fit pass. Below this the icons stop being
-// recognisable and a scrolling row would be better, but macOS never scrolls.
+// recognisable, so the strip scrolls instead of shrinking any further.
+//
+// macOS never scrolls, and it never has to: its switcher lists applications and
+// only applications, so the count is bounded by how many are running, and it has
+// no floor to reach. One tile per window is ours, and the reference cannot say
+// what should happen in a mode it does not have.
 inline constexpr float kMinTileSize  = 40.0f;
 
 // Highlight inset behind the selected tile, as a fraction of tile size.
@@ -83,6 +88,23 @@ struct Metrics {
     float labelHeight = kLabelHeight;
     float labelGap    = kLabelGap;
 
+    // The whole strip, which is what panelWidth would be if the screen were
+    // wide enough. Equal to panelWidth in every ordinary case; larger only when
+    // the tiles have hit their floor and still do not fit, which is when the
+    // strip scrolls under a panel that stays put.
+    float contentWidth = 0.0f;
+
+    // How many whole tiles the panel shows at once. Equal to the count asked
+    // for unless the strip scrolls.
+    int visibleCount = 0;
+
+    // How far the strip can travel. Always a whole number of tile strides, so
+    // a scrolled panel still begins and ends on a complete tile.
+    float MaxScroll() const {
+        const float slack = contentWidth - panelWidth;
+        return slack > 0.0f ? slack : 0.0f;
+    }
+
     // Left edge of tile `index`, relative to the panel's origin.
     float TileX(int index) const {
         return padding + static_cast<float>(index) * (tileSize + gap);
@@ -90,12 +112,52 @@ struct Metrics {
 
     // Horizontal centre of tile `index`, which is where the label is anchored.
     float TileCentreX(int index) const { return TileX(index) + tileSize * 0.5f; }
+
+    // Where the strip has to sit for tile `index` to be wholly inside the
+    // panel, starting from wherever it sits now. Returns `current` unchanged
+    // when the tile is already visible, so tabbing through the middle of a long
+    // list does not drag the strip about.
+    //
+    // This is the invariant the whole scrolling design rests on: the selected
+    // tile is always fully on screen, so there is no way to commit to an
+    // application nobody can see. It lives here rather than in panel.cpp so
+    // that tools/preview can assert it, which matters because panel.cpp cannot
+    // be compiled anywhere except CI.
+    //
+    // Both bounds land on whole tile strides, and so does MaxScroll, so a
+    // scrolled panel always begins and ends on a complete tile.
+    float ScrollFor(int index, float current) const {
+        const float limit = MaxScroll();
+        if (limit <= 0.0f || index < 0) return 0.0f;
+
+        const float stride = tileSize + gap;
+        if (stride <= 0.0f) return 0.0f;
+
+        // Snapped before anything else, so the answer rests on a tile boundary
+        // whatever it was handed. In practice `current` is always a previous
+        // answer and is already on one, but making that a property of the
+        // function rather than of its callers is what stops the panel ever
+        // coming to a stop showing two half tiles.
+        float scroll = std::round(current / stride) * stride;
+
+        const float lead  = static_cast<float>(index) * stride;
+        const float trail = lead + stride - static_cast<float>(visibleCount) * stride;
+
+        if (scroll > lead)  scroll = lead;    // the tile is off to the left
+        if (scroll < trail) scroll = trail;   // the tile is off to the right
+
+        if (scroll < 0.0f)  scroll = 0.0f;
+        if (scroll > limit) scroll = limit;
+        return scroll;
+    }
 };
 
 // Lay out `count` tiles into at most `availableWidth` physical pixels.
 //
-// macOS shrinks the tiles to fit rather than wrapping to a second row or
-// scrolling, so the panel is always a single strip however many apps are open.
+// Always a single row: shrink the tiles to fit, and once they cannot shrink any
+// further without becoming unrecognisable, hold as many whole tiles as the
+// screen allows and let the strip scroll under a panel that does not move. No
+// second row and no scrollbar, both of which the reference goes without.
 inline Metrics Compute(int count, float availableWidth, float dpiScale,
                        float baseTileSize = kTileSize) {
     Metrics m;
@@ -107,8 +169,9 @@ inline Metrics Compute(int count, float availableWidth, float dpiScale,
     m.tileSize    = baseTileSize  * dpiScale;
 
     if (count <= 0) {
-        m.panelWidth  = m.padding * 2;
-        m.panelHeight = m.padding * 2;
+        m.panelWidth   = m.padding * 2;
+        m.contentWidth = m.panelWidth;
+        m.panelHeight  = m.padding * 2;
         m.radius      = (std::min)(m.radius, m.panelHeight * 0.5f);
         return m;
     }
@@ -120,16 +183,43 @@ inline Metrics Compute(int count, float availableWidth, float dpiScale,
     availableWidth = (std::max)(availableWidth,
                                 kMinTileSize * dpiScale + m.padding * 2);
 
-    auto widthFor = [&](float tile) {
-        return m.padding * 2 + tile * count + m.gap * (count - 1);
+    auto widthFor = [&](float tile, int n) {
+        return m.padding * 2 + tile * n + m.gap * (n - 1);
     };
 
-    if (widthFor(m.tileSize) > availableWidth) {
+    if (widthFor(m.tileSize, count) > availableWidth) {
         const float usable = availableWidth - m.padding * 2 - m.gap * (count - 1);
         m.tileSize = (std::max)(kMinTileSize * dpiScale, usable / count);
     }
 
-    m.panelWidth  = (std::min)(widthFor(m.tileSize), availableWidth);
+    m.contentWidth = widthFor(m.tileSize, count);
+    m.visibleCount = count;
+    m.panelWidth   = m.contentWidth;
+
+    // Past the floor they no longer all fit, however small they are made. The
+    // panel then takes as many WHOLE tiles as the screen allows and the strip
+    // scrolls underneath it.
+    //
+    // Whole tiles, not as many pixels as there is room for. A panel stretched
+    // to the last pixel ends part way through an icon, and a sliced tile at the
+    // glass edge reads as something drawn wrong rather than as a list that
+    // continues. It also keeps the scroll a whole number of tile strides, so
+    // the strip can never come to rest showing two half tiles.
+    //
+    // Before this, the panel was clamped to the screen while the tiles carried
+    // on being placed at their own offsets, so everything past the edge was
+    // simply drawn outside the window and thrown away by the compositor: no
+    // tile, no selection highlight, and nothing to say why.
+    if (m.contentWidth > availableWidth) {
+        const float stride = m.tileSize + m.gap;
+
+        // n tiles carry n-1 gaps, so the gap comes back before dividing.
+        const float room = availableWidth - m.padding * 2 + m.gap;
+
+        m.visibleCount = (std::max)(1, static_cast<int>(room / stride));
+        m.panelWidth   = widthFor(m.tileSize, m.visibleCount);
+    }
+
     m.panelHeight = m.padding * 2 + m.tileSize;   // uniform padding, no chin
 
     // A corner extent past half the shorter side is meaningless, and at

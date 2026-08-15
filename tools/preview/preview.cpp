@@ -1316,6 +1316,69 @@ void RunSelfChecks() {
               "tile size scales linearly with DPI");
     }
 
+    // Overflow: past the floor the strip scrolls under a panel that stays put,
+    // and it only ever comes to rest showing whole tiles.
+    {
+        // Comfortable: everything fits, so there is nothing to scroll.
+        const layout::Metrics easy = layout::Compute(8, 1840.0f, 1.0f);
+        Check(easy.visibleCount == 8, "every tile is visible when they all fit");
+        Check(easy.MaxScroll() == 0.0f, "nothing scrolls when everything fits");
+        Check(std::fabs(easy.contentWidth - easy.panelWidth) < 0.01f,
+              "content and panel agree when nothing scrolls");
+        Check(easy.ScrollFor(7, 0.0f) == 0.0f, "no travel when there is no overflow");
+
+        // 60 windows on a 1920 screen: well past the floor.
+        const layout::Metrics big = layout::Compute(60, 1840.0f, 1.0f);
+        Check(big.tileSize == layout::kMinTileSize, "overflow sits at the floor");
+        Check(big.visibleCount < 60, "not everything fits");
+        Check(big.panelWidth <= 1840.0f + 0.01f, "panel still fits the screen");
+        Check(big.contentWidth > big.panelWidth, "there is something to scroll");
+
+        // The panel holds a whole number of tiles, with no part tile and no
+        // leftover strip of padding at the right edge.
+        const float stride = big.tileSize + big.gap;
+        const float whole  = big.padding * 2 + big.visibleCount * stride - big.gap;
+        Check(std::fabs(big.panelWidth - whole) < 0.01f,
+              "the panel is a whole number of tiles wide");
+
+        // One more tile would not have fitted, so no room is being wasted.
+        Check(big.padding * 2 + (big.visibleCount + 1) * stride - big.gap > 1840.0f,
+              "the panel holds as many whole tiles as it can");
+
+        // Both ends of the travel land on a tile boundary.
+        Check(std::fabs(std::fmod(big.MaxScroll(), stride)) < 0.01f,
+              "the far end of the travel is a whole number of tiles");
+
+        // The invariant: whatever is selected, and wherever the strip is now,
+        // the selected tile ends up wholly inside the panel.
+        for (int i = 0; i < 60; ++i) {
+            for (float from : { 0.0f, big.MaxScroll() * 0.5f, big.MaxScroll() }) {
+                const float scroll = big.ScrollFor(i, from);
+                Check(scroll >= 0.0f && scroll <= big.MaxScroll() + 0.01f,
+                      "the strip stays within its travel");
+                Check(std::fabs(std::fmod(scroll, stride)) < 0.01f,
+                      "the strip rests on a tile boundary");
+
+                const float left  = big.TileX(i) - scroll;
+                const float right = left + big.tileSize;
+                Check(left >= big.padding - 0.01f,
+                      "the selected tile is not cut off on the left");
+                Check(right <= big.panelWidth - big.padding + 0.01f,
+                      "the selected tile is not cut off on the right");
+            }
+        }
+
+        // A tile already on screen does not drag the strip about.
+        Check(big.ScrollFor(0, 0.0f) == 0.0f, "the first tile needs no travel");
+        Check(big.ScrollFor(big.visibleCount - 1, 0.0f) == 0.0f,
+              "the last visible tile needs no travel");
+        Check(big.ScrollFor(big.visibleCount, 0.0f) > 0.0f,
+              "the first tile past the edge moves the strip");
+
+        // Opening the panel always shows the most recent, never the middle.
+        Check(big.ScrollFor(1, 0.0f) == 0.0f, "a fresh gesture starts at the beginning");
+    }
+
     // Resize preserves aspect ratio and never invents opacity.
     {
         Bitmap wide = Bitmap::Create(200, 50);
