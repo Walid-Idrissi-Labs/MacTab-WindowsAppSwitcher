@@ -1375,8 +1375,25 @@ void RunSelfChecks() {
         Check(big.ScrollFor(big.visibleCount, 0.0f) > 0.0f,
               "the first tile past the edge moves the strip");
 
-        // Opening the panel always shows the most recent, never the middle.
-        Check(big.ScrollFor(1, 0.0f) == 0.0f, "a fresh gesture starts at the beginning");
+        // A tile that is already visible needs no travel, which is what makes a
+        // fresh gesture open at the beginning: the panel resets the offset to
+        // zero for a new list and the selection starts at the front of it.
+        Check(big.ScrollFor(1, 0.0f) == 0.0f, "an early tile needs no travel");
+
+        // Nonsense in does not become nonsense that sticks.
+        Check(big.ScrollFor(5, std::numeric_limits<float>::quiet_NaN()) == 0.0f,
+              "a non-finite offset is discarded rather than propagated");
+
+        // Exact fits must not lose a tile to truncation. At 125% the stride is
+        // not representable, which is where this used to go wrong.
+        for (float scale : { 1.0f, 1.25f, 1.5f, 2.0f }) {
+            const layout::Metrics probe = layout::Compute(80, 3000.0f, scale);
+            const float step  = probe.tileSize + probe.gap;
+            const float taken = probe.padding * 2 + probe.visibleCount * step - probe.gap;
+            Check(taken <= 3000.0f + 0.01f, "the panel fits the space given");
+            Check(taken + step > 3000.0f - 0.01f,
+                  "the panel holds every whole tile that fits");
+        }
     }
 
     // Resize preserves aspect ratio and never invents opacity.

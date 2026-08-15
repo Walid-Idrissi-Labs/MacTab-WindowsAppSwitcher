@@ -130,6 +130,11 @@ struct Metrics {
         const float limit = MaxScroll();
         if (limit <= 0.0f || index < 0) return 0.0f;
 
+        // A non-finite offset would survive every clamp below and then feed
+        // itself back in on the next call, since the caller keeps the answer.
+        // Unreachable today, and one comparison to keep it that way.
+        if (!std::isfinite(current)) current = 0.0f;
+
         const float stride = tileSize + gap;
         if (stride <= 0.0f) return 0.0f;
 
@@ -216,7 +221,12 @@ inline Metrics Compute(int count, float availableWidth, float dpiScale,
         // n tiles carry n-1 gaps, so the gap comes back before dividing.
         const float room = availableWidth - m.padding * 2 + m.gap;
 
-        m.visibleCount = (std::max)(1, static_cast<int>(room / stride));
+        // The epsilon is for exact fits. A stride like 55.2, which is what
+        // 46 comes to at 125% scaling, is not representable, so a width that
+        // holds exactly n tiles can divide to a hair under n and truncate to
+        // n-1, costing a whole tile of panel for nothing. Being wrong the other
+        // way would need a real overhang of under a twentieth of a pixel.
+        m.visibleCount = (std::max)(1, static_cast<int>(room / stride + 0.001f));
         m.panelWidth   = widthFor(m.tileSize, m.visibleCount);
     }
 
