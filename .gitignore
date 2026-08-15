@@ -16,3 +16,6 @@ build-preview/
 # tool exports. Only the frames the .ico is actually cut from are kept, and
 # those live in res/icon/.
 logo/
+
+# Working notes that are not documentation. Deliberately unpublished.
+notes/
