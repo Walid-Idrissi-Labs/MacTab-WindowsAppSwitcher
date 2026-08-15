@@ -130,7 +130,8 @@ struct Panel::Impl {
     WUC::ContainerVisual content{ nullptr };
     WUC::SpriteVisual    backdropVisual{ nullptr };
     WUC::SpriteVisual    selectionVisual{ nullptr };
-    WUC::ContainerVisual tileLayer{ nullptr };
+    WUC::ContainerVisual tileLayer{ nullptr };   // stationary, carries the clip
+    WUC::ContainerVisual stripLayer{ nullptr };  // the tiles, this is what moves
     WUC::InsetClip       tileClip{ nullptr };
     WUC::SpriteVisual    labelVisual{ nullptr };
 
@@ -460,13 +461,27 @@ bool Panel::Impl::CreateVisualTree() {
     contentChildren.InsertAtTop(tileLayer);
     contentChildren.InsertAtTop(labelVisual);
 
-    // The strip is clipped to the flat part of the glass, so that a scrolled
-    // row cannot draw a tile over the rounded corner or out into the padding.
-    // At rest the visible tiles end exactly on this boundary, since the panel
-    // is sized to a whole number of them; the clip matters while the spring is
-    // still settling, where the strip overshoots slightly before it stops.
-    tileClip = compositor.CreateInsetClip();
+    // Two layers, and it has to be two.
+    //
+    // A Visual's Clip is applied in that visual's OWN coordinate space, so
+    // offsetting a visual moves its clip along with it. Put the clip and the
+    // scroll on one visual and the clip stops being a window onto the strip and
+    // becomes a mask attached to it, travelling along and removing exactly the
+    // tiles the scroll just brought into view.
+    //
+    // So tileLayer never moves. It takes its size from the panel and carries
+    // the clip, which is the window. stripLayer is its only child, holds every
+    // tile, and is the thing the scroll offsets.
+    //
+    // The clip is inset to the flat part of the glass so no tile is ever drawn
+    // over the rounded corner. At rest the visible tiles end exactly on that
+    // boundary, since the panel is a whole number of tiles wide; it earns its
+    // keep while the spring is still settling, where the strip overshoots
+    // slightly before it stops.
+    tileClip   = compositor.CreateInsetClip();
+    stripLayer = compositor.CreateContainerVisual();
     tileLayer.Clip(tileClip);
+    tileLayer.Children().InsertAtTop(stripLayer);
 
     // The whole panel fades and scales as one unit.
     root.Opacity(0.0f);
@@ -552,6 +567,7 @@ void Panel::Shutdown() {
         impl.tileVisuals.clear();
         impl.labelVisual     = nullptr;
         impl.tileClip        = nullptr;
+        impl.stripLayer      = nullptr;
         impl.tileLayer       = nullptr;
         impl.selectionVisual = nullptr;
         impl.backdropVisual  = nullptr;
@@ -1437,10 +1453,10 @@ void Panel::Impl::PositionTiles(bool animate) {
         slide.DampingRatio(0.80f);
         slide.Period(std::chrono::milliseconds(50));
         slide.FinalValue(stripAt);
-        tileLayer.StartAnimation(L"Offset", slide);
+        stripLayer.StartAnimation(L"Offset", slide);
     } else {
-        tileLayer.StopAnimation(L"Offset");
-        tileLayer.Offset(stripAt);
+        stripLayer.StopAnimation(L"Offset");
+        stripLayer.Offset(stripAt);
     }
 }
 
@@ -1486,7 +1502,7 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
 
     // Reuse existing tile visuals; only create or trim the difference. Rebuilding
     // the whole tree per invocation would blow the one-frame budget.
-    auto children = impl.tileLayer.Children();
+    auto children = impl.stripLayer.Children();
     while (impl.tileVisuals.size() < impl.items.size()) {
         auto visual = impl.compositor.CreateSpriteVisual();
         children.InsertAtTop(visual);
