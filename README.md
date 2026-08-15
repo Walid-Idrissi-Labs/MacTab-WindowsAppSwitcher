@@ -238,4 +238,9 @@ antivirus software to run this.
 
 ## Licence
 
-Not yet chosen.
+GNU General Public License v3.0. The full text is in [LICENSE](LICENSE).
+
+Copyright (C) 2026 Walid Idrissi.
+
+Modified versions and redistributed builds must carry the same licence and make
+their source available.
