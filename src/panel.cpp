@@ -131,6 +131,7 @@ struct Panel::Impl {
     WUC::SpriteVisual    backdropVisual{ nullptr };
     WUC::SpriteVisual    selectionVisual{ nullptr };
     WUC::ContainerVisual tileLayer{ nullptr };
+    WUC::InsetClip       tileClip{ nullptr };
     WUC::SpriteVisual    labelVisual{ nullptr };
 
     WUC::CompositionDrawingSurface backdropSurface{ nullptr };
@@ -147,6 +148,15 @@ struct Panel::Impl {
     // State
     std::vector<PanelItem> items;
     int    selected  = 0;
+
+    // What the last layout worked out, kept so the scroll maths can be asked
+    // for again on every selection change without recomputing the layout.
+    layout::Metrics layoutMetrics{};
+
+    // How far the strip of tiles is slid to the left, in physical pixels.
+    // Zero unless there are more tiles than the screen can hold at the shrink
+    // floor. See layout::Metrics::ScrollFor.
+    float scrollPx = 0.0f;
     float  dpiScale  = 1.0f;
     float  tilePx    = layout::kTileSize;
     RECT   panelRect{};        // screen coords
@@ -450,6 +460,14 @@ bool Panel::Impl::CreateVisualTree() {
     contentChildren.InsertAtTop(tileLayer);
     contentChildren.InsertAtTop(labelVisual);
 
+    // The strip is clipped to the flat part of the glass, so that a scrolled
+    // row cannot draw a tile over the rounded corner or out into the padding.
+    // At rest the visible tiles end exactly on this boundary, since the panel
+    // is sized to a whole number of them; the clip matters while the spring is
+    // still settling, where the strip overshoots slightly before it stops.
+    tileClip = compositor.CreateInsetClip();
+    tileLayer.Clip(tileClip);
+
     // The whole panel fades and scales as one unit.
     root.Opacity(0.0f);
     return true;
@@ -533,6 +551,7 @@ void Panel::Shutdown() {
 
         impl.tileVisuals.clear();
         impl.labelVisual     = nullptr;
+        impl.tileClip        = nullptr;
         impl.tileLayer       = nullptr;
         impl.selectionVisual = nullptr;
         impl.backdropVisual  = nullptr;
@@ -1052,7 +1071,7 @@ void Panel::Impl::BakeLabel() {
     // Anchor on the selected tile's centre, then slide inward so the capsule
     // never overhangs the panel's own width at either end of the row.
     const float tileCentre =
-        padding + static_cast<float>(index) * (tilePx + gap) + tilePx * 0.5f;
+        padding + static_cast<float>(index) * (tilePx + gap) + tilePx * 0.5f - scrollPx;
     const float x = (std::max)(0.0f,
                                (std::min)(tileCentre - surfaceWidth * 0.5f,
                                           panelWidth - surfaceWidth));
@@ -1255,9 +1274,11 @@ void Panel::Impl::Layout(int count) {
 
     // macOS shrinks tiles to fit rather than wrapping to a second row, so the
     // panel is always a single strip.
-    const layout::Metrics metrics = layout::Compute(
+    layoutMetrics = layout::Compute(
         count, maxPanelWidth, dpiScale,
         static_cast<float>(config::Current().tileSize));
+
+    const layout::Metrics& metrics = layoutMetrics;
     tilePx        = metrics.tileSize;
     panelRadiusPx = metrics.radius;
 
@@ -1293,6 +1314,12 @@ void Panel::Impl::Layout(int count) {
 
     content.Offset({ 0.0f, 0.0f, 0.0f });
     content.Size({ panelWidth, panelHeight + labelBandPx });
+
+    // An inset clip measures from the visual's own bounds, so the layer needs a
+    // size before the clip means anything.
+    tileLayer.Size({ panelWidth, panelHeight });
+    tileClip.LeftInset(metrics.padding);
+    tileClip.RightInset(metrics.padding);
 
     // Last line on purpose. Everything above can throw (device loss), and
     // recording the count earlier would let SetItems skip the re-layout after a
@@ -1350,6 +1377,11 @@ void Panel::Impl::PositionTiles(bool animate) {
     const float padding = Scaled(layout::kPanelPadding);
     const float gap     = Scaled(layout::kTileGap);
 
+    // Where the strip has to sit for the selected tile to be wholly inside the
+    // panel. Answers zero whenever everything fits, which is almost always, so
+    // the whole of the rest of this is unchanged in the ordinary case.
+    scrollPx = layoutMetrics.ScrollFor(selected, scrollPx);
+
     for (size_t i = 0; i < tileVisuals.size(); ++i) {
         const float x = padding + static_cast<float>(i) * (tilePx + gap);
         tileVisuals[i].Size({ tilePx, tilePx });
@@ -1358,7 +1390,12 @@ void Panel::Impl::PositionTiles(bool animate) {
 
     if (selected >= 0 && selected < static_cast<int>(tileVisuals.size())) {
         const float inset = tilePx * layout::kSelectionInset;
-        const float x = padding + static_cast<float>(selected) * (tilePx + gap) - inset;
+
+        // The highlight is a sibling of the strip rather than a child of it, so
+        // it does not inherit the strip's offset and has to carry the scroll
+        // itself. Both are given the same spring below, so they travel together.
+        const float x =
+            padding + static_cast<float>(selected) * (tilePx + gap) - inset - scrollPx;
 
         selectionVisual.Size({ tilePx + inset * 2, tilePx + inset * 2 });
 
@@ -1389,6 +1426,22 @@ void Panel::Impl::PositionTiles(bool animate) {
             selectionVisual.Offset(destination);
         }
     }
+
+    // And the strip itself, with the same spring, so the tiles sliding one way
+    // and the highlight settling the other compose into one movement rather
+    // than two that disagree for 50 ms.
+    const WFN::float3 stripAt{ -scrollPx, 0.0f, 0.0f };
+
+    if (animate && config::Current().selectionAnimation) {
+        auto slide = compositor.CreateSpringVector3Animation();
+        slide.DampingRatio(0.80f);
+        slide.Period(std::chrono::milliseconds(50));
+        slide.FinalValue(stripAt);
+        tileLayer.StartAnimation(L"Offset", slide);
+    } else {
+        tileLayer.StopAnimation(L"Offset");
+        tileLayer.Offset(stripAt);
+    }
 }
 
 void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
@@ -1398,6 +1451,13 @@ void Panel::SetItems(std::vector<PanelItem> items, int selectedIndex) {
 
     impl.items    = std::move(items);
     impl.selected = selectedIndex;
+
+    // A new list starts at the beginning. Without this a gesture that had
+    // scrolled a long way would hand its offset to the next one, which would
+    // then open part way along a list the selection is at the front of. The
+    // same applies mid-gesture, where quitting an app or expanding one into its
+    // windows replaces the list outright.
+    impl.scrollPx = 0.0f;
 
     // Re-resolve the theme once per gesture, so switching Windows between light
     // and dark, or picking a theme from the tray, takes effect on the next
@@ -1599,8 +1659,14 @@ int Panel::Impl::HitTestScreen(POINT screenPoint) const {
 
     if (y < padding || y > padding + tilePx) return -1;
 
+    // Only what is actually under the glass. A scrolled strip has tiles sitting
+    // either side of the panel that the clip removes, and a click landing where
+    // one of those would have been must not select it.
+    const float panelWidth = static_cast<float>(panelRect.right - panelRect.left);
+    if (x < padding || x > panelWidth - padding) return -1;
+
     for (size_t i = 0; i < items.size(); ++i) {
-        const float left = padding + static_cast<float>(i) * (tilePx + gap);
+        const float left = padding + static_cast<float>(i) * (tilePx + gap) - scrollPx;
         if (x >= left && x <= left + tilePx)
             return static_cast<int>(i);
     }
