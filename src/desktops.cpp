@@ -174,81 +174,132 @@ struct Shell {
 // UI thread only, like Manager().
 Shell g_shell;
 
-// Set when a layout answered QueryService but failed the check, or when no
-// layout answered at all once the shell was up. Either way this build is not one
-// the slots above were checked against, and asking again will not change that.
+// Set when a layout answered but failed its check, or faulted in use. This
+// build's interface is not what the slots above describe, and asking again in
+// the same explorer will not change that. A new explorer is asked again.
 bool g_shellRefused = false;
 
-// Every desktop the interface lists, in its order, and the one being viewed.
+// What a call that faulted returns, so a fault is never mistaken for the shell
+// saying no.
+constexpr HRESULT kShellFaulted = MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x4D54);
+
+using GuardedFn = HRESULT (*)(void* context);
+
+// Every call into the shell goes through here.
 //
-// Split from SelfTest so the __try there guards a function with no destructors
-// of its own, which is what MSVC requires of one.
-bool ReadShellDesktops(IShellDesktops* desktops, const GUID& desktopIid,
-                       std::vector<GUID>& out, GUID& current, const char** why) {
-    UINT count = 0;
-    if (FAILED(desktops->GetCount(&count)) || count == 0) {
-        *why = "GetCount";
-        return false;
-    }
-
-    ComPtr<IObjectArray> array;
-    UINT listed = 0;
-    if (FAILED(desktops->GetDesktops(array.Put())) || !array ||
-        FAILED(array->GetCount(&listed)) || listed != count) {
-        *why = "GetDesktops";
-        return false;
-    }
-
-    for (UINT i = 0; i < listed; ++i) {
-        ComPtr<IShellDesktop> desktop;
-        GUID id{};
-        if (FAILED(array->GetAt(i, desktopIid, desktop.PutVoid())) || !desktop ||
-            FAILED(desktop->GetId(&id))) {
-            *why = "IVirtualDesktop::GetId";
-            return false;
-        }
-        out.push_back(id);
-    }
-
-    ComPtr<IShellDesktop> viewed;
-    if (FAILED(desktops->GetCurrentDesktop(viewed.Put())) || !viewed ||
-        FAILED(viewed->GetId(&current))) {
-        *why = "GetCurrentDesktop";
-        return false;
-    }
-    return true;
-}
-
+// A slot whose real signature differs from the one declared faults inside our
+// proxy rather than returning an error, and that is refused like any other
+// failed check rather than taking the process down. No destructors in this
+// frame, which is what MSVC asks of a function with __try in it; the call
+// itself runs in `fn`.
+HRESULT CallGuarded(GuardedFn fn, void* context) {
 #if defined(_MSC_VER)
-bool ReadShellDesktopsGuarded(IShellDesktops* desktops, const GUID& desktopIid,
-                              std::vector<GUID>* out, GUID* current, const char** why) {
-    // A slot with a different signature faults in our proxy rather than
-    // returning an error. Refusing the build is the right answer to that too.
     __try {
-        return ReadShellDesktops(desktops, desktopIid, *out, *current, why);
+        return fn(context);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        *why = "a fault inside the call";
-        return false;
+        return kShellFaulted;
     }
-}
 #else
-bool ReadShellDesktopsGuarded(IShellDesktops* desktops, const GUID& desktopIid,
-                              std::vector<GUID>* out, GUID* current, const char** why) {
-    return ReadShellDesktops(desktops, desktopIid, *out, *current, why);
-}
+    return fn(context);
 #endif
+}
+
+template <typename F>
+HRESULT Guarded(F& call) {
+    return CallGuarded([](void* context) { return (*static_cast<F*>(context))(); }, &call);
+}
+
+// The shell's object for the desktop with this id. Walked rather than looked up,
+// because FindDesktop is past slot 9.
+HRESULT FindShellDesktop(const Shell& shell, const GUID& id, ComPtr<IShellDesktop>& out) {
+    ComPtr<IObjectArray> array;
+    HRESULT hr = shell.desktops->GetDesktops(array.Put());
+    if (FAILED(hr)) return hr;
+    if (!array) return E_FAIL;
+
+    UINT count = 0;
+    hr = array->GetCount(&count);
+    if (FAILED(hr)) return hr;
+
+    for (UINT i = 0; i < count; ++i) {
+        ComPtr<IShellDesktop> desktop;
+        GUID candidate{};
+        hr = array->GetAt(i, shell.desktopIid, desktop.PutVoid());
+        if (FAILED(hr)) return hr;
+        if (!desktop || FAILED(desktop->GetId(&candidate))) continue;
+        if (::IsEqualGUID(candidate, id)) {
+            out = std::move(desktop);
+            return S_OK;
+        }
+    }
+    return TYPE_E_ELEMENTNOTFOUND;
+}
 
 // Does this interface describe the desktops that are actually there?
 //
 // Compared with the registry, which the shell writes and which has nothing to
-// do with any vtable. Same desktops, same order, and the viewed one among them.
+// do with any vtable: same desktops, same order, the viewed one among them.
 // Without a registry list (one desktop, never added to) the interface still has
-// to agree with itself across four different calls.
-bool SelfTest(IShellDesktops* desktops, const GUID& desktopIid, const char** why) {
+// to agree with itself. GetAdjacentDesktop is asked too, because it is the last
+// slot before the one that switches, and a slot inserted after GetDesktops
+// would otherwise pass this and be found by SwitchDesktop instead.
+bool SelfTest(const Shell& shell, const char** why) {
     std::vector<GUID> listed;
     GUID current{};
-    if (!ReadShellDesktopsGuarded(desktops, desktopIid, &listed, &current, why))
-        return false;
+
+    auto read = [&]() -> HRESULT {
+        UINT count = 0;
+        if (FAILED(shell.desktops->GetCount(&count)) || count == 0) {
+            *why = "GetCount";
+            return E_FAIL;
+        }
+
+        ComPtr<IObjectArray> array;
+        UINT size = 0;
+        if (FAILED(shell.desktops->GetDesktops(array.Put())) || !array ||
+            FAILED(array->GetCount(&size)) || size != count) {
+            *why = "GetDesktops";
+            return E_FAIL;
+        }
+
+        for (UINT i = 0; i < size; ++i) {
+            ComPtr<IShellDesktop> desktop;
+            GUID id{};
+            if (FAILED(array->GetAt(i, shell.desktopIid, desktop.PutVoid())) || !desktop ||
+                FAILED(desktop->GetId(&id))) {
+                *why = "IVirtualDesktop::GetId";
+                return E_FAIL;
+            }
+            listed.push_back(id);
+        }
+
+        ComPtr<IShellDesktop> viewed;
+        if (FAILED(shell.desktops->GetCurrentDesktop(viewed.Put())) || !viewed ||
+            FAILED(viewed->GetId(&current))) {
+            *why = "GetCurrentDesktop";
+            return E_FAIL;
+        }
+
+        // Left is 3 and right is 4. Either a desktop that is in the list, or a
+        // clean failure at an end; anything else is some other method.
+        for (UINT direction : { 3u, 4u }) {
+            ComPtr<IShellDesktop> next;
+            GUID id{};
+            if (FAILED(shell.desktops->GetAdjacentDesktop(viewed.Get(), direction, next.Put())))
+                continue;
+            if (!next || FAILED(next->GetId(&id)) ||
+                std::none_of(listed.begin(), listed.end(),
+                             [&](const GUID& g) { return ::IsEqualGUID(g, id) != FALSE; })) {
+                *why = "GetAdjacentDesktop";
+                return E_FAIL;
+            }
+        }
+        return S_OK;
+    };
+
+    const HRESULT hr = Guarded(read);
+    if (hr == kShellFaulted) *why = "a fault inside the call";
+    if (FAILED(hr)) return false;
 
     if (std::none_of(listed.begin(), listed.end(),
                      [&](const GUID& id) { return ::IsEqualGUID(id, current) != FALSE; })) {
@@ -272,30 +323,33 @@ bool SelfTest(IShellDesktops* desktops, const GUID& desktopIid, const char** why
     return true;
 }
 
-// The shell's desktop interface, connected and checked, or null.
-IShellDesktops* ShellDesktops() {
-    if (config::Current().desktopMoves == L"off") return nullptr;
-    if (g_shellRefused) return nullptr;
-    if (g_shell.desktops) return g_shell.desktops.Get();
+// Connect to the shell and check it, or say why not.
+//
+// Only a failed check is remembered. Explorer answering the shell object but
+// not yet the desktop service is normal early at logon, so a miss is asked
+// again on the next drop rather than taken as a verdict on the build.
+bool ConnectShell() {
+    if (config::Current().desktopMoves == L"off") return false;
+    if (g_shellRefused) return false;
+    if (g_shell.desktops) return true;
 
     const GUID shellClass = ParseGuid(kImmersiveShell);
-    ComPtr<IServiceProvider> shell;
+    ComPtr<IServiceProvider> provider;
     HRESULT hr = ::CoCreateInstance(shellClass, nullptr, CLSCTX_LOCAL_SERVER,
-                                    IID_PPV_ARGS(shell.Put()));
+                                    IID_PPV_ARGS(provider.Put()));
     if (FAILED(hr)) {
-        // Explorer not up yet, which is normal at logon. Asked again next time.
         MACTAB_DIAG("desktops: the shell is not answering (0x%08lX)",
                     static_cast<unsigned long>(hr));
-        return nullptr;
+        return false;
     }
 
     const GUID viewsIid = ParseGuid(kViewsInterface);
-    ComPtr<IShellViews> views;
-    hr = shell->QueryService(viewsIid, viewsIid, views.PutVoid());
-    if (FAILED(hr) || !views) {
+    Shell shell;
+    hr = provider->QueryService(viewsIid, viewsIid, shell.views.PutVoid());
+    if (FAILED(hr) || !shell.views) {
         MACTAB_DIAG("desktops: no view collection from the shell (0x%08lX)",
                     static_cast<unsigned long>(hr));
-        return nullptr;
+        return false;
     }
 
     const uint32_t build   = WindowsBuildNumber();
@@ -304,82 +358,68 @@ IShellDesktops* ShellDesktops() {
 
     for (const Layout& layout : kLayouts) {
         if (layout.win11 != win11) continue;
-
-        ComPtr<IShellDesktops> desktops;
-        if (FAILED(shell->QueryService(service, ParseGuid(layout.desktops),
-                                       desktops.PutVoid())) || !desktops)
+        if (FAILED(provider->QueryService(service, ParseGuid(layout.desktops),
+                                          shell.desktops.PutVoid())) || !shell.desktops)
             continue;
 
-        const GUID desktopIid = ParseGuid(layout.desktop);
+        shell.desktopIid = ParseGuid(layout.desktop);
         const char* why = "";
-        if (!SelfTest(desktops.Get(), desktopIid, &why)) {
+        if (!SelfTest(shell, &why)) {
             g_shellRefused = true;
             MACTAB_WARN("desktops: the shell's interface for %s failed its check on "
                         "build %u (%s); other applications' windows will not be moved",
                         layout.name, build, why);
-            return nullptr;
+            return false;
         }
 
-        g_shell.desktops   = std::move(desktops);
-        g_shell.views      = std::move(views);
-        g_shell.desktopIid = desktopIid;
+        g_shell = std::move(shell);
         MACTAB_DIAG("desktops: moving windows through the shell, layout %s, build %u",
                     layout.name, build);
-        return g_shell.desktops.Get();
+        return true;
     }
 
-    g_shellRefused = true;
-    MACTAB_WARN("desktops: build %u has a desktop interface MacTab has not been "
-                "checked against; other applications' windows will not be moved",
-                build);
-    return nullptr;
+    static bool told = false;
+    if (!told) {
+        told = true;
+        MACTAB_WARN("desktops: build %u answers none of the desktop interfaces MacTab "
+                    "has been checked against; other applications' windows will not "
+                    "be moved", build);
+    }
+    return false;
 }
 
 // Explorer restarted, or is restarting, under us.
 bool ShellWentAway(HRESULT hr) {
     return hr == RPC_E_DISCONNECTED || hr == RPC_E_SERVER_DIED ||
-           hr == RPC_E_SERVER_DIED_DNE ||
+           hr == RPC_E_SERVER_DIED_DNE || hr == CO_E_OBJNOTCONNECTED ||
            hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE) ||
            hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED);
 }
 
-// The shell's object for the desktop with this id. Walked rather than looked up,
-// because FindDesktop is past slot 9.
-HRESULT FindShellDesktop(IShellDesktops* desktops, const GUID& id,
-                         ComPtr<IShellDesktop>& out) {
-    ComPtr<IObjectArray> array;
-    HRESULT hr = desktops->GetDesktops(array.Put());
-    if (FAILED(hr)) return hr;
-    if (!array) return E_FAIL;
-
-    UINT count = 0;
-    hr = array->GetCount(&count);
-    if (FAILED(hr)) return hr;
-
-    for (UINT i = 0; i < count; ++i) {
-        ComPtr<IShellDesktop> desktop;
-        GUID candidate{};
-        hr = array->GetAt(i, g_shell.desktopIid, desktop.PutVoid());
-        if (FAILED(hr)) return hr;
-        if (!desktop || FAILED(desktop->GetId(&candidate))) continue;
-        if (::IsEqualGUID(candidate, id)) {
-            out = std::move(desktop);
-            return S_OK;
-        }
-    }
-    return TYPE_E_ELEMENTNOTFOUND;
-}
-
 // Run `call` against the shell, reconnecting once if explorer has restarted
 // since the last call and the cached proxies point at a process that is gone.
+//
+// The call gets its own references. It is cross-process COM from an STA, whose
+// modal loop delivers TaskbarCreated while explorer is restarting, and that
+// handler drops g_shell: without a copy, the proxy would be released under the
+// call that is still using it.
 template <typename F>
 HRESULT CallShell(F&& call) {
     HRESULT hr = E_NOINTERFACE;
     for (int attempt = 0; attempt < 2; ++attempt) {
-        IShellDesktops* desktops = ShellDesktops();
-        if (!desktops) return E_NOINTERFACE;
+        if (!ConnectShell()) return E_NOINTERFACE;
 
-        hr = call(desktops);
+        const Shell shell = g_shell;
+        auto bound = [&]() -> HRESULT { return call(shell); };
+        hr = Guarded(bound);
+
+        if (hr == kShellFaulted) {
+            g_shellRefused = true;
+            g_shell = Shell{};
+            MACTAB_WARN("desktops: a call into the shell faulted; other applications' "
+                        "windows will not be moved until explorer restarts");
+            return hr;
+        }
         if (!ShellWentAway(hr)) return hr;
 
         MACTAB_WARN("desktops: the shell went away (0x%08lX); reconnecting",
@@ -389,23 +429,23 @@ HRESULT CallShell(F&& call) {
     return hr;
 }
 
-HRESULT MoveThroughShell(IShellDesktops* desktops, HWND hwnd, const GUID& target) {
+HRESULT MoveThroughShell(const Shell& shell, HWND hwnd, const GUID& target) {
     ComPtr<IUnknown> view;
-    HRESULT hr = g_shell.views->GetViewForHwnd(hwnd, view.Put());
+    HRESULT hr = shell.views->GetViewForHwnd(hwnd, view.Put());
     if (FAILED(hr)) return hr;
     if (!view) return E_FAIL;
 
     // False for a window pinned to every desktop, among others.
     BOOL can = FALSE;
-    hr = desktops->CanViewMoveDesktops(view.Get(), &can);
+    hr = shell.desktops->CanViewMoveDesktops(view.Get(), &can);
     if (FAILED(hr)) return hr;
     if (!can) return E_ACCESSDENIED;
 
     ComPtr<IShellDesktop> desktop;
-    hr = FindShellDesktop(desktops, target, desktop);
+    hr = FindShellDesktop(shell, target, desktop);
     if (FAILED(hr)) return hr;
 
-    return desktops->MoveViewToDesktop(view.Get(), desktop.Get());
+    return shell.desktops->MoveViewToDesktop(view.Get(), desktop.Get());
 }
 
 void AppendKey(std::vector<INPUT>& inputs, WORD vk, bool up) {
@@ -564,8 +604,8 @@ bool MoveWindowTo(HWND hwnd, const GUID& desktop) {
     HWND root = ::GetAncestor(hwnd, GA_ROOT);
     if (!root) root = hwnd;
 
-    const HRESULT hr = CallShell([&](IShellDesktops* desktops) {
-        return MoveThroughShell(desktops, root, desktop);
+    const HRESULT hr = CallShell([&](const Shell& shell) {
+        return MoveThroughShell(shell, root, desktop);
     });
     if (FAILED(hr)) {
         MACTAB_WARN("desktops: %p was not moved (0x%08lX)", static_cast<void*>(root),
@@ -579,10 +619,10 @@ bool MoveWindowTo(HWND hwnd, const GUID& desktop) {
 }
 
 bool SwitchToId(const GUID& id) {
-    const HRESULT hr = CallShell([&](IShellDesktops* desktops) {
+    const HRESULT hr = CallShell([&](const Shell& shell) {
         ComPtr<IShellDesktop> desktop;
-        const HRESULT found = FindShellDesktop(desktops, id, desktop);
-        return FAILED(found) ? found : desktops->SwitchDesktop(desktop.Get());
+        const HRESULT found = FindShellDesktop(shell, id, desktop);
+        return FAILED(found) ? found : shell.desktops->SwitchDesktop(desktop.Get());
     });
     if (FAILED(hr)) {
         MACTAB_DIAG("desktops: the shell did not switch (0x%08lX)",
@@ -592,9 +632,22 @@ bool SwitchToId(const GUID& id) {
     return true;
 }
 
-bool CanMoveWindows() { return ShellDesktops() != nullptr; }
+bool CanMoveWindows() { return ConnectShell(); }
 
-void ResetShell() { g_shell = Shell{}; }
+// A new explorer is asked afresh, refusal included: the refusal was about the
+// interface the old one answered with.
+void ResetShell() {
+    g_shell        = Shell{};
+    g_shellRefused = false;
+}
+
+bool IsOnCurrentDesktop(HWND hwnd) {
+    IVirtualDesktopManager* manager = Manager();
+    BOOL on = TRUE;
+    if (!manager || !hwnd || FAILED(manager->IsWindowOnCurrentVirtualDesktop(hwnd, &on)))
+        return true;
+    return on != FALSE;
+}
 
 bool SwitchTo(const State& state, int targetIndex) {
     if (!state.known || state.current < 0) return false;

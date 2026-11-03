@@ -633,6 +633,11 @@ struct MissionPayload {
 // message that arrives in batches while the icons warm up.
 std::vector<icons::Request> g_missionIcons;
 
+// Set while a call into the shell is out. That call is cross-process COM from
+// this STA, and its modal loop delivers the watch timer, whose rebuild would
+// run in the middle of the caller's own.
+bool g_shellCallOut = false;
+
 MissionPayload BuildMissionPayload() {
     MissionPayload payload;
     g_missionIcons.clear();
@@ -827,9 +832,11 @@ void ChangeSpaces(bool add, int index, HWND carry = nullptr) {
         const desktops::State now = desktops::Query(g_app.host);
         for (const desktops::Desktop& desktop : now.all) {
             if (desktops::IndexOf(before, desktop.id) >= 0) continue;
+            g_shellCallOut = true;
             if (!desktops::MoveWindowTo(carry, desktop.id))
                 MACTAB_WARN("mission: the new desktop was made but %p would not go to it",
                             static_cast<void*>(carry));
+            g_shellCallOut = false;
             break;
         }
     }
@@ -856,9 +863,22 @@ void ChangeSpaces(bool add, int index, HWND carry = nullptr) {
 // rebuild puts it back where it really is.
 void MoveFromMission(HWND window, int index) {
     const desktops::State state = desktops::Query(g_app.host);
-    const bool moved = state.known && index >= 0 &&
-                       index < static_cast<int>(state.all.size()) && ::IsWindow(window) &&
-                       desktops::MoveWindowTo(window, state.all[static_cast<size_t>(index)].id);
+    bool moved = false;
+
+    if (state.known && index >= 0 && index < static_cast<int>(state.all.size()) &&
+        ::IsWindow(window)) {
+        const GUID& target = state.all[static_cast<size_t>(index)].id;
+
+        g_shellCallOut = true;
+        moved = desktops::MoveWindowTo(window, target);
+
+        // The shell saying yes is not the same as the window being there, and
+        // the overlay is already showing it there. Asked once, cheaply.
+        GUID now{};
+        if (moved && desktops::DesktopIdOf(window, now) && !::IsEqualGUID(now, target))
+            moved = false;
+        g_shellCallOut = false;
+    }
     if (moved || !g_app.mission.Visible()) return;
 
     MACTAB_WARN("mission: %p could not go to desktop %d; putting it back",
@@ -1026,7 +1046,7 @@ std::vector<HWND> EligibleWindows(const desktops::State& state) {
 
 // Anything that changed underneath us while we were looking at it.
 void SyncMission() {
-    if (!g_app.mission.Visible()) return;
+    if (!g_app.mission.Visible() || g_shellCallOut) return;
 
     const desktops::State state = desktops::Query(g_app.host);
     if (!state.known) return;
@@ -1103,7 +1123,12 @@ void CarryWindow(int direction, HWND dragged) {
         MACTAB_WARN("carry: %p did not go to desktop %d", static_cast<void*>(window), to);
 
     MACTAB_DIAG("carry: %p to desktop %d", static_cast<void*>(window), to);
-    if (!desktops::SwitchToId(target)) desktops::SwitchTo(state, to);
+    if (desktops::SwitchToId(target)) return;
+
+    // The shell's interface has gone since this was armed. The chord still
+    // switches, as the shell would have, and the hook stops taking it.
+    desktops::SwitchTo(state, to);
+    hotkey::SetCarryWindows(desktops::CanMoveWindows());
 }
 
 // Step the strip by one, for Ctrl+Win+Left and Ctrl+Win+Right.

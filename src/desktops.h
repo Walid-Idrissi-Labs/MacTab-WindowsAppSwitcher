@@ -114,6 +114,11 @@ bool CanMoveWindows();
 // reconnects and checks again.
 void ResetShell();
 
+// Whether a window is on the desktop being viewed, which a window pinned to
+// every desktop always is. True when it cannot be told, which is the answer
+// that changes nothing.
+bool IsOnCurrentDesktop(HWND hwnd);
+
 // Block until the shell reports `target` as the desktop being viewed, or give up.
 //
 // The one observable a switch has. Reading it costs two registry values, and

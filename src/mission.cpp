@@ -825,7 +825,8 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam == kGhostTimerId) {
             ::KillTimer(hwnd, kGhostTimerId);
             for (Mission::Impl::Ghost& ghost : impl->fading)
-                Mission::Impl::ReleaseGhost(ghost);
+                GuardMission(*impl, "ReleaseGhost",
+                             [&] { Mission::Impl::ReleaseGhost(ghost); });
             impl->fading.clear();
         }
         return 0;
@@ -3247,6 +3248,10 @@ void Mission::Impl::LiftDrag(Screen& screen) {
     const size_t index = static_cast<size_t>(&screen - screens.data());
     Tile& tile = screen.tiles[static_cast<size_t>(drag.tile)];
 
+    // A key or the wheel between the press and here can spread or close a pile,
+    // which rebuilds or moves the tiles, and then this index is somebody else.
+    if (tile.window != drag.window) return;
+
     drag.ghosts.resize(screens.size());
     Ghost& ghost = drag.ghosts[index];
     ghost.holder    = tile.holder;
@@ -3453,13 +3458,35 @@ RECT Mission::Impl::GhostRect(const Drag& held, POINT at) const {
 }
 
 void Mission::Impl::ReleaseGhost(Ghost& ghost) {
-    if (ghost.holder) {
-        if (auto parent = ghost.holder.Parent()) parent.Children().Remove(ghost.holder);
-        ghost.holder = nullptr;
-    }
+    // The registration first: it is the part DWM keeps on our behalf, and the
+    // visual tree call below is the one that can throw.
     thumbnail::ReleaseSharedVisual(ghost.thumbnail);
     ghost.thumbnail = nullptr;
+    if (ghost.holder) {
+        WUC::ContainerVisual holder = ghost.holder;
+        ghost.holder = nullptr;
+        if (auto parent = holder.Parent()) parent.Children().Remove(holder);
+    }
 }
+
+namespace {
+
+// Lets go of a finished drag's ghosts on every way out of the function holding
+// it, a throw from the rebuild included. Without it a failure there left the
+// ghost on screen and its thumbnail registered until the process exited.
+struct GhostsReleaser {
+    std::vector<Mission::Impl::Ghost>& ghosts;
+    ~GhostsReleaser() {
+        for (Mission::Impl::Ghost& ghost : ghosts) {
+            try {
+                Mission::Impl::ReleaseGhost(ghost);
+            } catch (...) {
+            }
+        }
+    }
+};
+
+} // namespace
 
 // Empty `drag` and let go of the mouse, in that order, so the
 // WM_CAPTURECHANGED the release sends finds nothing to cancel.
@@ -3478,13 +3505,14 @@ Mission::Impl::Drag Mission::Impl::TakeDrag() {
 void Mission::Impl::DropDrag() {
     if (!drag.screen) return;
     Drag held = TakeDrag();
-    for (Ghost& ghost : held.ghosts) ReleaseGhost(ghost);
+    GhostsReleaser release{ held.ghosts };
 }
 
 // Put the held window back where it came from, from wherever it is now.
 void Mission::Impl::CancelDrag() {
     if (!drag.screen) return;
     Drag held = TakeDrag();
+    GhostsReleaser release{ held.ghosts };
 
     if (held.moving && held.over >= 0 && held.over < static_cast<int>(screens.size())) {
         POINT cursor{};
@@ -3493,8 +3521,6 @@ void Mission::Impl::CancelDrag() {
         const POINT at{ cursor.x - over.rect.left, cursor.y - over.rect.top };
         Rearrange(browsed, held.window, static_cast<size_t>(held.over), GhostRect(held, at));
     }
-
-    for (Ghost& ghost : held.ghosts) ReleaseGhost(ghost);
 }
 
 // Shrink a dropped window into the miniature of the desktop it went to, at the
@@ -3543,11 +3569,11 @@ bool Mission::Impl::FinishDrag(Screen& screen, POINT client) {
     if (!drag.screen) return false;
 
     Drag held = TakeDrag();
+    GhostsReleaser release{ held.ghosts };
     if (!held.moving) return false;
 
     const int index = ItemOf(held.window);
     if (index < 0) {
-        for (Ghost& ghost : held.ghosts) ReleaseGhost(ghost);
         Rearrange(browsed);
         return true;
     }
@@ -3614,12 +3640,14 @@ bool Mission::Impl::FinishDrag(Screen& screen, POINT client) {
         y = (std::max)(y, static_cast<LONG>(to.rcWork.top));
 
         // A maximised window has to be restored first or it snaps straight
-        // back to the display it was maximised on.
+        // back to the display it was maximised on. Restored without being
+        // activated: activation takes focus off the overlay, which reads that as
+        // the user leaving.
         WINDOWPLACEMENT placement{};
         placement.length = sizeof(placement);
         const bool maximised = ::GetWindowPlacement(item.hwnd, &placement) &&
                                placement.showCmd == SW_SHOWMAXIMIZED;
-        if (maximised) ::ShowWindow(item.hwnd, SW_RESTORE);
+        if (maximised) ::ShowWindow(item.hwnd, SW_SHOWNOACTIVATE);
 
         // The bounds are the visible frame, and SetWindowPos places the whole
         // window, invisible resize borders included. Fed the frame, every move
@@ -3641,7 +3669,16 @@ bool Mission::Impl::FinishDrag(Screen& screen, POINT client) {
                             SWP_NOACTIVATE | SWP_NOZORDER))
             MACTAB_WARN("mission: %p would not move to another display (err %lu)",
                         static_cast<void*>(item.hwnd), ::GetLastError());
-        if (maximised) ::ShowWindow(item.hwnd, SW_SHOWMAXIMIZED);
+        if (maximised) {
+            // There is no maximise that does not activate. So the focus change
+            // it causes is not listened to, and the overlay takes focus back,
+            // which it may: the mouse release that got here was its input.
+            ignoreFocusFrom = ::GetTickCount();
+            ignoreFocusMs   = 500;
+            ::ShowWindow(item.hwnd, SW_SHOWMAXIMIZED);
+            ::SetForegroundWindow(screen.hwnd);
+            ::SetFocus(screen.hwnd);
+        }
 
         RECT moved{};
         if (SUCCEEDED(::DwmGetWindowAttribute(item.hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
@@ -3686,8 +3723,6 @@ bool Mission::Impl::FinishDrag(Screen& screen, POINT client) {
         // Into the arrangement, from the place it was let go of.
         Rearrange(browsed, held.window, s, GhostRect(held, at));
     }
-
-    for (Ghost& ghost : held.ghosts) ReleaseGhost(ghost);
     return true;
 }
 
@@ -4000,6 +4035,10 @@ void Mission::Impl::FinishHide() {
     if (!screens.empty()) ::KillTimer(screens.front().hwnd, kGhostTimerId);
     for (Ghost& ghost : fading) GuardMission(*this, "ReleaseGhost", [&] { ReleaseGhost(ghost); });
     fading.clear();
+    for (Screen& screen : screens)
+        GuardMission(*this, "ClearDragLayer", [&] {
+            if (screen.dragLayer) screen.dragLayer.Children().RemoveAll();
+        });
 
     for (Screen& screen : screens) {
         GuardMission(*this, "Hide", [&] {
@@ -4024,7 +4063,12 @@ void Mission::Impl::FinishHide() {
     // applications would grow without a bound.
     iconBitmaps.clear();
 
-    if (restoreOnHide && restoreWindow && ::IsWindow(restoreWindow))
+    // Only onto the desktop being viewed. Activating a window makes Windows
+    // switch to its desktop, and the window that had focus may have been dropped
+    // on another desktop since, or the view moved away from it by adding or
+    // closing one, in which case giving it focus back is a jump nobody asked for.
+    if (restoreOnHide && restoreWindow && ::IsWindow(restoreWindow) &&
+        desktops::IsOnCurrentDesktop(restoreWindow))
         ::SetForegroundWindow(restoreWindow);
 
     restoreWindow = nullptr;
