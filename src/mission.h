@@ -66,12 +66,21 @@ public:
 
     // wParam values for spaceMessage.
     //
-    // A bare index means "look at this desktop". kSpaceAdd means the plus button.
-    // kSpaceCloseBase plus an index means the little cross on that desktop, which
-    // has to name which one rather than meaning "the current one": the whole
-    // point of the strip is that you are looking at a desktop you are not on.
+    // A bare index means "go to this desktop", which is what clicking one does
+    // on macOS: it leaves Mission Control on that desktop. kSpaceAdd means the
+    // plus button. kSpaceCloseBase plus an index means the little cross on that
+    // desktop, which has to name which one rather than meaning "the current
+    // one", because the strip shows desktops you are not on.
+    //
+    // kSpaceMoveBase plus an index means a window was dropped on that desktop,
+    // and lParam is the window. kSpaceAdd with a window in lParam means one was
+    // dropped on the plus. The overlay shows the move at once and leaves the
+    // shell call to the receiver, which must Rebuild if the shell refuses: the
+    // call is cross-process COM and must not run inside the overlay's own
+    // window procedure.
     static constexpr WPARAM kSpaceAdd       = 0xFFFF;
     static constexpr WPARAM kSpaceCloseBase = 0x8000;
+    static constexpr WPARAM kSpaceMoveBase  = 0x4000;
 
     // Build and reveal. Items may name windows on any display and any desktop;
     // each is arranged on the display that holds it, and only the windows of

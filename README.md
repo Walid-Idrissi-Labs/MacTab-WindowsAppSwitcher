@@ -70,15 +70,34 @@ were, so they can be found by position rather than by reading labels.
 |---|---|
 | Arrow keys | Move between windows by position rather than through a list |
 | Click a pile, or `↓` | Spread one application's windows apart |
-| Click a desktop | Show that desktop's windows |
+| `Space` | Show the window under the pointer large; `Space` again puts it back |
+| Click a desktop | Go to that desktop |
+| `Ctrl+Win+←` `→` | Look at the previous or next desktop without leaving |
 | Click the `+` | Add a virtual desktop |
-| Drag | Move a window to another display |
+| Drag a window to a desktop | Move it to that desktop |
+| Drag a window to the `+` | Move it to a new desktop of its own |
+| Drag a window to another display | Move it to that display |
 | `Esc` | Leave |
 
-Viewing another desktop is not the same as switching to it. Its windows are
-shown, but the switch happens only on leaving. The overlay belongs to the
-desktop it was opened on, and switching underneath it would leave a full-screen
-window on a desktop that is no longer visible.
+A desktop in the bar of another display means that desktop on that display, so
+one drag can move a window to both. Dropped on empty space, a window goes to
+the desktop being looked at, which means pressing `Ctrl+Win+→` while holding it
+carries it to the next desktop.
+
+Looking at another desktop with `Ctrl+Win+←` `→` does not switch to it. The
+switch happens when you leave, or when you activate one of its windows.
+
+The same chord works outside Mission Control. Hold a window by its title bar and
+press `Ctrl+Win+←` or `→`, and the window goes to that desktop with you instead
+of being left behind.
+
+Windows has no public way to move another application's window between
+desktops, so this goes through the shell's own interface, which is
+undocumented. Before moving anything, MacTab asks that interface to list the
+desktops and checks the answer against the list in the registry, and it only
+uses the parts of the interface that have not changed between Windows 10 1809
+and Windows 11 25H2. A build where the check fails falls back to the public
+behaviour, and `DesktopMoves=off` in settings.ini turns it off entirely.
 
 ## Settings
 
@@ -211,10 +230,13 @@ memory as an LRU and on disk keyed by the source executable's timestamp.
   topmost windows that a normal process cannot enter.
 - **Windows 10 before build 17134 is unsupported**, which is the minimum for
   Windows.UI.Composition.
-- **Dragging a window to another virtual desktop can be unreliable.** The public API
-  permits a process to move only its own windows between desktops. The attempt
-  is made and the window returns to its place when Windows refuses, rather than
-  appearing to succeed.
+- **Moving windows between virtual desktops needs a known Windows build.** It
+  works on Windows 10 1809 to 22H2 and Windows 11 22H2 (22621.2215) onward,
+  checked through 25H2. On anything else, or with `DesktopMoves=off`, a window
+  from another application dropped on a desktop goes back where it was.
+- **A window carried with `Ctrl+Win+←` `→` may be let go of on arrival.** It
+  reaches the other desktop either way, but whether the drag continues there is
+  up to the application.
 - **Desktop miniatures show window positions, not contents.** A window on
   another desktop is cloaked, and DWM will not compose a cloaked window through
   any interface available to a normal process.

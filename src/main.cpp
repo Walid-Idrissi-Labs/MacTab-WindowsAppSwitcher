@@ -124,7 +124,7 @@ const wchar_t* MissionGestureName() {
     return L"Win+Tab";
 }
 
-void CloseMission(bool commitDesktop = false);
+void CloseMission(bool commitDesktop = false, int desktop = -1);
 void StartWatchingWindows();
 void StopWatchingWindows();
 
@@ -572,37 +572,46 @@ bool EnsureMission() {
 // LOOKING at; the overlay belongs to the desktop it was built on and switching
 // underneath it would strand it. So the switch is made real on the way out, and
 // only when the user meant to leave: Escape, the toggle, a click on the
-// background. Losing focus, a display appearing, a session lock or Alt+Tab
-// taking over are not decisions, and must not move anybody's desktop.
-void CloseMission(bool commitDesktop) {
+// background, a click on a desktop. Losing focus, a display appearing, a session
+// lock or Alt+Tab taking over are not decisions, and must not move anybody's
+// desktop.
+//
+// `desktop` is where to go, for a click on one; otherwise it is the desktop
+// being looked at.
+void CloseMission(bool commitDesktop, int desktop) {
     if (!g_app.mission.Visible()) return;
 
-    const int browsed = commitDesktop ? g_app.mission.BrowsedDesktop() : -1;
-
-    StopWatchingWindows();
-    hotkey::SetMissionOpen(false);
-
-    // Never with focus restored on this path. Putting foreground back on a
-    // window belonging to the desktop being left is both a flash of the wrong
-    // application and, since Windows shows a window it is asked to activate, a
-    // switch straight back to where it lives.
-    // Committing a desktop switch cannot wait for the windows to settle back:
-    // the shell animates the switch, and an overlay still on screen while the
-    // desktop slides underneath it looks like a fault. Everything else gets the
-    // collapse.
-    g_app.mission.Hide(browsed < 0, browsed >= 0);
-    MACTAB_DIAG("mission: dismissed");
-
-    if (browsed < 0) return;
+    const int target = !commitDesktop ? -1
+                     : (desktop >= 0) ? desktop
+                                      : g_app.mission.BrowsedDesktop();
 
     // Re-read rather than trusting what was true when the overlay opened.
     // SwitchTo counts steps from wherever the view is NOW, and something else
     // may have moved it while Mission Control was up.
     const desktops::State state = desktops::Query(g_app.host);
-    if (state.known && state.current >= 0 && state.current != browsed) {
-        MACTAB_DIAG("mission: committing the desktop being looked at (%d)", browsed);
-        desktops::SwitchTo(state, browsed);
-    }
+    const bool switching = target >= 0 && state.known && state.current >= 0 &&
+                           state.current != target;
+
+    StopWatchingWindows();
+    hotkey::SetMissionOpen(false);
+
+    // Leaving for another desktop cannot wait for the windows to settle back:
+    // the shell animates the switch, and an overlay still on screen while the
+    // desktop slides underneath it looks like a fault. Nor can focus go back to
+    // where it was, which would be a flash of the wrong application and, since
+    // Windows shows a window it is asked to activate, a switch straight back.
+    //
+    // Staying put gets the collapse and the focus back. Both used to be skipped
+    // whenever a desktop was being looked at at all, which is always, so Escape
+    // and a click on the background took the overlay off the screen in one frame
+    // and left the keyboard nowhere.
+    g_app.mission.Hide(!switching, switching);
+    MACTAB_DIAG("mission: dismissed");
+
+    if (!switching) return;
+
+    MACTAB_DIAG("mission: going to desktop %d", target);
+    desktops::SwitchTo(state, target);
 }
 
 // Everything the overlay is shown with, gathered in one place because three
@@ -761,11 +770,17 @@ bool WaitForDesktopCount(size_t before, DWORD timeoutMs = 800) {
 // to admit it happened, bring the overlays across to wherever the view ended up,
 // and rebuild in place. macOS stays open through both, and closing and reopening
 // would throw away the thing the user was in the middle of.
-void ChangeSpaces(bool add, int index) {
+//
+// `carry` is a window dropped on the plus, which goes to the new desktop. Without
+// a way to move it there, nothing is created: an empty desktop the user did not
+// ask for is not a consolation for the window staying put.
+void ChangeSpaces(bool add, int index, HWND carry = nullptr) {
     // A click can be sitting in the queue behind a dismissal. Acting on it then
     // would create or destroy a real desktop with the overlay already gone, and
     // re-install watchers that nothing would ever take down again.
     if (!g_app.mission.Visible()) return;
+
+    if (carry && (!::IsWindow(carry) || !desktops::CanMoveWindows())) return;
 
     const desktops::State before = desktops::Query(g_app.host);
     if (!before.known || before.current < 0) return;
@@ -807,6 +822,18 @@ void ChangeSpaces(bool add, int index) {
         }
     }
 
+    // The new desktop is the one id that was not there before.
+    if (carry) {
+        const desktops::State now = desktops::Query(g_app.host);
+        for (const desktops::Desktop& desktop : now.all) {
+            if (desktops::IndexOf(before, desktop.id) >= 0) continue;
+            if (!desktops::MoveWindowTo(carry, desktop.id))
+                MACTAB_WARN("mission: the new desktop was made but %p would not go to it",
+                            static_cast<void*>(carry));
+            break;
+        }
+    }
+
     MissionPayload payload = BuildMissionPayload();
     if (!payload.known || payload.spaces.empty()) return;
 
@@ -818,9 +845,36 @@ void ChangeSpaces(bool add, int index) {
     StartWatchingWindows();
 }
 
-void HandleMissionSpace(WPARAM which) {
+// A window dropped on another desktop in Mission Control.
+//
+// Asked of the shell here rather than inside the overlay, because the call is
+// cross-process COM from this STA, and the modal loop it runs while it waits
+// delivers the watch timer and window-gone messages. Either of those rebuilds
+// the overlay's lists, so nothing in there can be holding a reference across it.
+//
+// The overlay has already shown the window leaving. If the shell says no, the
+// rebuild puts it back where it really is.
+void MoveFromMission(HWND window, int index) {
+    const desktops::State state = desktops::Query(g_app.host);
+    const bool moved = state.known && index >= 0 &&
+                       index < static_cast<int>(state.all.size()) && ::IsWindow(window) &&
+                       desktops::MoveWindowTo(window, state.all[static_cast<size_t>(index)].id);
+    if (moved || !g_app.mission.Visible()) return;
+
+    MACTAB_WARN("mission: %p could not go to desktop %d; putting it back",
+                static_cast<void*>(window), index);
+
+    MissionPayload payload = BuildMissionPayload();
+    if (!payload.known || payload.spaces.empty()) return;
+
+    g_app.mission.Rebuild(std::move(payload.items), std::move(payload.spaces),
+                          g_app.mission.BrowsedDesktop());
+    StartWatchingWindows();
+}
+
+void HandleMissionSpace(WPARAM which, LPARAM lParam) {
     if (which == Mission::kSpaceAdd) {
-        ChangeSpaces(true, 0);
+        ChangeSpaces(true, 0, reinterpret_cast<HWND>(lParam));
         return;
     }
 
@@ -829,14 +883,19 @@ void HandleMissionSpace(WPARAM which) {
         return;
     }
 
-    // Clicking a desktop LOOKS at it. It does not go there, yet.
+    if (which >= Mission::kSpaceMoveBase) {
+        MoveFromMission(reinterpret_cast<HWND>(lParam),
+                        static_cast<int>(which - Mission::kSpaceMoveBase));
+        return;
+    }
+
+    // Clicking a desktop goes there, as it does on a Mac, and Mission Control
+    // closes on the way. Looking at another desktop without leaving is still
+    // Ctrl+Win+Left and Right.
     //
-    // The windows on another desktop are shell-cloaked but they are still
-    // enumerable and still have geometry, so the arrangement can be built for
-    // any of them without leaving, and the strip stays put while you look
-    // around. Going there for real happens on the way out, or the moment one of
-    // those windows is activated, which Windows does as part of the activation.
-    g_app.mission.BrowseDesktop(static_cast<int>(which));
+    // Closed directly rather than browsed to first, which would build the whole
+    // arrangement for a desktop nobody is going to see.
+    CloseMission(true, static_cast<int>(which));
 }
 
 // --- Keeping the overlay honest while it is up -------------------------------
@@ -1009,6 +1068,42 @@ void SyncMission() {
 
     g_app.mission.Rebuild(std::move(payload.items), std::move(payload.spaces), target);
     StartWatchingWindows();
+}
+
+// Ctrl+Win+Left or Right while a window is being dragged by its title bar.
+//
+// The window goes to the next desktop first and the view follows, so it is
+// already there when the view arrives, and the switch goes through the shell's
+// interface rather than an injected chord, so the Ctrl and Win the user is still
+// holding stay down and a second press goes one further.
+//
+// Best effort, and the header of desktops.h says why it cannot be checked here:
+// whether the application keeps its drag going through the switch is up to the
+// application, and some end it when activation moves. The window arrives either
+// way, and that was the request.
+void CarryWindow(int direction, HWND dragged) {
+    HWND window = dragged ? ::GetAncestor(dragged, GA_ROOT) : nullptr;
+    if (!window || !::IsWindow(window)) return;
+
+    const desktops::State state = desktops::Query(g_app.host);
+    if (!state.known || state.current < 0) return;
+
+    // A window pinned to every desktop is already wherever the view goes.
+    GUID on{};
+    const int  home   = desktops::DesktopIdOf(window, on) ? desktops::IndexOf(state, on) : -1;
+    const bool pinned = home < 0;
+    const int  from   = pinned ? state.current : home;
+    const int  to     = from + direction;
+
+    // Past either end the shell's own chord does nothing, and neither does this.
+    if (to < 0 || to >= static_cast<int>(state.all.size())) return;
+
+    const GUID& target = state.all[static_cast<size_t>(to)].id;
+    if (!pinned && !desktops::MoveWindowTo(window, target))
+        MACTAB_WARN("carry: %p did not go to desktop %d", static_cast<void*>(window), to);
+
+    MACTAB_DIAG("carry: %p to desktop %d", static_cast<void*>(window), to);
+    if (!desktops::SwitchToId(target)) desktops::SwitchTo(state, to);
 }
 
 // Step the strip by one, for Ctrl+Win+Left and Ctrl+Win+Right.
@@ -1215,6 +1310,7 @@ void ApplySettings() {
     }
 
     hotkey::SetMissionGesture(MissionGesture());
+    hotkey::SetCarryWindows(desktops::CanMoveWindows());
     g_app.mission.InvalidateBackdrop();
 }
 
@@ -1283,6 +1379,10 @@ void ShutdownSubsystems() {
     g_app.mission.Shutdown();
     g_app.panel.Shutdown();
 
+    // Proxies into explorer, released while the apartment that owns them is
+    // still up rather than by a static destructor after it has gone.
+    desktops::ResetShell();
+
     if (g_app.wtsRegistered && g_app.host) {
         ::WTSUnRegisterSessionNotification(g_app.host);
         g_app.wtsRegistered = false;
@@ -1295,6 +1395,12 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     // Registered messages carry runtime values and cannot appear in a switch.
     if (msg == g_msgTaskbarCreated && g_msgTaskbarCreated != 0) {
         g_app.tray.Readd();
+
+        // Explorer has started again, and the shell's desktop interface we held
+        // belonged to the one that went away. This is also the first sign that
+        // explorer is up at all when MacTab starts with the session.
+        desktops::ResetShell();
+        hotkey::SetCarryWindows(desktops::CanMoveWindows());
         return 0;
     }
     if (msg == g_msgRequestQuit && g_msgRequestQuit != 0) {
@@ -1379,8 +1485,13 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         StepMissionSpace(static_cast<int>(static_cast<INT_PTR>(wParam)));
         return 0;
 
+    case hotkey::WM_MACTAB_CARRY:
+        CarryWindow(static_cast<int>(static_cast<INT_PTR>(wParam)),
+                    reinterpret_cast<HWND>(lParam));
+        return 0;
+
     case WM_MACTAB_MC_SPACE:
-        HandleMissionSpace(wParam);
+        HandleMissionSpace(wParam, lParam);
         return 0;
 
     case WM_MACTAB_HOVER: {
@@ -1868,6 +1979,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR c
         diag::Shutdown();
         return 1;
     }
+
+    // Connects to the shell's desktop interface and checks it, once. Too early at
+    // logon is fine: TaskbarCreated asks again when explorer arrives.
+    hotkey::SetCarryWindows(desktops::CanMoveWindows());
 
     MACTAB_DIAG("boot: ready in %.2f ms", NowMs());
 

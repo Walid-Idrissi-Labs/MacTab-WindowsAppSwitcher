@@ -92,6 +92,15 @@ enum : UINT {
     // because it swallowed it: the shell's own desktop switch cannot be allowed
     // to run under an overlay that belongs to the desktop being left.
     WM_MACTAB_MISSION_STEP = WM_APP + 17,
+
+    // Ctrl+Win+Left or Ctrl+Win+Right while a window is being dragged by its
+    // title bar, with Mission Control closed. wParam: +1 or -1, as above.
+    // lParam: the window being dragged.
+    //
+    // The window goes along to the next desktop, as it does on a Mac with
+    // Control and an arrow. Left to the shell, the switch happens and the window
+    // being dragged stays behind on the desktop it came from.
+    WM_MACTAB_CARRY = WM_APP + 18,
 };
 
 // Which key opens Mission Control.
@@ -172,6 +181,11 @@ void SetTiming(UINT revealDelayMs, bool leftAltOnly);
 // right gesture aimed at the right thing, so they walk the strip instead. Closing
 // Mission Control on a different desktop is what makes the switch real.
 void SetMissionOpen(bool open);
+
+// Whether WM_MACTAB_CARRY may be posted at all, which needs the shell's private
+// desktop interface. Off, the chord is left to the shell. A plain bool written
+// from the UI thread, for the same reason as SetMissionOpen.
+void SetCarryWindows(bool enabled);
 
 // Abort any in-flight gesture and clear the stuck-Alt state. Called on session
 // lock/unlock: the secure desktop means we may never see the Alt release.

@@ -42,6 +42,10 @@ volatile LONG g_sharedAltVk = 0;
 // missionOnWinTab is one.
 bool g_missionOpen = false;
 
+// True when a window being dragged can be carried to another desktop. Same
+// shape as g_missionOpen.
+bool g_carryWindows = false;
+
 // --- Hook-thread state ------------------------------------------------------
 HHOOK    g_hook          = nullptr;
 State    g_state         = State::Idle;
@@ -70,8 +74,8 @@ void KillRevealTimer() {
     }
 }
 
-void PostToUi(UINT message, WPARAM wParam = 0) {
-    if (g_uiWindow) ::PostMessageW(g_uiWindow, message, wParam, 0);
+void PostToUi(UINT message, WPARAM wParam = 0, LPARAM lParam = 0) {
+    if (g_uiWindow) ::PostMessageW(g_uiWindow, message, wParam, lParam);
 }
 
 void EndGesture(UINT message) {
@@ -208,6 +212,22 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
             PostToUi(WM_MACTAB_MISSION_STEP,
                      static_cast<WPARAM>(vk == VK_RIGHT ? 1 : -1));
             return 1;
+        }
+
+        // The same chord with a window held by its title bar carries the window
+        // along. Only then: the move/size loop is the one moment the shell's own
+        // switch does the wrong thing, leaving that window behind. One syscall,
+        // and only for this chord.
+        if (g_carryWindows && (vk == VK_LEFT || vk == VK_RIGHT) &&
+            KeyDown(VK_CONTROL) && winHeld) {
+            GUITHREADINFO info{};
+            info.cbSize = sizeof(info);
+            if (::GetGUIThreadInfo(0, &info) && (info.flags & GUI_INMOVESIZE) &&
+                info.hwndMoveSize) {
+                PostToUi(WM_MACTAB_CARRY, static_cast<WPARAM>(vk == VK_RIGHT ? 1 : -1),
+                         reinterpret_cast<LPARAM>(info.hwndMoveSize));
+                return 1;
+            }
         }
 
         // Gesture opens on Alt+Tab. Note Tab arrives as WM_SYSKEYDOWN because
@@ -554,6 +574,10 @@ WORD GestureAltKey() {
 
 void SetMissionOpen(bool open) {
     g_missionOpen = open;
+}
+
+void SetCarryWindows(bool enabled) {
+    g_carryWindows = enabled;
 }
 
 void SetMissionGesture(Gesture gesture) {

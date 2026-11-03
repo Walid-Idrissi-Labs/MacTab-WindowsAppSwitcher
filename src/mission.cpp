@@ -82,6 +82,10 @@ constexpr UINT_PTR kCloseTimerId = 1;
 // And the one that sharpens the previews once the flight has landed.
 constexpr UINT_PTR kSharpenTimerId = 2;
 
+// And the one that lets go of a window that flew into a desktop in the strip,
+// once it has finished shrinking into it.
+constexpr UINT_PTR kGhostTimerId = 3;
+
 // Posted by the sharpen worker when it has pixels to hand back. lParam owns a
 // heap SharpBatch, and the window procedure takes that ownership before any of
 // its own early returns.
@@ -388,9 +392,21 @@ struct Mission::Impl {
         WUC::SpriteVisual    barGlass{ nullptr };
         WUC::SpriteVisual    bar{ nullptr };   // the miniatures on top of it
 
+        // Above the strip: the outline round the desktop a dragged window would
+        // land on, and the dragged window itself, which has to pass over the
+        // strip to get to one.
+        WUC::SpriteVisual    dropMark{ nullptr };
+        WUC::ContainerVisual dragLayer{ nullptr };
+
         WUC::CompositionDrawingSurface backdropSurface{ nullptr };
         WUC::CompositionDrawingSurface outlineSurface{ nullptr };
         WUC::CompositionDrawingSurface barGlassSurface{ nullptr };
+        WUC::CompositionDrawingSurface dropSurface{ nullptr };
+
+        // What the drop mark was last drawn for, the same economy as the outline.
+        float dropW = 0.0f;
+        float dropH = 0.0f;
+        bool  dropRound = false;
 
         // What the outline surface was last drawn for, so moving between two
         // windows of the same size does not redraw it.
@@ -418,6 +434,11 @@ struct Mission::Impl {
         // pick between several windows of one app without leaving.
         int expandedGroup = -1;
 
+        // The tile shown enlarged by the space bar, or -1, and where it was
+        // before, which is where it goes back to.
+        int  preview = -1;
+        RECT previewFrom{};
+
         float Scaled(float logical) const { return logical * dpiScale; }
         float Width()  const { return static_cast<float>(rect.right - rect.left); }
         float Height() const { return static_cast<float>(rect.bottom - rect.top); }
@@ -430,16 +451,46 @@ struct Mission::Impl {
     // The desktop being looked at, which is not necessarily the one being used.
     int browsed = -1;
 
-    // A window being dragged. Dragging is how a window is moved to another
-    // display, and the one gesture where the tile leaves its arrangement.
+    // A window in the hand, on one display.
+    //
+    // On the display it was picked up from this is the tile's own visual, lifted
+    // out of the arrangement. On any other display the pointer reaches, it is a
+    // second one made for that overlay, because a DWM thumbnail is registered
+    // against the window it is drawn in and what it does inside another
+    // window's tree is not documented.
+    struct Ghost {
+        WUC::ContainerVisual holder{ nullptr };
+        HTHUMBNAIL           thumbnail = nullptr;
+        float                sx = 1.0f;   // the holder's scale at full size
+        float                sy = 1.0f;
+    };
+
+    // A window being dragged, to another display, to another desktop in the
+    // strip, or both.
+    //
+    // Identified by its handle, not by a tile index, because the arrangement
+    // can be rebuilt under it: walking the desktops with the window held is how
+    // it gets carried to one, and the watch timer rebuilds when anything else
+    // on the machine changes.
     struct Drag {
-        HWND  screen  = nullptr;   // the overlay the press happened on
-        int   tile    = -1;
+        HWND  screen  = nullptr;   // the overlay the press happened on, which holds capture
+        int   tile    = -1;        // the tile pressed, until the drag lifts it out
+        HWND  window  = nullptr;
         POINT grab{};              // where the press was, in that overlay
-        POINT origin{};            // the tile's offset when the press happened
+        POINT origin{};            // the tile's top-left when the press happened
+        float w = 0.0f;            // and its size
+        float h = 0.0f;
         bool  moving  = false;     // past the threshold, so it is a drag
+        bool  small   = false;     // shrunk to desktop size over the strip
+        float k       = 1.0f;      // how far it is shrunk
+        int   over    = -1;        // the display under the pointer
+        std::vector<Ghost> ghosts; // one per display, made when the pointer gets there
     };
     Drag drag;
+
+    // Windows that have been dropped on a desktop and are still shrinking into
+    // it. Let go of by kGhostTimerId.
+    std::vector<Ghost> fading;
 
     // The app icons, uploaded once each rather than once per window.
     std::map<std::wstring, ComPtr<ID2D1Bitmap1>> iconBitmaps;
@@ -515,10 +566,36 @@ struct Mission::Impl {
 
     ComPtr<ID2D1Bitmap1> IconFor(ID2D1DeviceContext* dc, const MissionItem& item);
 
+    bool AttachLive(Screen& screen, Tile& tile, HWND window, float w, float h,
+                    SIZE fallback);
+    void AttachCard(Screen& screen, Tile& tile, const MissionItem& item,
+                    float w, float h, Bitmap content);
+
     void BeginDrag(Screen& screen, POINT client);
     void UpdateDrag(Screen& screen, POINT client);
     bool FinishDrag(Screen& screen, POINT client);   // true if it was a drag
-    void Rearrange(int desktop);
+    void CancelDrag();
+    void DropDrag();
+    Drag TakeDrag();
+    void LiftDrag(Screen& screen);
+    void MakeGhost(size_t screen);
+    void PlaceGhosts(POINT virt, size_t screen);
+    void FlyIntoChip(Ghost& ghost, const Screen& screen, const mission::SpaceChip& chip,
+                     const MissionItem& item);
+    static void ReleaseGhost(Ghost& ghost);
+    RECT GhostRect(const Drag& held, POINT client) const;
+    void ShowDropMark(Screen& screen, int chip);
+    size_t ScreenAt(POINT virt, int fallback) const;
+    int  ItemOf(HWND window) const;
+
+    void BeginPreview(Screen& screen, int index);
+    void EndPreview(Screen& screen);
+
+    // Lay everything out again and fly it from wherever it is. `seedWindow`, if
+    // set, flies from `seedRect` on display `seedScreen` instead, which is where
+    // a dropped window was let go of.
+    void Rearrange(int desktop, HWND seedWindow = nullptr, size_t seedScreen = 0,
+                   RECT seedRect = RECT{});
 };
 
 namespace {
@@ -648,15 +725,21 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     // a click on the background are decisions and take you to the desktop you
     // were looking at; losing focus is not, and must not move anybody.
     case WM_LBUTTONDOWN:
-        impl->BeginDrag(*screen, POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+        // Nothing is picked up out of an enlarged preview. The click is dealt
+        // with when it is released.
+        if (screen->preview < 0)
+            GuardMission(*impl, "BeginDrag", [&] {
+                impl->BeginDrag(*screen, POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+            });
         return 0;
 
     case WM_MOUSEMOVE: {
         const POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        if (impl->drag.tile >= 0) {
+        if (impl->drag.screen) {
             impl->UpdateDrag(*screen, point);
             return 0;
         }
+        if (screen->preview >= 0) return 0;
         impl->SetHovered(*screen, impl->HitTestTile(*screen, point));
         return 0;
     }
@@ -666,8 +749,23 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (!impl->notifyWindow) return 0;
 
         // A drag consumes the click. Releasing after moving a window across is
-        // not a request to switch to it.
-        if (impl->FinishDrag(*screen, point)) return 0;
+        // not a request to switch to it, even if something failed on the way.
+        const bool dragging = impl->drag.moving;
+        GuardMission(*impl, "FinishDrag", [&] { impl->FinishDrag(*screen, point); });
+        if (dragging) return 0;
+
+        // With a window enlarged, clicking it goes to it and clicking anywhere
+        // else puts it back, which is what Quick Look in Mission Control does.
+        if (screen->preview >= 0) {
+            const Mission::Impl::Tile& shown =
+                screen->tiles[static_cast<size_t>(screen->preview)];
+            if (::PtInRect(&shown.liveRect, point))
+                ::PostMessageW(impl->notifyWindow, impl->activateMessage,
+                               static_cast<WPARAM>(shown.item), 0);
+            else
+                impl->EndPreview(*screen);
+            return 0;
+        }
 
         const int closing = impl->HitTestClose(*screen, point);
         if (closing >= 0) {
@@ -676,6 +774,7 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
+        // Clicking a desktop goes there, and clicking the plus adds one.
         const int chip = impl->HitTestChip(*screen, point);
         if (chip >= 0) {
             const mission::SpaceChip& c = screen->chips[static_cast<size_t>(chip)];
@@ -723,21 +822,70 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ::KillTimer(hwnd, kSharpenTimerId);
             impl->SharpenTiles();
         }
+        if (wParam == kGhostTimerId) {
+            ::KillTimer(hwnd, kGhostTimerId);
+            for (Mission::Impl::Ghost& ghost : impl->fading)
+                Mission::Impl::ReleaseGhost(ghost);
+            impl->fading.clear();
+        }
         return 0;
 
     // Capture can be taken away, by a system dialog or an alt-tab out. Leaving
     // the drag armed would make the next click somewhere else finish a move.
+    //
+    // Our own ReleaseCapture lands here too, but only after the drag has been
+    // taken out of `drag`, so there is nothing left to cancel by then.
     case WM_CAPTURECHANGED:
-        if (impl->drag.tile >= 0) {
-            impl->drag = Mission::Impl::Drag{};
-            impl->Rearrange(impl->browsed);
-        }
+        if (impl->drag.screen && reinterpret_cast<HWND>(lParam) != impl->drag.screen)
+            GuardMission(*impl, "CancelDrag", [&] { impl->CancelDrag(); });
         return 0;
 
     case WM_KEYDOWN: {
         if (!impl->notifyWindow) return 0;
+
+        // A window in the hand takes every key but Escape, which puts it back.
+        // Ctrl+Win+Left and Right never arrive here: the hook turns them into a
+        // walk along the strip, and that is how a held window is carried to
+        // another desktop.
+        if (impl->drag.moving) {
+            if (wParam == VK_ESCAPE)
+                GuardMission(*impl, "CancelDrag", [&] { impl->CancelDrag(); });
+            return 0;
+        }
+
         const int  hovered  = screen->hovered;
         const bool expanded = screen->expandedGroup >= 0;
+        const bool repeat   = (lParam & (1L << 30)) != 0;
+
+        // The enlarged preview first, then the spread pile, then Mission Control
+        // itself. Escape that skipped a level would throw away the thing the
+        // user was half way through doing.
+        if (screen->preview >= 0) {
+            switch (wParam) {
+            case VK_ESCAPE:
+                impl->EndPreview(*screen);
+                return 0;
+            case VK_SPACE:
+                if (!repeat) impl->EndPreview(*screen);
+                return 0;
+            case VK_RETURN:
+                ::PostMessageW(impl->notifyWindow, impl->activateMessage,
+                               static_cast<WPARAM>(
+                                   screen->tiles[static_cast<size_t>(screen->preview)].item),
+                               0);
+                return 0;
+            case VK_LEFT:
+            case VK_RIGHT:
+            case VK_UP:
+            case VK_DOWN:
+            case VK_TAB:
+                // Moving the selection puts the preview back first.
+                impl->EndPreview(*screen);
+                break;
+            default:
+                return 0;
+            }
+        }
 
         // Ctrl and the arrows walk the desktops, which is the binding macOS uses
         // and the one Ctrl+Win+Left and Ctrl+Win+Right arrive here as. Bare
@@ -762,18 +910,21 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         switch (wParam) {
         case VK_ESCAPE:
-            // Out of the spread first, out of Mission Control second. Escape
-            // that skipped a level would throw away the thing the user was
-            // half way through doing.
             if (expanded) impl->CollapsePile(*screen);
             else          ::PostMessageW(impl->notifyWindow, impl->dismissMessage, 1, 0);
             return 0;
 
         case VK_RETURN:
-        case VK_SPACE:
             if (hovered >= 0)
                 ::PostMessageW(impl->notifyWindow, impl->activateMessage,
                                static_cast<WPARAM>(screen->tiles[static_cast<size_t>(hovered)].item), 0);
+            return 0;
+
+        // The space bar enlarges the window under the pointer, and again puts it
+        // back, as it does in Mission Control on a Mac. A toggle, so a held key
+        // must not strobe it.
+        case VK_SPACE:
+            if (!repeat && hovered >= 0) impl->BeginPreview(*screen, hovered);
             return 0;
 
         case VK_LEFT:
@@ -816,6 +967,8 @@ LRESULT CALLBACK MissionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     // Scrolling up on a pile spreads it, and down puts it back. The gesture the
     // reference uses is a two-finger swipe, which arrives here as a wheel.
     case WM_MOUSEWHEEL: {
+        if (impl->drag.moving || screen->preview >= 0) return 0;
+
         POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         ::ScreenToClient(hwnd, &point);
 
@@ -1048,6 +1201,8 @@ bool Mission::Impl::BuildScreens() {
         screen.chromeLayer = compositor.CreateContainerVisual();
         screen.barGlass    = compositor.CreateSpriteVisual();
         screen.bar         = compositor.CreateSpriteVisual();
+        screen.dropMark    = compositor.CreateSpriteVisual();
+        screen.dragLayer   = compositor.CreateContainerVisual();
 
         // The outline goes ABOVE the windows, not below them. Under them it was
         // covered by the hovered window's own shadow, which reaches further out
@@ -1059,8 +1214,11 @@ bool Mission::Impl::BuildScreens() {
         children.InsertAtTop(screen.chromeLayer);
         children.InsertAtTop(screen.barGlass);
         children.InsertAtTop(screen.bar);
+        children.InsertAtTop(screen.dropMark);
+        children.InsertAtTop(screen.dragLayer);
 
         screen.outline.Opacity(0.0f);
+        screen.dropMark.Opacity(0.0f);
         screen.root.Opacity(0.0f);
     }
 
@@ -1257,10 +1415,13 @@ void Mission::DisplaysChanged() {
         screen.outline         = nullptr;
         screen.barGlass        = nullptr;
         screen.bar             = nullptr;
+        screen.dropMark        = nullptr;
+        screen.dragLayer       = nullptr;
         screen.backdropSurface = nullptr;
         screen.outlineSurface  = nullptr;
         screen.barGlassSurface = nullptr;
         screen.barSurface      = nullptr;
+        screen.dropSurface     = nullptr;
         screen.target          = nullptr;
         if (screen.hwnd) ::DestroyWindow(screen.hwnd);
     }
@@ -1303,10 +1464,13 @@ void Mission::Shutdown() {
         screen.outline         = nullptr;
         screen.barGlass        = nullptr;
         screen.bar             = nullptr;
+        screen.dropMark        = nullptr;
+        screen.dragLayer       = nullptr;
         screen.backdropSurface = nullptr;
         screen.outlineSurface  = nullptr;
         screen.barGlassSurface = nullptr;
         screen.barSurface      = nullptr;
+        screen.dropSurface     = nullptr;
         screen.target          = nullptr;
         if (screen.hwnd) ::DestroyWindow(screen.hwnd);
     }
@@ -1344,6 +1508,7 @@ void Mission::Impl::ReleaseTiles(Screen& screen) {
 
     screen.tiles.clear();
     screen.hovered = -1;
+    screen.preview = -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1924,6 +2089,127 @@ void Mission::Impl::BakeChrome(Screen& screen, Tile& tile) {
                          static_cast<float>(tile.screenRect.bottom) - badge * 0.66f, 0.0f });
 }
 
+// The window's live picture, from DWM, in `tile.holder` at w by h. False when
+// this machine has no such thing, and the caller draws something else.
+//
+// `fallback` is the size to ask DWM for when the window's own geometry cannot
+// be read.
+bool Mission::Impl::AttachLive(Screen& screen, Tile& tile, HWND window, float w, float h,
+                               SIZE fallback) {
+    if (!dcompDevice) return false;
+
+    // What the thumbnail's pixels cover, and what part of that is the window
+    // you can see. They differ by the invisible resize border, around seven
+    // pixels a side at 100%, and the arrangement is built from the visible
+    // frame.
+    RECT sourceWindow{}, sourceFrame{};
+    const bool haveGeometry = thumbnail::SourceGeometry(window, sourceWindow, sourceFrame);
+
+    // Deliberately GetWindowRect rather than DWM's own idea of the thumbnail's
+    // size, which the two can disagree about on a cloaked UWP window.
+    // Everything below scales and offsets in this same space, and a size from
+    // one space with an offset from another is how the window ends up not
+    // filling its tile.
+    const SIZE render{
+        haveGeometry ? sourceWindow.right - sourceWindow.left : fallback.cx,
+        haveGeometry ? sourceWindow.bottom - sourceWindow.top : fallback.cy };
+
+    void* raw = nullptr;
+    if (!thumbnail::CreateSharedVisual(dcompDevice.get(), screen.hwnd, window,
+                                       render, &raw, &tile.thumbnail) || !raw)
+        return false;
+
+    winrt::com_ptr<IUnknown> unknown;
+    unknown.attach(reinterpret_cast<IUnknown*>(raw));
+
+    auto visual = unknown.try_as<WUC::Visual>();
+    if (!visual) {
+        thumbnail::ReleaseSharedVisual(tile.thumbnail);
+        tile.thumbnail = nullptr;
+        return false;
+    }
+
+    // Fit the VISIBLE frame to the tile, not the whole thumbnail. Scaling by
+    // the thumbnail's own size leaves the window smaller than its tile and
+    // pushed up and left inside it, which is what made the hover outline look
+    // like it was drawn around the wrong rectangle.
+    const float frameW = haveGeometry
+        ? static_cast<float>(sourceFrame.right - sourceFrame.left)
+        : static_cast<float>(render.cx);
+    const float frameH = haveGeometry
+        ? static_cast<float>(sourceFrame.bottom - sourceFrame.top)
+        : static_cast<float>(render.cy);
+    const float scaleX = w / (std::max)(1.0f, frameW);
+    const float scaleY = h / (std::max)(1.0f, frameH);
+
+    visual.Scale({ scaleX, scaleY, 1.0f });
+
+    // Slide the invisible border back off the top and the left, so what lands
+    // on the tile's origin is the frame's origin.
+    if (haveGeometry)
+        visual.Offset({ (sourceWindow.left - sourceFrame.left) * scaleX,
+                        (sourceWindow.top  - sourceFrame.top)  * scaleY,
+                        0.0f });
+
+    tile.holder.Children().InsertAtTop(visual);
+    tile.live      = visual;
+    tile.reduction = (w > 0.0f) ? frameW / w : 1.0f;
+    return true;
+}
+
+// A still of the window if there is one, otherwise a window-shaped plate with
+// the app's icon on it, in `tile.holder` at w by h.
+void Mission::Impl::AttachCard(Screen& screen, Tile& tile, const MissionItem& item,
+                               float w, float h, Bitmap content) {
+    tile.contentSurface = graphics.CreateDrawingSurface(
+        { w, h },
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+
+    {
+        SurfaceDraw draw(tile.contentSurface);
+        if (draw.ok) {
+            ID2D1DeviceContext* dc = draw.dc.Get();
+            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+            if (!content.Empty()) {
+                if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(content))) {
+                    // Cubic rather than the linear DrawBitmap defaults to.
+                    //
+                    // The snapshot has already been reduced to fit the tile by a
+                    // box filter, which is the right way to do the big reduction,
+                    // but aspect ratio is preserved so it lands a pixel or two
+                    // short in one axis and this last step is a small stretch.
+                    // Linear on a small stretch is visibly soft, and this is
+                    // drawn once per window per gesture, so the better filter
+                    // costs nothing worth counting.
+                    dc->DrawBitmap(bitmap.Get(), D2D1::RectF(0.0f, 0.0f, w, h), 1.0f,
+                                   D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
+                }
+            } else {
+                // A window-shaped plate with the app's icon on it, which is a
+                // design rather than a hole.
+                FillSquircle(dc, d2dFactory.Get(), 0.0f, 0.0f, w, h,
+                             screen.Scaled(kTileRadius),
+                             themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.80f)
+                                          : D2D1::ColorF(0.10f, 0.10f, 0.13f, 0.85f));
+
+                if (ComPtr<ID2D1Bitmap1> icon = IconFor(dc, item)) {
+                    const float side = (std::min)(w, h) * 0.40f;
+                    dc->DrawBitmap(icon.Get(),
+                                   D2D1::RectF((w - side) * 0.5f, (h - side) * 0.5f,
+                                               (w + side) * 0.5f, (h + side) * 0.5f));
+                }
+            }
+        }
+    }
+
+    tile.content = compositor.CreateSpriteVisual();
+    tile.content.Size({ w, h });
+    tile.content.Brush(compositor.CreateSurfaceBrush(tile.contentSurface));
+    tile.holder.Children().InsertAtTop(tile.content);
+}
+
 void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
                                int slide) {
     ReleaseTiles(screen);
@@ -2056,68 +2342,10 @@ void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
             tile.holder.Children().InsertAtTop(tile.shadow);
         }
 
-        bool haveThumbnail = false;
+        const SIZE fallback{ tile.sourceRect.right - tile.sourceRect.left,
+                             tile.sourceRect.bottom - tile.sourceRect.top };
 
-        if (dcompDevice) {
-            // What the thumbnail's pixels cover, and what part of that is the
-            // window you can see. They differ by the invisible resize border,
-            // around seven pixels a side at 100%, and the arrangement is built
-            // from the visible frame.
-            RECT sourceWindow{}, sourceFrame{};
-            const bool haveGeometry =
-                thumbnail::SourceGeometry(item.hwnd, sourceWindow, sourceFrame);
-
-            // Deliberately GetWindowRect rather than DWM's own idea of the
-            // thumbnail's size, which the two can disagree about on a cloaked
-            // UWP window. Everything below scales and offsets in this same
-            // space, and a size from one space with an offset from another is
-            // how the window ends up not filling its tile.
-            const SIZE render{
-                haveGeometry ? sourceWindow.right - sourceWindow.left
-                             : tile.sourceRect.right - tile.sourceRect.left,
-                haveGeometry ? sourceWindow.bottom - sourceWindow.top
-                             : tile.sourceRect.bottom - tile.sourceRect.top };
-
-            void* raw = nullptr;
-            if (thumbnail::CreateSharedVisual(dcompDevice.get(), screen.hwnd, item.hwnd,
-                                              render, &raw, &tile.thumbnail) && raw) {
-                winrt::com_ptr<IUnknown> unknown;
-                unknown.attach(reinterpret_cast<IUnknown*>(raw));
-
-                if (auto visual = unknown.try_as<WUC::Visual>()) {
-                    // Fit the VISIBLE frame to the tile, not the whole
-                    // thumbnail. Scaling by the thumbnail's own size leaves the
-                    // window smaller than its tile and pushed up and left
-                    // inside it, which is what made the hover outline look like
-                    // it was drawn around the wrong rectangle.
-                    const float frameW = haveGeometry
-                        ? static_cast<float>(sourceFrame.right - sourceFrame.left)
-                        : static_cast<float>(render.cx);
-                    const float frameH = haveGeometry
-                        ? static_cast<float>(sourceFrame.bottom - sourceFrame.top)
-                        : static_cast<float>(render.cy);
-
-                    const float scaleX = place.w / (std::max)(1.0f, frameW);
-                    const float scaleY = place.h / (std::max)(1.0f, frameH);
-
-                    visual.Scale({ scaleX, scaleY, 1.0f });
-
-                    // Slide the invisible border back off the top and the left,
-                    // so what lands on the tile's origin is the frame's origin.
-                    if (haveGeometry)
-                        visual.Offset({ (sourceWindow.left - sourceFrame.left) * scaleX,
-                                        (sourceWindow.top  - sourceFrame.top)  * scaleY,
-                                        0.0f });
-
-                    tile.holder.Children().InsertAtTop(visual);
-                    tile.live      = visual;
-                    tile.reduction = (place.w > 0.0f) ? frameW / place.w : 1.0f;
-                    haveThumbnail  = true;
-                }
-            }
-        }
-
-        if (!haveThumbnail) {
+        if (!AttachLive(screen, tile, item.hwnd, place.w, place.h, fallback)) {
             // Snapshots run on the thread that owes a frame: a fifty
             // millisecond ping plus a full-size readback each. So the tier gets
             // a budget and everything past it becomes a card, because a late
@@ -2132,56 +2360,7 @@ void Mission::Impl::BuildTiles(Screen& screen, const std::vector<int>& members,
                 ++skipped;
             }
 
-            tile.contentSurface = graphics.CreateDrawingSurface(
-                { place.w, place.h },
-                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
-
-            SurfaceDraw draw(tile.contentSurface);
-            if (draw.ok) {
-                ID2D1DeviceContext* dc = draw.dc.Get();
-                dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-
-                if (!content.Empty()) {
-                    if (ComPtr<ID2D1Bitmap1> bitmap = UploadBitmap(dc, std::move(content))) {
-                        // Cubic rather than the linear DrawBitmap defaults to.
-                        //
-                        // The snapshot has already been reduced to fit the tile
-                        // by a box filter, which is the right way to do the big
-                        // reduction, but aspect ratio is preserved so it lands a
-                        // pixel or two short in one axis and this last step is a
-                        // small stretch. Linear on a small stretch is visibly
-                        // soft, and this is drawn once per window per gesture,
-                        // so the better filter costs nothing worth counting.
-                        dc->DrawBitmap(bitmap.Get(),
-                                       D2D1::RectF(0.0f, 0.0f, place.w, place.h),
-                                       1.0f,
-                                       D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                                       nullptr);
-                    }
-                } else {
-                    // A window-shaped plate with the app's icon on it, which is
-                    // a design rather than a hole.
-                    FillSquircle(dc, d2dFactory.Get(), 0.0f, 0.0f, place.w, place.h,
-                                 screen.Scaled(kTileRadius),
-                                 themeIsLight ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.80f)
-                                              : D2D1::ColorF(0.10f, 0.10f, 0.13f, 0.85f));
-
-                    if (ComPtr<ID2D1Bitmap1> icon = IconFor(dc, item)) {
-                        const float side = (std::min)(place.w, place.h) * 0.40f;
-                        dc->DrawBitmap(icon.Get(),
-                                       D2D1::RectF((place.w - side) * 0.5f,
-                                                   (place.h - side) * 0.5f,
-                                                   (place.w + side) * 0.5f,
-                                                   (place.h + side) * 0.5f));
-                    }
-                }
-            }
-
-            tile.content = compositor.CreateSpriteVisual();
-            tile.content.Size({ place.w, place.h });
-            tile.content.Brush(compositor.CreateSurfaceBrush(tile.contentSurface));
-            tile.holder.Children().InsertAtTop(tile.content);
+            AttachCard(screen, tile, item, place.w, place.h, std::move(content));
         }
 
         // One badge and one name per pile, under the front window. The chrome
@@ -2614,6 +2793,9 @@ void Mission::Impl::BuildForDesktop(int desktop, int slide) {
     for (size_t i = 0; i < items.size(); ++i) {
         if (items[i].desktop >= 0 && items[i].desktop != desktop) continue;
 
+        // A window in the hand is drawn by the drag, not by the arrangement.
+        if (drag.moving && items[i].hwnd == drag.window) continue;
+
         const RECT& b = items[i].bounds;
         const POINT centre{ (b.left + b.right) / 2, (b.top + b.bottom) / 2 };
         const HMONITOR monitor = ::MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST);
@@ -2858,146 +3040,654 @@ void Mission::Impl::CollapsePile(Screen& screen) {
     MACTAB_DIAG("mission: pile of app %d collapsed", group);
 }
 
+// --- the space bar ------------------------------------------------------------
+//
+// On a Mac, pressing the space bar with the pointer on a window in Mission
+// Control shows that window large, and pressing it again puts it back. The tile
+// itself grows, over a dimmed arrangement; nothing is rebuilt, so putting it back
+// leaves a spread pile spread.
+
+void Mission::Impl::BeginPreview(Screen& screen, int index) {
+    if (index < 0 || index >= static_cast<int>(screen.tiles.size())) return;
+
+    GuardMission(*this, "BeginPreview", [&] {
+        Tile& tile = screen.tiles[static_cast<size_t>(index)];
+
+        // As large as the window really is, up to most of the space under the
+        // strip, and never smaller than the tile already is.
+        const float realW = static_cast<float>(tile.homeRect.right - tile.homeRect.left);
+        const float realH = static_cast<float>(tile.homeRect.bottom - tile.homeRect.top);
+        const float tileW = static_cast<float>(tile.liveRect.right - tile.liveRect.left);
+        const float tileH = static_cast<float>(tile.liveRect.bottom - tile.liveRect.top);
+        if (realW <= 0.0f || realH <= 0.0f || tileW <= 0.0f || tileH <= 0.0f) return;
+
+        const float barH  = BarHeight(screen);
+        const float roomW = screen.Width() * 0.84f;
+        const float roomH = (screen.Height() - barH) * 0.84f;
+        const float fit   = (std::min)(1.0f, (std::min)(roomW / realW, roomH / realH));
+        float w = realW * fit;
+        float h = realH * fit;
+        if (w < tileW) {
+            w = tileW;
+            h = tileH;
+        }
+
+        const float x = (screen.Width() - w) * 0.5f;
+        const float y = barH + (screen.Height() - barH - h) * 0.5f;
+
+        screen.preview     = index;
+        screen.previewFrom = tile.liveRect;
+        tile.liveRect = RECT{ static_cast<LONG>(x), static_cast<LONG>(y),
+                              static_cast<LONG>(x + w), static_cast<LONG>(y + h) };
+
+        // In front of everything else for as long as it is large.
+        screen.tileLayer.Children().Remove(tile.holder);
+        screen.tileLayer.Children().InsertAtTop(tile.holder);
+
+        const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
+        auto easing = compositor.CreateCubicBezierEasingFunction({ 0.22f, 1.0f }, { 0.36f, 1.0f });
+
+        auto offset = compositor.CreateVector3KeyFrameAnimation();
+        offset.InsertKeyFrame(1.0f, { x, y, 0.0f }, easing);
+        offset.Duration(duration);
+        tile.holder.StartAnimation(L"Offset", offset);
+
+        auto scale = compositor.CreateVector3KeyFrameAnimation();
+        scale.InsertKeyFrame(1.0f, { w / (std::max)(1.0f, tile.baseW),
+                                     h / (std::max)(1.0f, tile.baseH), 1.0f }, easing);
+        scale.Duration(duration);
+        tile.holder.StartAnimation(L"Scale", scale);
+
+        for (size_t i = 0; i < screen.tiles.size(); ++i) {
+            if (static_cast<int>(i) == index) continue;
+            auto dim = compositor.CreateScalarKeyFrameAnimation();
+            dim.InsertKeyFrame(1.0f, 0.2f, easing);
+            dim.Duration(duration);
+            screen.tiles[i].holder.StartAnimation(L"Opacity", dim);
+        }
+
+        auto hide = compositor.CreateScalarKeyFrameAnimation();
+        hide.InsertKeyFrame(1.0f, 0.0f, easing);
+        hide.Duration(duration);
+        screen.chromeLayer.StartAnimation(L"Opacity", hide);
+
+        screen.outline.Opacity(0.0f);
+    });
+}
+
+void Mission::Impl::EndPreview(Screen& screen) {
+    const int index = screen.preview;
+    screen.preview = -1;
+    if (index < 0 || index >= static_cast<int>(screen.tiles.size())) return;
+
+    GuardMission(*this, "EndPreview", [&] {
+        Tile& tile = screen.tiles[static_cast<size_t>(index)];
+        tile.liveRect = screen.previewFrom;
+
+        // Back to its depth in the stack: under the first tile built after it.
+        // BuildTiles inserts back to front, deepest first and then by index, so
+        // that order is the stacking order.
+        const auto builtAfter = [&](size_t a, size_t b) {
+            const Tile& ta = screen.tiles[a];
+            const Tile& tb = screen.tiles[b];
+            return ta.depth < tb.depth || (ta.depth == tb.depth && a > b);
+        };
+        int above = -1;
+        for (size_t i = 0; i < screen.tiles.size(); ++i) {
+            if (static_cast<int>(i) == index || !builtAfter(i, static_cast<size_t>(index)))
+                continue;
+            if (above < 0 || builtAfter(static_cast<size_t>(above), i))
+                above = static_cast<int>(i);
+        }
+        auto children = screen.tileLayer.Children();
+        children.Remove(tile.holder);
+        if (above >= 0)
+            children.InsertBelow(tile.holder, screen.tiles[static_cast<size_t>(above)].holder);
+        else
+            children.InsertAtTop(tile.holder);
+
+        const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
+        auto easing = compositor.CreateCubicBezierEasingFunction({ 0.22f, 1.0f }, { 0.36f, 1.0f });
+        const RECT& r = tile.liveRect;
+
+        auto offset = compositor.CreateVector3KeyFrameAnimation();
+        offset.InsertKeyFrame(1.0f, { static_cast<float>(r.left), static_cast<float>(r.top), 0.0f },
+                              easing);
+        offset.Duration(duration);
+        tile.holder.StartAnimation(L"Offset", offset);
+
+        auto scale = compositor.CreateVector3KeyFrameAnimation();
+        scale.InsertKeyFrame(1.0f,
+            { static_cast<float>(r.right - r.left) / (std::max)(1.0f, tile.baseW),
+              static_cast<float>(r.bottom - r.top) / (std::max)(1.0f, tile.baseH), 1.0f },
+            easing);
+        scale.Duration(duration);
+        tile.holder.StartAnimation(L"Scale", scale);
+
+        // Everything else back to how bright it was, which is not fully bright
+        // for the other applications while a pile is spread.
+        for (size_t i = 0; i < screen.tiles.size(); ++i) {
+            if (static_cast<int>(i) == index) continue;
+            const bool dimmed = screen.expandedGroup >= 0 &&
+                                screen.tiles[i].group != screen.expandedGroup;
+            auto undim = compositor.CreateScalarKeyFrameAnimation();
+            undim.InsertKeyFrame(1.0f, dimmed ? 0.18f : 1.0f, easing);
+            undim.Duration(duration);
+            screen.tiles[i].holder.StartAnimation(L"Opacity", undim);
+        }
+
+        auto show = compositor.CreateScalarKeyFrameAnimation();
+        show.InsertKeyFrame(1.0f, 1.0f, easing);
+        show.Duration(duration);
+        screen.chromeLayer.StartAnimation(L"Opacity", show);
+
+        PositionOutline(screen);
+    });
+}
+
 // --- dragging ---------------------------------------------------------------
 //
-// A window can be picked up and put on another display, or on another desktop
-// in the strip. It is the one gesture where a tile leaves the arrangement, so
-// the tile itself is moved and everything else is left alone until the drop.
+// A window can be picked up and put on another display, on another desktop in
+// the strip, or both: a desktop in the strip of another display's overlay means
+// that desktop on that display. Dropped on empty space it goes to the desktop
+// being looked at, so walking the desktops with Ctrl+Win+Left and Right while
+// holding it carries it there, the way Ctrl and an arrow do on a Mac. Dropped on
+// the plus, it gets a desktop of its own.
+//
+// The tile leaves the arrangement when the drag starts and nothing is rebuilt
+// around the gap until the drop, as on macOS.
+
+int Mission::Impl::ItemOf(HWND window) const {
+    for (size_t i = 0; i < items.size(); ++i)
+        if (items[i].hwnd == window) return static_cast<int>(i);
+    return -1;
+}
+
+size_t Mission::Impl::ScreenAt(POINT virt, int fallback) const {
+    for (size_t i = 0; i < screens.size(); ++i)
+        if (::PtInRect(&screens[i].rect, virt)) return i;
+
+    // Between two displays that do not touch, the pointer is on neither. It
+    // stays on the one it was last seen on.
+    if (fallback >= 0 && fallback < static_cast<int>(screens.size()))
+        return static_cast<size_t>(fallback);
+    return 0;
+}
 
 void Mission::Impl::BeginDrag(Screen& screen, POINT client) {
-    drag = Drag{};
+    DropDrag();
 
     const int tile = HitTestTile(screen, client);
     if (tile < 0) return;
 
+    const Tile& pressed = screen.tiles[static_cast<size_t>(tile)];
     drag.screen = screen.hwnd;
     drag.tile   = tile;
+    drag.window = pressed.window;
     drag.grab   = client;
-    drag.origin = POINT{ screen.tiles[static_cast<size_t>(tile)].liveRect.left,
-                         screen.tiles[static_cast<size_t>(tile)].liveRect.top };
+    drag.origin = POINT{ pressed.liveRect.left, pressed.liveRect.top };
+    drag.w      = static_cast<float>(pressed.liveRect.right - pressed.liveRect.left);
+    drag.h      = static_cast<float>(pressed.liveRect.bottom - pressed.liveRect.top);
 
     // Capture, so the pointer can leave this overlay and land on another
     // display's without the moves stopping.
     ::SetCapture(screen.hwnd);
 }
 
-void Mission::Impl::UpdateDrag(Screen& screen, POINT client) {
+// Take the pressed tile out of the arrangement and into the hand.
+//
+// Its visual moves to the layer above the strip and its thumbnail registration
+// moves to the drag, so a rebuild while it is held (walking the desktops, the
+// watch timer) cannot tear it down. The tile list loses an entry, which shifts
+// every index after it, so the epoch moves too: a sharpening pass in flight
+// addresses tiles by position.
+void Mission::Impl::LiftDrag(Screen& screen) {
     if (drag.tile < 0 || drag.tile >= static_cast<int>(screen.tiles.size())) return;
 
-    const int dx = client.x - drag.grab.x;
-    const int dy = client.y - drag.grab.y;
+    const size_t index = static_cast<size_t>(&screen - screens.data());
+    Tile& tile = screen.tiles[static_cast<size_t>(drag.tile)];
 
-    // A threshold, so a click with a shaky hand is still a click.
-    if (!drag.moving) {
-        const int slack = static_cast<int>(screen.Scaled(6.0f));
-        if (dx * dx + dy * dy < slack * slack) return;
-        drag.moving = true;
-        screen.outline.Opacity(0.0f);
+    drag.ghosts.resize(screens.size());
+    Ghost& ghost = drag.ghosts[index];
+    ghost.holder    = tile.holder;
+    ghost.thumbnail = tile.thumbnail;
+    ghost.sx        = drag.w / (std::max)(1.0f, tile.baseW);
+    ghost.sy        = drag.h / (std::max)(1.0f, tile.baseH);
+    tile.thumbnail  = nullptr;
+
+    // Whatever the reveal or a spread pile was still doing to it stops here, or
+    // it would go on fighting the pointer.
+    ghost.holder.StopAnimation(L"Offset");
+    ghost.holder.StopAnimation(L"Scale");
+    ghost.holder.StopAnimation(L"Opacity");
+    ghost.holder.Opacity(1.0f);
+    ghost.holder.Scale({ ghost.sx, ghost.sy, 1.0f });
+
+    // Scaled about the point it was picked up by, so shrinking over the strip
+    // keeps that point under the pointer.
+    ghost.holder.CenterPoint({ (drag.grab.x - drag.origin.x) / ghost.sx,
+                               (drag.grab.y - drag.origin.y) / ghost.sy, 0.0f });
+
+    screen.tileLayer.Children().Remove(ghost.holder);
+    screen.dragLayer.Children().InsertAtTop(ghost.holder);
+    if (tile.chrome) screen.chromeLayer.Children().Remove(tile.chrome);
+
+    screen.tiles.erase(screen.tiles.begin() + drag.tile);
+    ++tileEpoch;
+
+    screen.hovered = -1;
+    screen.outline.Opacity(0.0f);
+
+    drag.tile   = -1;
+    drag.moving = true;
+    drag.over   = static_cast<int>(index);
+}
+
+// The window, drawn again for a display the pointer has just reached.
+void Mission::Impl::MakeGhost(size_t index) {
+    if (index >= drag.ghosts.size() || drag.ghosts[index].holder) return;
+
+    const int item = ItemOf(drag.window);
+    if (item < 0) return;
+
+    Screen& screen = screens[index];
+
+    Tile scratch;
+    scratch.holder = compositor.CreateContainerVisual();
+    scratch.holder.Size({ drag.w, drag.h });
+
+    if (shadowBrush) {
+        auto shadow = compositor.CreateSpriteVisual();
+        shadow.Brush(shadowBrush);
+        shadow.Size({ drag.w + textureSpread * 2, drag.h + textureSpread * 2 });
+        shadow.Offset({ -textureSpread, -textureSpread, 0.0f });
+        scratch.holder.Children().InsertAtTop(shadow);
     }
 
-    Tile& tile = screen.tiles[static_cast<size_t>(drag.tile)];
-    tile.holder.Offset({ static_cast<float>(drag.origin.x + dx),
-                         static_cast<float>(drag.origin.y + dy), 0.0f });
-    if (tile.chrome) tile.chrome.Opacity(0.0f);
+    const MissionItem& source = items[static_cast<size_t>(item)];
+    const SIZE fallback{ source.bounds.right - source.bounds.left,
+                         source.bounds.bottom - source.bounds.top };
+    if (!AttachLive(screen, scratch, source.hwnd, drag.w, drag.h, fallback))
+        AttachCard(screen, scratch, source, drag.w, drag.h, Bitmap{});
+
+    scratch.holder.CenterPoint({ static_cast<float>(drag.grab.x - drag.origin.x),
+                                 static_cast<float>(drag.grab.y - drag.origin.y), 0.0f });
+    scratch.holder.Scale({ drag.k, drag.k, 1.0f });
+    screen.dragLayer.Children().InsertAtTop(scratch.holder);
+
+    Ghost& ghost = drag.ghosts[index];
+    ghost.holder    = scratch.holder;
+    ghost.thumbnail = scratch.thumbnail;
+}
+
+// The outline round the desktop, or the plus, a window would land on.
+void Mission::Impl::ShowDropMark(Screen& screen, int chip) {
+    if (!screen.dropMark) return;
+    if (chip < 0 || chip >= static_cast<int>(screen.chips.size())) {
+        screen.dropMark.Opacity(0.0f);
+        return;
+    }
+
+    const mission::SpaceChip& c = screen.chips[static_cast<size_t>(chip)];
+    const float stroke = screen.Scaled(kOutlineWidth);
+    const float pad    = std::ceil(stroke);
+    const float w      = c.w + pad * 2.0f;
+    const float h      = c.h + pad * 2.0f;
+
+    if (!screen.dropSurface || screen.dropW != w || screen.dropH != h ||
+        screen.dropRound != c.add) {
+        screen.dropSurface = graphics.CreateDrawingSurface(
+            { w, h },
+            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            winrt::Windows::Graphics::DirectX::DirectXAlphaMode::Premultiplied);
+        screen.dropW     = w;
+        screen.dropH     = h;
+        screen.dropRound = c.add;
+
+        SurfaceDraw draw(screen.dropSurface);
+        if (!draw.ok) {
+            screen.dropMark.Opacity(0.0f);
+            return;
+        }
+
+        ID2D1DeviceContext* dc = draw.dc.Get();
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        if (c.add) {
+            ComPtr<ID2D1SolidColorBrush> brush;
+            if (SUCCEEDED(dc->CreateSolidColorBrush(accent, brush.Put())))
+                dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(w * 0.5f, h * 0.5f),
+                                              c.w * 0.5f, c.h * 0.5f),
+                                brush.Get(), stroke);
+        } else {
+            StrokeSquircle(dc, d2dFactory.Get(), pad, pad, c.w, c.h,
+                           screen.Scaled(kChipRadius), stroke, accent);
+        }
+
+        screen.dropMark.Brush(compositor.CreateSurfaceBrush(screen.dropSurface));
+    }
+
+    screen.dropMark.Size({ w, h });
+    screen.dropMark.Offset({ c.x - pad, c.y - pad, 0.0f });
+    screen.dropMark.Opacity(1.0f);
+}
+
+// Show the held window under the pointer on whichever display it is over.
+void Mission::Impl::PlaceGhosts(POINT virt, size_t index) {
+    Screen& screen = screens[index];
+    drag.over = static_cast<int>(index);
+    MakeGhost(index);
+
+    const POINT at{ virt.x - screen.rect.left, virt.y - screen.rect.top };
+
+    // Over the strip it shrinks toward the size of a desktop there, so it can
+    // be seen going into one, and the desktop under it is outlined.
+    const bool overStrip = !spaces.empty() && !screen.chips.empty() &&
+                           at.y < BarHeight(screen);
+    const int chip = overStrip ? HitTestChip(screen, at) : -1;
+
+    for (size_t i = 0; i < screens.size(); ++i)
+        ShowDropMark(screens[i], (i == index) ? chip : -1);
+
+    if (overStrip != drag.small) {
+        drag.small = overStrip;
+        drag.k = overStrip
+            ? (std::max)(0.12f, (std::min)(1.0f, screen.chips.front().w / (std::max)(1.0f, drag.w)))
+            : 1.0f;
+
+        auto easing = compositor.CreateCubicBezierEasingFunction({ 0.22f, 1.0f },
+                                                                { 0.36f, 1.0f });
+        for (Ghost& ghost : drag.ghosts) {
+            if (!ghost.holder) continue;
+            auto scale = compositor.CreateVector3KeyFrameAnimation();
+            scale.InsertKeyFrame(1.0f, { ghost.sx * drag.k, ghost.sy * drag.k, 1.0f }, easing);
+            scale.Duration(std::chrono::milliseconds(160));
+            ghost.holder.StartAnimation(L"Scale", scale);
+        }
+    }
+
+    for (size_t i = 0; i < drag.ghosts.size(); ++i) {
+        Ghost& ghost = drag.ghosts[i];
+        if (!ghost.holder) continue;
+        ghost.holder.Opacity((i == index) ? 1.0f : 0.0f);
+        if (i != index) continue;
+
+        // With the centre point on the grab point, the offset that keeps that
+        // point under the pointer is the same at every scale.
+        const WFN::float3 centre = ghost.holder.CenterPoint();
+        ghost.holder.Offset({ at.x - centre.x, at.y - centre.y, 0.0f });
+    }
+}
+
+void Mission::Impl::UpdateDrag(Screen& screen, POINT client) {
+    if (!drag.screen) return;
+
+    if (!drag.moving) {
+        const int dx = client.x - drag.grab.x;
+        const int dy = client.y - drag.grab.y;
+
+        // A threshold, so a click with a shaky hand is still a click.
+        const int slack = static_cast<int>(screen.Scaled(6.0f));
+        if (dx * dx + dy * dy < slack * slack) return;
+
+        if (screen.hwnd != drag.screen) return;
+        if (!GuardMission(*this, "LiftDrag", [&] { LiftDrag(screen); }) || !drag.moving) {
+            DropDrag();
+            return;
+        }
+    }
+
+    const POINT virt{ client.x + screen.rect.left, client.y + screen.rect.top };
+    const size_t over = ScreenAt(virt, drag.over);
+    GuardMission(*this, "UpdateDrag", [&] { PlaceGhosts(virt, over); });
+}
+
+// Where the held window is showing on a display, in that display's coordinates.
+RECT Mission::Impl::GhostRect(const Drag& held, POINT at) const {
+    const float gx = static_cast<float>(held.grab.x - held.origin.x) * held.k;
+    const float gy = static_cast<float>(held.grab.y - held.origin.y) * held.k;
+    const float left = at.x - gx;
+    const float top  = at.y - gy;
+    return RECT{ static_cast<LONG>(left), static_cast<LONG>(top),
+                 static_cast<LONG>(left + held.w * held.k),
+                 static_cast<LONG>(top  + held.h * held.k) };
+}
+
+void Mission::Impl::ReleaseGhost(Ghost& ghost) {
+    if (ghost.holder) {
+        if (auto parent = ghost.holder.Parent()) parent.Children().Remove(ghost.holder);
+        ghost.holder = nullptr;
+    }
+    thumbnail::ReleaseSharedVisual(ghost.thumbnail);
+    ghost.thumbnail = nullptr;
+}
+
+// Empty `drag` and let go of the mouse, in that order, so the
+// WM_CAPTURECHANGED the release sends finds nothing to cancel.
+Mission::Impl::Drag Mission::Impl::TakeDrag() {
+    Drag held = std::move(drag);
+    drag = Drag{};
+    if (held.screen && ::GetCapture() == held.screen) ::ReleaseCapture();
+    GuardMission(*this, "ShowDropMark", [&] {
+        for (Screen& screen : screens) ShowDropMark(screen, -1);
+    });
+    return held;
+}
+
+// Forget the drag without putting anything back, for paths that are about to
+// rebuild or take everything down anyway.
+void Mission::Impl::DropDrag() {
+    if (!drag.screen) return;
+    Drag held = TakeDrag();
+    for (Ghost& ghost : held.ghosts) ReleaseGhost(ghost);
+}
+
+// Put the held window back where it came from, from wherever it is now.
+void Mission::Impl::CancelDrag() {
+    if (!drag.screen) return;
+    Drag held = TakeDrag();
+
+    if (held.moving && held.over >= 0 && held.over < static_cast<int>(screens.size())) {
+        POINT cursor{};
+        ::GetCursorPos(&cursor);
+        const Screen& over = screens[static_cast<size_t>(held.over)];
+        const POINT at{ cursor.x - over.rect.left, cursor.y - over.rect.top };
+        Rearrange(browsed, held.window, static_cast<size_t>(held.over), GhostRect(held, at));
+    }
+
+    for (Ghost& ghost : held.ghosts) ReleaseGhost(ghost);
+}
+
+// Shrink a dropped window into the miniature of the desktop it went to, at the
+// place it has there, and fade it out on arrival.
+void Mission::Impl::FlyIntoChip(Ghost& ghost, const Screen& screen,
+                                const mission::SpaceChip& chip, const MissionItem& item) {
+    if (!ghost.holder) return;
+
+    const float sx = chip.w / (std::max)(1.0f, screen.Width());
+    const float sy = chip.h / (std::max)(1.0f, screen.Height());
+    float x = chip.x + (item.bounds.left - screen.rect.left) * sx;
+    float y = chip.y + (item.bounds.top  - screen.rect.top)  * sy;
+    const float w = (std::max)(2.0f, (item.bounds.right - item.bounds.left) * sx);
+    const float h = (std::max)(2.0f, (item.bounds.bottom - item.bounds.top) * sy);
+    x = (std::max)(chip.x, (std::min)(x, chip.x + chip.w - w));
+    y = (std::max)(chip.y, (std::min)(y, chip.y + chip.h - h));
+
+    // The holder's own size, which its scale multiplies.
+    const WFN::float2 size = ghost.holder.Size();
+    const float kx = w / (std::max)(1.0f, size.x);
+    const float ky = h / (std::max)(1.0f, size.y);
+
+    const WFN::float3 centre = ghost.holder.CenterPoint();
+    const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
+    auto easing = compositor.CreateCubicBezierEasingFunction({ 0.22f, 1.0f }, { 0.36f, 1.0f });
+
+    auto offset = compositor.CreateVector3KeyFrameAnimation();
+    offset.InsertKeyFrame(1.0f, { x - centre.x * (1.0f - kx), y - centre.y * (1.0f - ky), 0.0f },
+                          easing);
+    offset.Duration(duration);
+    ghost.holder.StartAnimation(L"Offset", offset);
+
+    auto scale = compositor.CreateVector3KeyFrameAnimation();
+    scale.InsertKeyFrame(1.0f, { kx, ky, 1.0f }, easing);
+    scale.Duration(duration);
+    ghost.holder.StartAnimation(L"Scale", scale);
+
+    auto fade = compositor.CreateScalarKeyFrameAnimation();
+    fade.InsertKeyFrame(0.6f, 1.0f);
+    fade.InsertKeyFrame(1.0f, 0.0f, easing);
+    fade.Duration(duration);
+    ghost.holder.StartAnimation(L"Opacity", fade);
 }
 
 bool Mission::Impl::FinishDrag(Screen& screen, POINT client) {
-    const Drag held = drag;
-    drag = Drag{};
+    if (!drag.screen) return false;
 
-    if (held.screen) ::ReleaseCapture();
-    if (!held.moving || held.tile < 0 ||
-        held.tile >= static_cast<int>(screen.tiles.size()))
-        return false;
+    Drag held = TakeDrag();
+    if (!held.moving) return false;
 
-    Tile& tile = screen.tiles[static_cast<size_t>(held.tile)];
-    if (tile.item < 0 || tile.item >= static_cast<int>(items.size())) return true;
-
-    MissionItem& item = items[static_cast<size_t>(tile.item)];
-
-    // Where the drop landed, in virtual-screen coordinates. The pointer is
-    // captured, so it can be well outside this overlay by now.
-    const POINT dropped{ client.x + screen.rect.left, client.y + screen.rect.top };
-
-    // Dropped on a desktop in the strip.
-    for (const mission::SpaceChip& chip : screen.chips) {
-        if (chip.add || chip.index < 0 || chip.index >= static_cast<int>(spaces.size()))
-            continue;
-        if (client.x < chip.x || client.x >= chip.x + chip.w ||
-            client.y < chip.y || client.y >= chip.y + chip.h)
-            continue;
-
-        if (desktops::MoveWindowTo(item.hwnd, spaces[static_cast<size_t>(chip.index)].id)) {
-            item.desktop = chip.index;
-            MACTAB_DIAG("mission: moved %p to desktop %d",
-                        static_cast<void*>(item.hwnd), chip.index);
-        } else {
-            // Not allowed for another process's window, and there is no public
-            // way round it. The arrangement snapping back is the honest answer:
-            // nothing happened, and nothing pretends it did.
-            MACTAB_WARN("mission: Windows does not allow moving another "
-                        "application's window between desktops");
-        }
+    const int index = ItemOf(held.window);
+    if (index < 0) {
+        for (Ghost& ghost : held.ghosts) ReleaseGhost(ghost);
         Rearrange(browsed);
         return true;
     }
 
-    // Dropped on another display.
-    const HMONITOR target = ::MonitorFromPoint(dropped, MONITOR_DEFAULTTONEAREST);
-    if (target && target != screen.monitor) {
-        MONITORINFO from{}, to{};
-        from.cbSize = sizeof(from);
-        to.cbSize   = sizeof(to);
+    // Where the drop landed. The pointer is captured, so it can be well outside
+    // this overlay by now.
+    const POINT  virt{ client.x + screen.rect.left, client.y + screen.rect.top };
+    const size_t s = ScreenAt(virt, held.over);
+    Screen&      target = screens[s];
+    const POINT  at{ virt.x - target.rect.left, virt.y - target.rect.top };
 
-        if (::GetMonitorInfoW(screen.monitor, &from) && ::GetMonitorInfoW(target, &to)) {
-            // Kept where it was on its old screen in proportion, rather than at
-            // the same pixel offset: two displays are rarely the same size, and
-            // a window three quarters of the way across a wide screen belongs
-            // three quarters of the way across the narrow one.
-            const float fw = static_cast<float>(from.rcWork.right - from.rcWork.left);
-            const float fh = static_cast<float>(from.rcWork.bottom - from.rcWork.top);
-            const float tw = static_cast<float>(to.rcWork.right - to.rcWork.left);
-            const float th = static_cast<float>(to.rcWork.bottom - to.rcWork.top);
-
-            const float u = (item.bounds.left - from.rcWork.left) / (std::max)(1.0f, fw);
-            const float v = (item.bounds.top  - from.rcWork.top)  / (std::max)(1.0f, fh);
-
-            LONG w = item.bounds.right - item.bounds.left;
-            LONG h = item.bounds.bottom - item.bounds.top;
-            w = (std::min)(w, static_cast<LONG>(tw));
-            h = (std::min)(h, static_cast<LONG>(th));
-
-            LONG x = to.rcWork.left + static_cast<LONG>(u * tw);
-            LONG y = to.rcWork.top  + static_cast<LONG>(v * th);
-            x = (std::min)(x, static_cast<LONG>(to.rcWork.right)  - w);
-            y = (std::min)(y, static_cast<LONG>(to.rcWork.bottom) - h);
-            x = (std::max)(x, static_cast<LONG>(to.rcWork.left));
-            y = (std::max)(y, static_cast<LONG>(to.rcWork.top));
-
-            // A maximised window has to be restored first or it snaps straight
-            // back to the display it was maximised on.
-            WINDOWPLACEMENT placement{};
-            placement.length = sizeof(placement);
-            const bool maximised = ::GetWindowPlacement(item.hwnd, &placement) &&
-                                   placement.showCmd == SW_SHOWMAXIMIZED;
-            if (maximised) ::ShowWindow(item.hwnd, SW_RESTORE);
-
-            ::SetWindowPos(item.hwnd, nullptr, x, y, w, h,
-                           SWP_NOACTIVATE | SWP_NOZORDER);
-            if (maximised) ::ShowWindow(item.hwnd, SW_SHOWMAXIMIZED);
-
-            RECT moved{};
-            if (SUCCEEDED(::DwmGetWindowAttribute(item.hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
-                                                  &moved, sizeof(moved))) ||
-                ::GetWindowRect(item.hwnd, &moved))
-                item.bounds = moved;
-
-            MACTAB_DIAG("mission: moved %p to another display",
-                        static_cast<void*>(item.hwnd));
+    // Empty space means the desktop being looked at, a desktop means that one,
+    // and the strip anywhere else means nothing at all.
+    int  desktop = browsed;
+    int  chip    = -1;
+    bool add     = false;
+    bool nowhere = false;
+    if (!spaces.empty() && at.y < BarHeight(target)) {
+        chip = HitTestChip(target, at);
+        if (chip < 0) {
+            nowhere = true;
+        } else if (target.chips[static_cast<size_t>(chip)].add) {
+            add = true;
+        } else {
+            desktop = target.chips[static_cast<size_t>(chip)].index;
         }
     }
 
-    Rearrange(browsed);
+    MissionItem& item = items[static_cast<size_t>(index)];
+
+    // Another display.
+    const POINT centre{ (item.bounds.left + item.bounds.right) / 2,
+                        (item.bounds.top + item.bounds.bottom) / 2 };
+    const HMONITOR home = ::MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST);
+
+    MONITORINFO from{}, to{};
+    from.cbSize = sizeof(from);
+    to.cbSize   = sizeof(to);
+
+    if (!nowhere && target.monitor != home &&
+        ::GetMonitorInfoW(home, &from) && ::GetMonitorInfoW(target.monitor, &to)) {
+        // Kept where it was on its old screen in proportion, rather than at the
+        // same pixel offset: two displays are rarely the same size, and a window
+        // three quarters of the way across a wide screen belongs three quarters
+        // of the way across the narrow one.
+        const float fw = static_cast<float>(from.rcWork.right - from.rcWork.left);
+        const float fh = static_cast<float>(from.rcWork.bottom - from.rcWork.top);
+        const float tw = static_cast<float>(to.rcWork.right - to.rcWork.left);
+        const float th = static_cast<float>(to.rcWork.bottom - to.rcWork.top);
+
+        const float u = (item.bounds.left - from.rcWork.left) / (std::max)(1.0f, fw);
+        const float v = (item.bounds.top  - from.rcWork.top)  / (std::max)(1.0f, fh);
+
+        LONG w = item.bounds.right - item.bounds.left;
+        LONG h = item.bounds.bottom - item.bounds.top;
+        w = (std::min)(w, static_cast<LONG>(tw));
+        h = (std::min)(h, static_cast<LONG>(th));
+
+        LONG x = to.rcWork.left + static_cast<LONG>(u * tw);
+        LONG y = to.rcWork.top  + static_cast<LONG>(v * th);
+        x = (std::min)(x, static_cast<LONG>(to.rcWork.right)  - w);
+        y = (std::min)(y, static_cast<LONG>(to.rcWork.bottom) - h);
+        x = (std::max)(x, static_cast<LONG>(to.rcWork.left));
+        y = (std::max)(y, static_cast<LONG>(to.rcWork.top));
+
+        // A maximised window has to be restored first or it snaps straight
+        // back to the display it was maximised on.
+        WINDOWPLACEMENT placement{};
+        placement.length = sizeof(placement);
+        const bool maximised = ::GetWindowPlacement(item.hwnd, &placement) &&
+                               placement.showCmd == SW_SHOWMAXIMIZED;
+        if (maximised) ::ShowWindow(item.hwnd, SW_RESTORE);
+
+        // The bounds are the visible frame, and SetWindowPos places the whole
+        // window, invisible resize borders included. Fed the frame, every move
+        // took those borders off the window's size and put it that much up and
+        // to the left.
+        RECT outer{}, frame{};
+        LONG padL = 0, padT = 0, padR = 0, padB = 0;
+        if (::GetWindowRect(item.hwnd, &outer) &&
+            SUCCEEDED(::DwmGetWindowAttribute(item.hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                              &frame, sizeof(frame)))) {
+            padL = frame.left - outer.left;
+            padT = frame.top  - outer.top;
+            padR = outer.right  - frame.right;
+            padB = outer.bottom - frame.bottom;
+        }
+
+        if (!::SetWindowPos(item.hwnd, nullptr, x - padL, y - padT,
+                            w + padL + padR, h + padT + padB,
+                            SWP_NOACTIVATE | SWP_NOZORDER))
+            MACTAB_WARN("mission: %p would not move to another display (err %lu)",
+                        static_cast<void*>(item.hwnd), ::GetLastError());
+        if (maximised) ::ShowWindow(item.hwnd, SW_SHOWMAXIMIZED);
+
+        RECT moved{};
+        if (SUCCEEDED(::DwmGetWindowAttribute(item.hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                              &moved, sizeof(moved))) ||
+            ::GetWindowRect(item.hwnd, &moved))
+            item.bounds = moved;
+
+        MACTAB_DIAG("mission: moved %p to another display", static_cast<void*>(item.hwnd));
+    }
+
+    // Another desktop. The shell is asked by the host window, never from here:
+    // see kSpaceMoveBase. The arrangement shows the result now, and the host
+    // rebuilds it if the shell says no.
+    //
+    // A window pinned to every desktop is already on all of them.
+    const bool pinned = item.desktop < 0;
+    bool leaving = false;
+
+    if (!nowhere && !pinned && notifyWindow) {
+        if (add) {
+            ::PostMessageW(notifyWindow, spaceMessage, Mission::kSpaceAdd,
+                           reinterpret_cast<LPARAM>(item.hwnd));
+        } else if (desktop >= 0 && desktop < static_cast<int>(spaces.size()) &&
+                   desktop != item.desktop) {
+            item.desktop = desktop;
+            leaving = desktop != browsed;
+            ::PostMessageW(notifyWindow, spaceMessage,
+                           Mission::kSpaceMoveBase + static_cast<WPARAM>(desktop),
+                           reinterpret_cast<LPARAM>(item.hwnd));
+        }
+    }
+
+    if (leaving && chip >= 0 && s < held.ghosts.size() && held.ghosts[s].holder) {
+        // Into the desktop it was dropped on, and out of this one.
+        FlyIntoChip(held.ghosts[s], target, target.chips[static_cast<size_t>(chip)], item);
+        fading.push_back(held.ghosts[s]);
+        held.ghosts[s] = Ghost{};
+        ::SetTimer(screens.front().hwnd, kGhostTimerId,
+                   config::Current().missionRevealMs + 40, nullptr);
+        Rearrange(browsed);
+    } else {
+        // Into the arrangement, from the place it was let go of.
+        Rearrange(browsed, held.window, s, GhostRect(held, at));
+    }
+
+    for (Ghost& ghost : held.ghosts) ReleaseGhost(ghost);
     return true;
 }
 
@@ -3007,7 +3697,8 @@ bool Mission::Impl::FinishDrag(Screen& screen, POINT client) {
 // soon as anything can remove an item: a closed window shifts every index after
 // it, and every window past the gap would then fly in from the position of its
 // neighbour.
-void Mission::Impl::Rearrange(int desktop) {
+void Mission::Impl::Rearrange(int desktop, HWND seedWindow, size_t seedScreen,
+                              RECT seedRect) {
     // Keyed on the handle each tile carries, not on its index into `items`.
     //
     // The index is the obvious thing to reach for and it is wrong wherever this
@@ -3022,11 +3713,16 @@ void Mission::Impl::Rearrange(int desktop) {
 
     BuildForDesktop(desktop, 0);
 
-    for (Screen& other : screens) {
+    for (size_t s = 0; s < screens.size(); ++s) {
+        Screen& other = screens[s];
         for (Tile& tile : other.tiles) {
             tile.holder.Opacity(1.0f);
             if (tile.chrome) tile.chrome.Opacity(1.0f);
 
+            if (seedWindow && tile.window == seedWindow && s == seedScreen) {
+                tile.sourceRect = seedRect;
+                continue;
+            }
             const auto was = current.find(tile.window);
             if (was != current.end()) tile.sourceRect = was->second;
         }
@@ -3142,6 +3838,11 @@ void Mission::BrowseDesktop(int index) {
     if (index == impl.browsed) return;
 
     GuardMission(impl, "BrowseDesktop", [&] {
+        // A held window rides along, which is how it is carried to another
+        // desktop. A press that has not become a drag yet names a tile by index,
+        // and the rebuild is about to change what that index means.
+        if (!impl.drag.moving) impl.DropDrag();
+
         const int direction = (index > impl.browsed) ? 1 : -1;
         const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
 
@@ -3224,8 +3925,11 @@ void Mission::Rebuild(std::vector<MissionItem> items, std::vector<MissionSpace> 
         // changed underneath us. Cheap to redo; wrong to keep.
         impl.iconBitmaps.clear();
 
-        // A dragged tile no longer refers to anything.
-        impl.drag = Impl::Drag{};
+        // A held window survives a rebuild if it still exists, so something
+        // unrelated changing on the machine does not snatch it out of the hand.
+        // A press that has not become a drag names a tile by index, and those
+        // are about to change.
+        if (!impl.drag.moving || impl.ItemOf(impl.drag.window) < 0) impl.DropDrag();
 
         const int last   = static_cast<int>(impl.spaces.size()) - 1;
         const int target = (last < 0) ? 0 : (std::max)(0, (std::min)(last, desktop));
@@ -3244,11 +3948,11 @@ bool Mission::ForgetWindow(HWND hwnd) {
                                    });
     if (gone == impl.items.end()) return false;
 
-    // If it was the one under the pointer, the drag has nothing left to hold.
-    if (impl.drag.tile >= 0) {
-        ::ReleaseCapture();
-        impl.drag = Impl::Drag{};
-    }
+    // If it was the one in the hand, there is nothing left to hold. A press
+    // that has not become a drag names a tile by index, and the rebuild below
+    // changes those.
+    if (!impl.drag.moving || impl.drag.window == hwnd)
+        GuardMission(impl, "DropDrag", [&] { impl.DropDrag(); });
 
     impl.items.erase(gone);
 
@@ -3289,6 +3993,13 @@ void Mission::Impl::FinishHide() {
     closing = false;
     ignoreFocusFrom = 0;
     ignoreFocusMs   = 0;
+
+    // A drag cut short by leaving, and windows still shrinking into a desktop.
+    // Both hold thumbnail registrations, and both have to go with the overlay.
+    GuardMission(*this, "DropDrag", [&] { DropDrag(); });
+    if (!screens.empty()) ::KillTimer(screens.front().hwnd, kGhostTimerId);
+    for (Ghost& ghost : fading) GuardMission(*this, "ReleaseGhost", [&] { ReleaseGhost(ghost); });
+    fading.clear();
 
     for (Screen& screen : screens) {
         GuardMission(*this, "Hide", [&] {
@@ -3333,6 +4044,10 @@ void Mission::Hide(bool restoreFocus, bool immediate) {
     impl.restoreOnHide = restoreFocus;
 
     const auto duration = std::chrono::milliseconds(config::Current().missionRevealMs);
+
+    // A held window is not part of the collapse. Its own window is already
+    // where the collapse would take it.
+    GuardMission(impl, "DropDrag", [&] { impl.DropDrag(); });
 
     if (!immediate && impl.visible && !impl.closing && !impl.screens.empty()) {
         impl.closing = true;
