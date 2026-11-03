@@ -481,7 +481,7 @@ struct Mission::Impl {
         float w = 0.0f;            // and its size
         float h = 0.0f;
         bool  moving  = false;     // past the threshold, so it is a drag
-        bool  small   = false;     // shrunk to desktop size over the strip
+        bool  shrunk  = false;     // shrunk to desktop size over the strip
         float k       = 1.0f;      // how far it is shrunk
         int   over    = -1;        // the display under the pointer
         std::vector<Ghost> ghosts; // one per display, made when the pointer gets there
@@ -3388,8 +3388,8 @@ void Mission::Impl::PlaceGhosts(POINT virt, size_t index) {
     for (size_t i = 0; i < screens.size(); ++i)
         ShowDropMark(screens[i], (i == index) ? chip : -1);
 
-    if (overStrip != drag.small) {
-        drag.small = overStrip;
+    if (overStrip != drag.shrunk) {
+        drag.shrunk = overStrip;
         drag.k = overStrip
             ? (std::max)(0.12f, (std::min)(1.0f, screen.chips.front().w / (std::max)(1.0f, drag.w)))
             : 1.0f;
