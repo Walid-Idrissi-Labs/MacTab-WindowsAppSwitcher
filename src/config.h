@@ -170,6 +170,11 @@ struct Settings {
     // and if it misbehaves on some driver this gets a working Mission Control
     // back without waiting for a build.
     std::wstring missionThumbnails = L"auto";
+
+    // "auto" or "off". Whether windows of other applications may be moved
+    // between desktops through the shell's undocumented interface. The kill
+    // switch for a Windows build nobody here has seen; see desktops.h.
+    std::wstring desktopMoves = L"auto";
 };
 
 const Settings& Current();

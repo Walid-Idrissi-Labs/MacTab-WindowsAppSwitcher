@@ -164,6 +164,13 @@ const wchar_t* kDefaultIniBody =
     L";   icon     no window contents at all, just the app icon on a card\r\n"
     L"; Drop to snapshot if the windows come out blank, misplaced or flickering.\r\n"
     L"MissionThumbnails=auto\r\n"
+    L"\r\n"
+    L"; Moving another application's window to a different desktop needs the\r\n"
+    L"; shell's own interface, which Windows does not document. MacTab checks it\r\n"
+    L"; against the desktops in the registry before it moves anything.\r\n"
+    L";   auto     use it on the Windows builds it has been checked against\r\n"
+    L";   off      never use it; a window dropped on a desktop goes back\r\n"
+    L"DesktopMoves=auto\r\n"
     L"\r\n";
 
 // Throw away whatever the profile APIs are holding for this file.
@@ -607,6 +614,7 @@ void ReadSettings() {
     g_settings.missionRevealMs   = static_cast<UINT>(
         (std::max)(0, (std::min)(2000, ReadInt(L"MissionRevealMs", 260))));
     g_settings.missionThumbnails = ReadKeyword(L"MissionThumbnails", L"auto");
+    g_settings.desktopMoves      = ReadKeyword(L"DesktopMoves", L"auto");
 
     g_settings.missionGap        = 26.0f;
     g_settings.missionFan        = 30.0f;
@@ -640,13 +648,14 @@ void ReadSettings() {
                 g_settings.glassRefraction ? 1 : 0);
     MACTAB_DIAG("config: glassRimTap %d", g_settings.glassRimTap ? 1 : 0);
     MACTAB_DIAG("config: mission enabled %d, groupByApp %d, gap %.0f/%.0f, "
-                "blur %.0f, dim %.2f, reveal %u ms, thumbnails %s",
+                "blur %.0f, dim %.2f, reveal %u ms, thumbnails %s, desktop moves %s",
                 g_settings.missionEnabled ? 1 : 0,
                 g_settings.missionGroupByApp ? 1 : 0,
                 g_settings.missionGap, g_settings.missionClusterGap,
                 g_settings.missionBlurSigma, g_settings.missionDim,
                 g_settings.missionRevealMs,
-                ToUtf8(g_settings.missionThumbnails).c_str());
+                ToUtf8(g_settings.missionThumbnails).c_str(),
+                ToUtf8(g_settings.desktopMoves).c_str());
 }
 
 } // namespace

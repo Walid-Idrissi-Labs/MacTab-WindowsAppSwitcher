@@ -4,6 +4,7 @@
 #include "desktops.h"
 #include "com.h"
 #include "common.h"
+#include "config.h"
 #include "diag.h"
 #include "hotkey.h"
 
@@ -100,6 +101,311 @@ IVirtualDesktopManager* Manager() {
             MACTAB_WARN("desktops: IVirtualDesktopManager unavailable");
     }
     return manager.Get();
+}
+
+// --- The shell's own interface ----------------------------------------------
+//
+// See the header for why this exists and what it is allowed to touch. In short:
+// three known IIDs, only the slots that have never moved, and a check against
+// the registry before anything is trusted.
+
+// Declared without uuids, because the IID depends on the build. The slot order
+// is what matters, and it is the same for all three layouts below.
+struct IShellDesktop : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE IsViewVisible(IUnknown* view, BOOL* visible) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetId(GUID* id) = 0;
+};
+
+struct IShellDesktops : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetCount(UINT* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE MoveViewToDesktop(IUnknown* view, IShellDesktop* desktop) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CanViewMoveDesktops(IUnknown* view, BOOL* can) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(IShellDesktop** desktop) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDesktops(IObjectArray** desktops) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetAdjacentDesktop(IShellDesktop* from, UINT direction,
+                                                         IShellDesktop** out) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SwitchDesktop(IShellDesktop* desktop) = 0;
+    // Nothing past slot 9, ever. Slot 10 moved inside one IID in 26100.2605.
+};
+
+// IApplicationViewCollection. Same IID and order from Windows 10 1809 onward.
+struct IShellViews : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetViews(IObjectArray** views) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetViewsByZOrder(IObjectArray** views) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetViewsByAppUserModelId(PCWSTR id, IObjectArray** views) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetViewForHwnd(HWND hwnd, IUnknown** view) = 0;
+};
+
+// Kept as text and parsed, so no GUID is ever transcribed into bytes by hand.
+constexpr wchar_t kImmersiveShell[]   = L"{C2F03A33-21F5-47FA-B4BB-156362A2F239}";
+constexpr wchar_t kDesktopsService[]  = L"{C5E0CDCA-7B6E-41B2-9FC4-D93975CC467B}";
+constexpr wchar_t kViewsInterface[]   = L"{1841C6D7-4F9D-42C0-AF41-8747538F10E5}";
+
+struct Layout {
+    const char*    name;
+    const wchar_t* desktops;   // IVirtualDesktopManagerInternal
+    const wchar_t* desktop;    // IVirtualDesktop
+    bool           win11;
+};
+
+// Newest first. Sources: Ciantic/VirtualDesktopAccessor and MScholtes/VirtualDesktop,
+// which agree on all three.
+constexpr Layout kLayouts[] = {
+    { "Windows 11 23H2 (22631.3085) to 25H2",
+      L"{53F5CA0B-158F-4124-900C-057158060B27}", L"{3F07F4BE-B107-441A-AF0F-39D82529072C}", true },
+    { "Windows 11 22H2 (22621.2215) to 23H2 (22631.3007)",
+      L"{A3175F2D-239C-4BD2-8AA0-EEBA8B0B138E}", L"{3F07F4BE-B107-441A-AF0F-39D82529072C}", true },
+    { "Windows 10 1809 to 22H2",
+      L"{F31574D6-B682-4CDC-BD56-1827860ABEC6}", L"{FF72FFDD-BE7E-43FC-9C03-AD81681E88E4}", false },
+};
+
+GUID ParseGuid(const wchar_t* text) {
+    GUID id{};
+    ::CLSIDFromString(text, &id);
+    return id;
+}
+
+struct Shell {
+    ComPtr<IShellDesktops> desktops;
+    ComPtr<IShellViews>    views;
+    GUID                   desktopIid{};
+};
+
+// UI thread only, like Manager().
+Shell g_shell;
+
+// Set when a layout answered QueryService but failed the check, or when no
+// layout answered at all once the shell was up. Either way this build is not one
+// the slots above were checked against, and asking again will not change that.
+bool g_shellRefused = false;
+
+// Every desktop the interface lists, in its order, and the one being viewed.
+//
+// Split from SelfTest so the __try there guards a function with no destructors
+// of its own, which is what MSVC requires of one.
+bool ReadShellDesktops(IShellDesktops* desktops, const GUID& desktopIid,
+                       std::vector<GUID>& out, GUID& current, const char** why) {
+    UINT count = 0;
+    if (FAILED(desktops->GetCount(&count)) || count == 0) {
+        *why = "GetCount";
+        return false;
+    }
+
+    ComPtr<IObjectArray> array;
+    UINT listed = 0;
+    if (FAILED(desktops->GetDesktops(array.Put())) || !array ||
+        FAILED(array->GetCount(&listed)) || listed != count) {
+        *why = "GetDesktops";
+        return false;
+    }
+
+    for (UINT i = 0; i < listed; ++i) {
+        ComPtr<IShellDesktop> desktop;
+        GUID id{};
+        if (FAILED(array->GetAt(i, desktopIid, desktop.PutVoid())) || !desktop ||
+            FAILED(desktop->GetId(&id))) {
+            *why = "IVirtualDesktop::GetId";
+            return false;
+        }
+        out.push_back(id);
+    }
+
+    ComPtr<IShellDesktop> viewed;
+    if (FAILED(desktops->GetCurrentDesktop(viewed.Put())) || !viewed ||
+        FAILED(viewed->GetId(&current))) {
+        *why = "GetCurrentDesktop";
+        return false;
+    }
+    return true;
+}
+
+#if defined(_MSC_VER)
+bool ReadShellDesktopsGuarded(IShellDesktops* desktops, const GUID& desktopIid,
+                              std::vector<GUID>* out, GUID* current, const char** why) {
+    // A slot with a different signature faults in our proxy rather than
+    // returning an error. Refusing the build is the right answer to that too.
+    __try {
+        return ReadShellDesktops(desktops, desktopIid, *out, *current, why);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *why = "a fault inside the call";
+        return false;
+    }
+}
+#else
+bool ReadShellDesktopsGuarded(IShellDesktops* desktops, const GUID& desktopIid,
+                              std::vector<GUID>* out, GUID* current, const char** why) {
+    return ReadShellDesktops(desktops, desktopIid, *out, *current, why);
+}
+#endif
+
+// Does this interface describe the desktops that are actually there?
+//
+// Compared with the registry, which the shell writes and which has nothing to
+// do with any vtable. Same desktops, same order, and the viewed one among them.
+// Without a registry list (one desktop, never added to) the interface still has
+// to agree with itself across four different calls.
+bool SelfTest(IShellDesktops* desktops, const GUID& desktopIid, const char** why) {
+    std::vector<GUID> listed;
+    GUID current{};
+    if (!ReadShellDesktopsGuarded(desktops, desktopIid, &listed, &current, why))
+        return false;
+
+    if (std::none_of(listed.begin(), listed.end(),
+                     [&](const GUID& id) { return ::IsEqualGUID(id, current) != FALSE; })) {
+        *why = "the viewed desktop is not in its own list";
+        return false;
+    }
+
+    std::vector<BYTE> raw;
+    if (ReadBinary(kRoot, L"VirtualDesktopIDs", raw) && raw.size() >= sizeof(GUID)) {
+        if (raw.size() / sizeof(GUID) != listed.size()) {
+            *why = "a different number of desktops from the registry";
+            return false;
+        }
+        for (size_t i = 0; i < listed.size(); ++i) {
+            if (std::memcmp(raw.data() + i * sizeof(GUID), &listed[i], sizeof(GUID)) != 0) {
+                *why = "different desktops from the registry";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// The shell's desktop interface, connected and checked, or null.
+IShellDesktops* ShellDesktops() {
+    if (config::Current().desktopMoves == L"off") return nullptr;
+    if (g_shellRefused) return nullptr;
+    if (g_shell.desktops) return g_shell.desktops.Get();
+
+    const GUID shellClass = ParseGuid(kImmersiveShell);
+    ComPtr<IServiceProvider> shell;
+    HRESULT hr = ::CoCreateInstance(shellClass, nullptr, CLSCTX_LOCAL_SERVER,
+                                    IID_PPV_ARGS(shell.Put()));
+    if (FAILED(hr)) {
+        // Explorer not up yet, which is normal at logon. Asked again next time.
+        MACTAB_DIAG("desktops: the shell is not answering (0x%08lX)",
+                    static_cast<unsigned long>(hr));
+        return nullptr;
+    }
+
+    const GUID viewsIid = ParseGuid(kViewsInterface);
+    ComPtr<IShellViews> views;
+    hr = shell->QueryService(viewsIid, viewsIid, views.PutVoid());
+    if (FAILED(hr) || !views) {
+        MACTAB_DIAG("desktops: no view collection from the shell (0x%08lX)",
+                    static_cast<unsigned long>(hr));
+        return nullptr;
+    }
+
+    const uint32_t build   = WindowsBuildNumber();
+    const bool     win11   = build >= 22000;
+    const GUID     service = ParseGuid(kDesktopsService);
+
+    for (const Layout& layout : kLayouts) {
+        if (layout.win11 != win11) continue;
+
+        ComPtr<IShellDesktops> desktops;
+        if (FAILED(shell->QueryService(service, ParseGuid(layout.desktops),
+                                       desktops.PutVoid())) || !desktops)
+            continue;
+
+        const GUID desktopIid = ParseGuid(layout.desktop);
+        const char* why = "";
+        if (!SelfTest(desktops.Get(), desktopIid, &why)) {
+            g_shellRefused = true;
+            MACTAB_WARN("desktops: the shell's interface for %s failed its check on "
+                        "build %u (%s); other applications' windows will not be moved",
+                        layout.name, build, why);
+            return nullptr;
+        }
+
+        g_shell.desktops   = std::move(desktops);
+        g_shell.views      = std::move(views);
+        g_shell.desktopIid = desktopIid;
+        MACTAB_DIAG("desktops: moving windows through the shell, layout %s, build %u",
+                    layout.name, build);
+        return g_shell.desktops.Get();
+    }
+
+    g_shellRefused = true;
+    MACTAB_WARN("desktops: build %u has a desktop interface MacTab has not been "
+                "checked against; other applications' windows will not be moved",
+                build);
+    return nullptr;
+}
+
+// Explorer restarted, or is restarting, under us.
+bool ShellWentAway(HRESULT hr) {
+    return hr == RPC_E_DISCONNECTED || hr == RPC_E_SERVER_DIED ||
+           hr == RPC_E_SERVER_DIED_DNE ||
+           hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE) ||
+           hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED);
+}
+
+// The shell's object for the desktop with this id. Walked rather than looked up,
+// because FindDesktop is past slot 9.
+HRESULT FindShellDesktop(IShellDesktops* desktops, const GUID& id,
+                         ComPtr<IShellDesktop>& out) {
+    ComPtr<IObjectArray> array;
+    HRESULT hr = desktops->GetDesktops(array.Put());
+    if (FAILED(hr)) return hr;
+    if (!array) return E_FAIL;
+
+    UINT count = 0;
+    hr = array->GetCount(&count);
+    if (FAILED(hr)) return hr;
+
+    for (UINT i = 0; i < count; ++i) {
+        ComPtr<IShellDesktop> desktop;
+        GUID candidate{};
+        hr = array->GetAt(i, g_shell.desktopIid, desktop.PutVoid());
+        if (FAILED(hr)) return hr;
+        if (!desktop || FAILED(desktop->GetId(&candidate))) continue;
+        if (::IsEqualGUID(candidate, id)) {
+            out = std::move(desktop);
+            return S_OK;
+        }
+    }
+    return TYPE_E_ELEMENTNOTFOUND;
+}
+
+// Run `call` against the shell, reconnecting once if explorer has restarted
+// since the last call and the cached proxies point at a process that is gone.
+template <typename F>
+HRESULT CallShell(F&& call) {
+    HRESULT hr = E_NOINTERFACE;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        IShellDesktops* desktops = ShellDesktops();
+        if (!desktops) return E_NOINTERFACE;
+
+        hr = call(desktops);
+        if (!ShellWentAway(hr)) return hr;
+
+        MACTAB_WARN("desktops: the shell went away (0x%08lX); reconnecting",
+                    static_cast<unsigned long>(hr));
+        g_shell = Shell{};
+    }
+    return hr;
+}
+
+HRESULT MoveThroughShell(IShellDesktops* desktops, HWND hwnd, const GUID& target) {
+    ComPtr<IUnknown> view;
+    HRESULT hr = g_shell.views->GetViewForHwnd(hwnd, view.Put());
+    if (FAILED(hr)) return hr;
+    if (!view) return E_FAIL;
+
+    // False for a window pinned to every desktop, among others.
+    BOOL can = FALSE;
+    hr = desktops->CanViewMoveDesktops(view.Get(), &can);
+    if (FAILED(hr)) return hr;
+    if (!can) return E_ACCESSDENIED;
+
+    ComPtr<IShellDesktop> desktop;
+    hr = FindShellDesktop(desktops, target, desktop);
+    if (FAILED(hr)) return hr;
+
+    return desktops->MoveViewToDesktop(view.Get(), desktop.Get());
 }
 
 void AppendKey(std::vector<INPUT>& inputs, WORD vk, bool up) {
@@ -235,18 +541,60 @@ State Query(HWND ownWindow) {
 }
 
 bool MoveWindowTo(HWND hwnd, const GUID& desktop) {
-    IVirtualDesktopManager* manager = Manager();
-    if (!manager || !hwnd) return false;
+    if (!hwnd) return false;
 
-    const HRESULT hr = manager->MoveWindowToDesktop(hwnd, desktop);
+    DWORD owner = 0;
+    ::GetWindowThreadProcessId(hwnd, &owner);
+
+    if (owner == ::GetCurrentProcessId()) {
+        IVirtualDesktopManager* manager = Manager();
+        if (!manager) return false;
+
+        const HRESULT hr = manager->MoveWindowToDesktop(hwnd, desktop);
+        if (FAILED(hr)) {
+            MACTAB_WARN("desktops: cannot move our own window %p (0x%08lX)",
+                        static_cast<void*>(hwnd), static_cast<unsigned long>(hr));
+            return false;
+        }
+        return true;
+    }
+
+    // The view belongs to the top-level window, not to whatever child a caller
+    // happened to be holding.
+    HWND root = ::GetAncestor(hwnd, GA_ROOT);
+    if (!root) root = hwnd;
+
+    const HRESULT hr = CallShell([&](IShellDesktops* desktops) {
+        return MoveThroughShell(desktops, root, desktop);
+    });
     if (FAILED(hr)) {
-        MACTAB_DIAG("desktops: cannot move %p (0x%08lX); the public API only "
-                    "moves this process's own windows",
-                    static_cast<void*>(hwnd), static_cast<unsigned long>(hr));
+        MACTAB_WARN("desktops: %p was not moved (0x%08lX)", static_cast<void*>(root),
+                    static_cast<unsigned long>(hr));
+        return false;
+    }
+
+    MACTAB_DIAG("desktops: moved %p to %s", static_cast<void*>(root),
+                ToUtf8(GuidToBraces(desktop)).c_str());
+    return true;
+}
+
+bool SwitchToId(const GUID& id) {
+    const HRESULT hr = CallShell([&](IShellDesktops* desktops) {
+        ComPtr<IShellDesktop> desktop;
+        const HRESULT found = FindShellDesktop(desktops, id, desktop);
+        return FAILED(found) ? found : desktops->SwitchDesktop(desktop.Get());
+    });
+    if (FAILED(hr)) {
+        MACTAB_DIAG("desktops: the shell did not switch (0x%08lX)",
+                    static_cast<unsigned long>(hr));
         return false;
     }
     return true;
 }
+
+bool CanMoveWindows() { return ShellDesktops() != nullptr; }
+
+void ResetShell() { g_shell = Shell{}; }
 
 bool SwitchTo(const State& state, int targetIndex) {
     if (!state.known || state.current < 0) return false;

@@ -4,28 +4,46 @@
 
 // Windows' virtual desktops, which are macOS' Spaces.
 //
-// WHY THIS IS ALL PUBLIC API, WHEN EVERY OTHER TOOL USES THE PRIVATE ONE.
+// TWO INTERFACES, AND WHY THE SECOND ONE IS ALLOWED.
 //
-// Almost everything interesting about virtual desktops lives on
-// IVirtualDesktopManagerInternal, which is undocumented and whose interface ID
-// changes with nearly every Windows build. That is survivable for a project
-// with a test machine. It is not survivable here: the interface was
-// restructured in 24H2 WITHOUT changing its ID, so QueryInterface succeeded,
-// the vtable was wrong, and the tools that used it crashed rather than failed.
-// A crash on somebody else's machine, on a build we have never seen, found out
-// about weeks later, is the single worst failure this project can have.
-//
-// So everything below is built from three public things:
+// Most of this file is public API:
 //
 //   the registry     the ordered list of desktop GUIDs and their names, which
 //                    the shell keeps current rather than writing lazily
 //   IVirtualDesktopManager   GetWindowDesktopId, to bucket windows, and
-//                    IsWindowOnCurrentVirtualDesktop
+//                    MoveWindowToDesktop for this process's own windows
 //   SendInput        the same keyboard shortcuts a user would press
 //
-// What that cannot do is close a desktop other than the current one, and move
-// another process's window to another desktop. Both need the private interface,
-// and both are deliberately absent rather than risky.
+// None of that can move ANOTHER process's window to another desktop, which is
+// the one thing Mission Control exists to let you do. Only the shell's own
+// IVirtualDesktopManagerInternal can, and it is undocumented. It has bitten
+// every tool that used it, and the way it bit is the design of the code here:
+//
+//   Its IID changes between builds. That is survivable: QueryService with an
+//   IID the shell does not know fails cleanly.
+//
+//   Its vtable has also changed WITHOUT the IID changing. 26100.2605 inserted
+//   SwitchDesktopAndMoveForegroundView at slot 10 and kept the IID, so every
+//   method from slot 10 on moved by one and the tools that called them crashed
+//   or did something else entirely. Slots 3 to 9 (GetCount, MoveViewToDesktop,
+//   CanViewMoveDesktops, GetCurrentDesktop, GetDesktops, GetAdjacentDesktop,
+//   SwitchDesktop) have the same order and signatures in every layout from
+//   Windows 10 1809 to Windows 11 25H2.
+//
+// So only slots 3 to 9 are declared, for three known IIDs, and nothing is moved
+// until the interface has listed the desktops back in exactly the order the
+// registry has them, which a shifted vtable cannot do by accident. A build that
+// fails that is refused for the session and gets the public behaviour back:
+// a window from another application dropped on a desktop goes back where it
+// was. DesktopMoves=off in settings.ini refuses it everywhere.
+//
+// Not covered: Windows 10 1803 and Windows 11 before 22621.2215, whose layouts
+// take a monitor handle in the slots above. They get the public behaviour.
+//
+// Every call into the shell here is cross-process COM from an STA, which runs a
+// modal loop that dispatches timers and posted messages while it waits. Callers
+// must not hold references into anything those could tear down. Mission
+// Control posts its moves to the host window for exactly that reason.
 
 namespace mactab::desktops {
 
@@ -76,12 +94,25 @@ bool SwitchTo(const State& state, int targetIndex);
 
 // Move a window to another desktop.
 //
-// The public API only permits this for windows this process owns, and returns
-// E_ACCESSDENIED for anything else, which is almost everything a user would
-// want to drag. The alternative is the private interface, whose vtable was
-// restructured in 24H2 without its identifier changing, so callers crashed
-// rather than failed. False here means "not allowed", not "went wrong".
+// This process's own windows go through the public API. Anything else goes
+// through the shell's private interface, when CanMoveWindows() says it is
+// usable on this machine. False means nothing moved.
 bool MoveWindowTo(HWND hwnd, const GUID& desktop);
+
+// Switch the view to `desktop` through the shell's interface: no animation, and
+// nothing injected, so keys the user is holding stay held. False when that
+// interface is not usable here, and the caller falls back to SwitchTo.
+bool SwitchToId(const GUID& desktop);
+
+// Whether windows of other applications can be moved between desktops here.
+//
+// Connects to the shell and checks it on first use. A failure because explorer
+// is not up yet is retried next time; a build that fails the check is not.
+bool CanMoveWindows();
+
+// Drop the connection to the shell, for when explorer restarts. The next call
+// reconnects and checks again.
+void ResetShell();
 
 // Block until the shell reports `target` as the desktop being viewed, or give up.
 //
